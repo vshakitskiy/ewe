@@ -106,13 +106,13 @@ import glisten
 import glisten/socket/options as glisten_options
 import glisten/transport
 
-import gramps/websocket as ws
+import gramps/websocket as gramps
 
 import ewe/internal/file as file_
 import ewe/internal/handler as handler_
 import ewe/internal/http as http_
 import ewe/internal/information
-import ewe/internal/websocket as websocket_
+import ewe/internal/websocket as ewe_websocket
 
 // -----------------------------------------------------------------------------
 // CONNECTION
@@ -600,7 +600,7 @@ fn consumer_adapter(
 // 12.1.11
 
 pub type WebsocketConnection =
-  websocket_.WebsocketConnection
+  ewe_websocket.WebsocketConnection
 
 /// Represents instruction on how WebSocket connection should proceed.
 /// 
@@ -645,11 +645,12 @@ pub fn stop_abnormal(reason: String) -> Next(user_state, user_message) {
 
 fn to_internal_next(
   next: Next(user_state, user_message),
-) -> websocket_.WebsocketNext(user_state, user_message) {
+) -> ewe_websocket.WebsocketNext(user_state, user_message) {
   case next {
-    Continue(user_state, selector) -> websocket_.Continue(user_state, selector)
-    NormalStop -> websocket_.NormalStop
-    AbnormalStop(reason) -> websocket_.AbnormalStop(reason)
+    Continue(user_state, selector) ->
+      ewe_websocket.Continue(user_state, selector)
+    NormalStop -> ewe_websocket.NormalStop
+    AbnormalStop(reason) -> ewe_websocket.AbnormalStop(reason)
   }
 }
 
@@ -661,15 +662,19 @@ pub type WebsocketMessage(user_message) {
 }
 
 fn transform_websocket_message(
-  message: websocket_.WebsocketMessage(user_message),
+  message: ewe_websocket.WebsocketMessage(user_message),
 ) -> Result(WebsocketMessage(user_message), Nil) {
   case message {
-    websocket_.WebsocketFrame(ws.Data(ws.TextFrame(text))) ->
-      bit_array.to_string(text)
-      |> result.map(Text)
-    websocket_.WebsocketFrame(ws.Data(ws.BinaryFrame(binary))) ->
-      Ok(Binary(binary))
-    websocket_.UserMessage(user_message) -> Ok(User(user_message))
+    ewe_websocket.WebsocketFrame(gramps.Data(frame)) -> {
+      gramps.match_data_frame(
+        frame,
+        on_text: fn(payload, _) {
+          bit_array.to_string(payload) |> result.map(Text)
+        },
+        on_binary: fn(payload, _) { Ok(Binary(payload)) },
+      )
+    }
+    ewe_websocket.UserMessage(user_message) -> Ok(User(user_message))
     _ -> Error(Nil)
   }
 }
@@ -707,7 +712,7 @@ pub fn upgrade_websocket(
     )
 
     use selector <- result.try(
-      websocket_.start(
+      ewe_websocket.start(
         transport,
         socket,
         on_init,
@@ -733,8 +738,8 @@ pub fn send_binary_frame(
   conn: WebsocketConnection,
   bits: BitArray,
 ) -> Result(Nil, glisten.SocketReason) {
-  websocket_.send_frame(
-    ws.encode_binary_frame,
+  ewe_websocket.send_frame(
+    gramps.encode_binary_frame,
     conn.transport,
     conn.socket,
     conn.deflate,
@@ -748,8 +753,8 @@ pub fn send_text_frame(
   conn: WebsocketConnection,
   text: String,
 ) -> Result(Nil, glisten.SocketReason) {
-  websocket_.send_frame(
-    ws.encode_text_frame,
+  ewe_websocket.send_frame(
+    gramps.encode_text_frame,
     conn.transport,
     conn.socket,
     conn.deflate,

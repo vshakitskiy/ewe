@@ -7,7 +7,6 @@
 - Store incomplete frames in WebSocket state until they are fully received.
 - Ensure unexpected continuation frames correctly cause an abnormal stop.
 - Add handling for control frames interleaved with fragmented data frames.
-- Replace `gramps` package with a development version to comply with the Autobahn test suite.
 - Add `date` header to responses.
 
 # v0.9.0
