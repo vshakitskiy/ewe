@@ -526,3 +526,114 @@ fn strip_padding(
     True, _ -> Error(InvalidPayload(TooShort))
   }
 }
+
+pub fn encode(frame: Frame) -> BitArray {
+  case frame {
+    Data(stream_id:, end_stream:, data:) ->
+      <<0:7, encode_flag(end_stream):1>>
+      |> encode_frame(type_: 0x00, stream_id:, payload: data)
+
+    Headers(stream_id:, end_headers:, end_stream:, field_block:) ->
+      <<0:5, encode_flag(end_headers):1, 0:1, encode_flag(end_stream):1>>
+      |> encode_frame(type_: 0x01, stream_id:, payload: field_block)
+
+    Priority(stream_id:, exclusive:, dependency:, weight:) ->
+      <<encode_flag(exclusive):1, dependency:31, { weight - 1 }:8>>
+      |> encode_frame(type_: 0x02, flags: <<0:8>>, stream_id:)
+
+    RstStream(stream_id:, code:) ->
+      <<encode_code(code):32>>
+      |> encode_frame(type_: 0x03, flags: <<0:8>>, stream_id:)
+
+    Settings(settings:) -> encode_settings(settings, <<>>)
+    SettingsAck ->
+      <<0:7, 1:1>>
+      |> encode_frame(type_: 0x04, stream_id: 0, payload: <<>>)
+
+    PushPromise(stream_id:, promised_stream_id:, end_headers:, field_block:) ->
+      encode_frame(
+        type_: 0x05,
+        flags: <<0:5, encode_flag(end_headers):1, 0:2>>,
+        stream_id:,
+        payload: <<0:1, promised_stream_id:31, field_block:bits>>,
+      )
+
+    Ping(ack:, data:) ->
+      <<0:7, encode_flag(ack):1>>
+      |> encode_frame(type_: 0x06, stream_id: 0, payload: data)
+
+    GoAway(last_stream_id:, code:, debug:) ->
+      <<0:1, last_stream_id:31, encode_code(code):32, debug:bits>>
+      |> encode_frame(type_: 0x07, flags: <<0:8>>, stream_id: 0)
+
+    WindowUpdate(stream_id:, increment:) ->
+      <<0:1, increment:31>>
+      |> encode_frame(type_: 0x08, flags: <<0:8>>, stream_id:)
+
+    Continuation(stream_id:, end_headers:, field_block:) ->
+      <<0:5, encode_flag(end_headers):1, 0:2>>
+      |> encode_frame(type_: 0x09, stream_id:, payload: field_block)
+
+    Unknown -> <<>>
+  }
+}
+
+fn encode_code(code: ErrorCode) -> Int {
+  case code {
+    NoError -> 0x00
+    ProtocolError -> 0x01
+    InternalError -> 0x02
+    FlowControlError -> 0x03
+    SettingsTimeout -> 0x04
+    StreamClosed -> 0x05
+    FrameSizeError -> 0x06
+    RefusedStream -> 0x07
+    Cancel -> 0x08
+    CompressionError -> 0x09
+    ConnectError -> 0x0a
+    EnhanceYourCalm -> 0x0b
+    InadequateSecurity -> 0x0c
+    Http11Required -> 0x0d
+  }
+}
+
+fn encode_settings(settings: List(#(SettingId, Int)), acc: BitArray) -> BitArray {
+  case settings {
+    [] -> acc
+    [#(id, value), ..remaining] -> {
+      let id = case id {
+        HeaderTableSize -> 0x01
+        EnablePush -> 0x02
+        MaxConcurrentStreams -> 0x03
+        InitialWindowSize -> 0x04
+        MaxFrameSize -> 0x05
+        MaxHeaderListSize -> 0x06
+      }
+
+      encode_settings(remaining, <<acc:bits, id:16, value:32>>)
+    }
+  }
+}
+
+fn encode_frame(
+  type_ type_: Int,
+  flags flags: BitArray,
+  stream_id stream_id: Int,
+  payload payload: BitArray,
+) -> BitArray {
+  <<
+    bit_array.byte_size(payload):24,
+    type_:8,
+    flags:bits,
+    0:1,
+    stream_id:31,
+    payload:bits,
+  >>
+}
+
+fn encode_flag(flag: Bool) -> Int {
+  case flag {
+    True -> 1
+    False -> 0
+  }
+}
