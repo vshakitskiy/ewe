@@ -52,8 +52,6 @@ pub type SettingId {
   // 0x06; Maximum ammount of field section size that the sender is prepared to
   // accept, in units of octets. There is no limit by default.
   MaxHeaderListSize
-  // Unrecognised setting, must be ignored.
-  UnknownSetting
 }
 
 pub type Frame {
@@ -101,7 +99,12 @@ pub type Frame {
 
   // 6.4 RST_STREAM; Allows termination of a stream with an error code.
   // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.4
-  RstStream(stream_id: Int, code: ErrorCode)
+  RstStream(
+    // Which stream it belongs to, must be larger than 0.
+    stream_id: Int,
+    // Reason why we are killing the stream.
+    code: ErrorCode,
+  )
 
   // 6.5 SETTINGS; Consists of zero or more settings for a connection.
   // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5
@@ -110,6 +113,73 @@ pub type Frame {
   // 6.5 SETTINGS; Acknowledges the receipt of a SETTINGS frame.
   // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5
   SettingsAck
+
+  // 6.6 PUSH_PROMISE; Notifies the peer endpoint in advance of streams the
+  // sender intends to initiate.
+  // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.6
+  PushPromise(
+    // Which stream it belongs to, must be larger than 0.
+    stream_id: Int,
+    // The new stream identificator for the pushed resource.
+    promised_stream_id: Int,
+    // Flag that indicates is containing entire field block and is not followed
+    // by any CONTINUATION frames. A header with this flag unset must be
+    // followed by CONTINUATION frame for the same stream.
+    end_headers: Bool,
+    // HPACK-encoded headers for the pushed request.
+    field_block: BitArray,
+  )
+
+  // 6.7 PING; Checks if the connection is alive, measuring a minimal round-trip
+  // time from the sender.
+  // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7
+  Ping(
+    // Flag that indicates that this frame is a PING response.
+    ack: Bool,
+    // 8 octets of opaque data, PING response must have identical payload.
+    data: BitArray,
+  )
+
+  // 6.8 GOAWAY; initiates shutdown of a connection or signals serious error
+  // conditions. Allows an endpoint to gracefully stop accepting new streams
+  // while finishing the ones in progress.
+  // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.8
+  GoAway(
+    // Highest stream identificator we have processed. Any streams with id more
+    // than this value will not be processed.
+    last_stream_id: Int,
+    // Reason why we are killing the connection.
+    code: ErrorCode,
+    // Optional human-readable debug information.
+    debug: BitArray,
+  )
+
+  // 6.9 WINDOW_UPDATE; Increases the flow control window, allowing sender to
+  // transmit more data bytes on each individual stream and on the entire
+  // connection
+  // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+  WindowUpdate(
+    // Which stream it belongs to. For connection-level updates value zero is
+    // used.
+    stream_id: Int,
+    // Amount of bytes that is being added to the window. Must be from 1 to
+    // 2^31 - 1 octets.
+    increment: Int,
+  )
+
+  // 6.10; CONTINUATION; Continues a sequence of field block fragments.
+  // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+  Continuation(
+    // Which stream it belongs to, must be larger than 0 and preceding previous
+    // frame.
+    stream_id: Int,
+    // Flag that indicates is containing entire field block and is not followed
+    // by any CONTINUATION frames. A header with this flag unset must be
+    // followed by CONTINUATION frame for the same stream.
+    end_headers: Bool,
+    // Next fragment of HPACK-encoded headers.
+    field_block: BitArray,
+  )
 
   // Unknown frame, must be ignored.
   Unknown
@@ -126,15 +196,17 @@ pub type DecodeError {
 
 pub type ViolationError {
   // Frame cannot be on a stream 0.
-  InvalidFrameOnConnectionControlStream
+  FrameOnControlStream
   // Stream cannot depend on itself.
   StreamDependingOnItself
-  // SETTINGS must be on a stream 0.
-  SettingsOnWrongStream
+  // Frame must be on a stream 0.
+  FrameOnWrongStream
   // A setting value violates protocol limits.
   InvalidSettingValue
   // INITIAL_WINDOW_SIZE exceeded the maximum allowed limit of 2^31 - 1.
   InitialWindowSizeOverflow
+  // WINDOW_UPDATE increment cannot be 0.
+  InvalidWindowUpdateValue
 }
 
 pub type PayloadError {
@@ -214,6 +286,11 @@ fn do_decode(
     0x02 -> decode_priority(stream_id:, payload:)
     0x03 -> decode_rst_stream(stream_id:, payload:)
     0x04 -> decode_settings(stream_id:, ack:, payload:)
+    0x05 -> decode_push_promise(stream_id:, padded:, end_headers:, payload:)
+    0x06 -> decode_ping(stream_id:, ack:, payload:)
+    0x07 -> decode_goaway(stream_id:, payload:)
+    0x08 -> decode_window_update(stream_id:, payload:)
+    0x09 -> decode_continuation(stream_id:, end_headers:, payload:)
     _unknown -> Ok(Unknown)
   }
 }
@@ -225,7 +302,7 @@ fn decode_data(
   payload payload: BitArray,
 ) -> Result(Frame, DecodeError) {
   case stream_id {
-    0 -> Error(ProtocolViolation(InvalidFrameOnConnectionControlStream))
+    0 -> Error(ProtocolViolation(FrameOnControlStream))
     _ -> {
       use data <- result.try(strip_padding(payload, padded))
       Ok(Data(stream_id:, end_stream:, data:))
@@ -242,7 +319,7 @@ fn decode_headers(
   payload payload: BitArray,
 ) -> Result(Frame, DecodeError) {
   case stream_id, priority {
-    0, _ -> Error(ProtocolViolation(InvalidFrameOnConnectionControlStream))
+    0, _ -> Error(ProtocolViolation(FrameOnControlStream))
     _, False -> {
       use field_block <- result.try(strip_padding(payload, padded))
       Ok(Headers(stream_id:, end_headers:, end_stream:, field_block:))
@@ -252,7 +329,7 @@ fn decode_headers(
 
       case payload {
         // Even tho RFC 9113 deprecated priority fields, I am still going to
-        // strict there.
+        // be strict here.
         <<_exclusive:1, dependency:31, _weight:8, _field_block:bits>>
           if dependency == stream_id
         -> Error(ProtocolViolation(StreamDependingOnItself))
@@ -269,7 +346,7 @@ fn decode_priority(
   payload payload: BitArray,
 ) -> Result(Frame, DecodeError) {
   case stream_id, payload {
-    0, _ -> Error(ProtocolViolation(InvalidFrameOnConnectionControlStream))
+    0, _ -> Error(ProtocolViolation(FrameOnControlStream))
     _, <<_exclusive:1, dependency:31, _weight:8>> if dependency == stream_id ->
       Error(ProtocolViolation(StreamDependingOnItself))
     _, <<exclusive:1, dependency:31, weight:8>> ->
@@ -288,7 +365,7 @@ fn decode_rst_stream(
   payload payload: BitArray,
 ) -> Result(Frame, DecodeError) {
   case stream_id, payload {
-    0, _ -> Error(ProtocolViolation(InvalidFrameOnConnectionControlStream))
+    0, _ -> Error(ProtocolViolation(FrameOnControlStream))
     _, <<code:32>> -> Ok(RstStream(stream_id:, code: decode_code(code)))
     _, _ -> Error(InvalidPayload(BadSize))
   }
@@ -363,6 +440,76 @@ fn do_decode_settings(
   }
 }
 
+fn decode_push_promise(
+  stream_id stream_id: Int,
+  padded padded: Bool,
+  end_headers end_headers: Bool,
+  payload payload: BitArray,
+) -> Result(Frame, DecodeError) {
+  case stream_id, payload {
+    0, _ -> Error(ProtocolViolation(FrameOnControlStream))
+    _, _ -> {
+      use payload <- result.try(strip_padding(payload, padded))
+      case payload {
+        <<_reserved:1, promised_stream_id:31, field_block:bits>> ->
+          Ok(PushPromise(
+            stream_id:,
+            promised_stream_id:,
+            end_headers:,
+            field_block:,
+          ))
+        _ -> Error(InvalidPayload(TooShort))
+      }
+    }
+  }
+}
+
+fn decode_ping(
+  stream_id stream_id: Int,
+  ack ack: Bool,
+  payload payload: BitArray,
+) -> Result(Frame, DecodeError) {
+  case stream_id, bit_array.byte_size(payload) {
+    0, 8 -> Ok(Ping(ack:, data: payload))
+    0, _ -> Error(InvalidPayload(BadSize))
+    _, _ -> Error(ProtocolViolation(FrameOnWrongStream))
+  }
+}
+
+fn decode_goaway(
+  stream_id stream_id: Int,
+  payload payload: BitArray,
+) -> Result(Frame, DecodeError) {
+  case stream_id, payload {
+    0, <<_reserved:1, last_stream_id:31, code:32, debug:bits>> ->
+      Ok(GoAway(last_stream_id:, code: decode_code(code), debug:))
+    0, _ -> Error(InvalidPayload(TooShort))
+    _, _ -> Error(ProtocolViolation(FrameOnWrongStream))
+  }
+}
+
+fn decode_window_update(
+  stream_id stream_id: Int,
+  payload payload: BitArray,
+) -> Result(Frame, DecodeError) {
+  case payload {
+    <<_reserved:1, 0:31>> -> Error(ProtocolViolation(InvalidWindowUpdateValue))
+    <<_reserved:1, increment:31>> -> Ok(WindowUpdate(stream_id:, increment:))
+    _ -> Error(InvalidPayload(BadSize))
+  }
+}
+
+fn decode_continuation(
+  stream_id stream_id: Int,
+  end_headers end_headers: Bool,
+  payload payload: BitArray,
+) -> Result(Frame, DecodeError) {
+  case stream_id {
+    0 -> Error(ProtocolViolation(FrameOnControlStream))
+    _ -> Ok(Continuation(stream_id:, end_headers:, field_block: payload))
+  }
+}
+
 fn strip_padding(
   payload: BitArray,
   padded: Bool,
@@ -376,6 +523,6 @@ fn strip_padding(
         _ -> Error(InvalidPayload(ExceedingPadding))
       }
     }
-    True, _ -> Error(InvalidPayload(BadSize))
+    True, _ -> Error(InvalidPayload(TooShort))
   }
 }
