@@ -1,11 +1,11 @@
 import compresso
 import ewe/internal/encoder
 import ewe/internal/file
-import ewe/internal/http1.{
+import ewe/internal/http.{
   type Connection, type HttpVersion, type ResponseBody, BitsData, BytesData,
   Chunked, Empty, File, SSE, StringTreeData, TextData, Websocket,
-} as ewe_http
-import ewe/internal/http1/buffer.{Buffer}
+} as http_
+import ewe/internal/http/buffer.{Buffer}
 import exception
 import gleam/bit_array
 import gleam/bytes_tree
@@ -25,20 +25,20 @@ import logging
 
 /// HTTP/1.1 handler state.
 ///
-pub type Http1Handler {
-  Http1Handler(idle_timer: Option(process.Timer))
+pub type HttpHandler {
+  HttpHandler(idle_timer: Option(process.Timer))
 }
 
 /// Initializes the HTTP/1.1 handler state.
 ///
-pub fn init() -> Http1Handler {
-  Http1Handler(idle_timer: None)
+pub fn init() -> HttpHandler {
+  HttpHandler(idle_timer: None)
 }
 
 /// Action to take after handling a packet.
 ///
 pub type Next {
-  Continue(state: Http1Handler)
+  Continue(state: HttpHandler)
   Stop
   Http2Upgrade(upgrade: Http2Upgrade)
 }
@@ -53,7 +53,7 @@ pub type Http2Upgrade {
 /// Handles received glisten packet.
 ///
 pub fn handle_packet(
-  state: Http1Handler,
+  state: HttpHandler,
   connection: Connection,
   data: BitArray,
   glisten_subject: process.Subject(glisten_handler.Message(_)),
@@ -66,8 +66,8 @@ pub fn handle_packet(
     None -> process.TimerNotFound
   }
 
-  case ewe_http.parse_request(connection, Buffer(data, 0)) {
-    Ok(ewe_http.Http1Request(request, version)) -> {
+  case http_.parse_request(connection, Buffer(data, 0)) {
+    Ok(http_.HttpRequest(request, version)) -> {
       let call_result =
         call(request, version, glisten_subject, handler, on_crash, idle_timeout)
 
@@ -76,28 +76,12 @@ pub fn handle_packet(
         Error(Nil) -> Stop
       }
     }
-    Ok(ewe_http.Http2Upgrade(ewe_http.Direct(data))) ->
-      Http2Upgrade(Direct(data:))
-    Ok(ewe_http.Http2Upgrade(ewe_http.Upgrade(request, _settings))) -> {
-      logging.log(logging.Notice, "HTTP/2 upgrade; using HTTP/1.1")
-      let call_result =
-        call(
-          request,
-          ewe_http.Http11,
-          glisten_subject,
-          handler,
-          on_crash,
-          idle_timeout,
-        )
-
-      case call_result {
-        Ok(state) -> Continue(state)
-        Error(Nil) -> Stop
-      }
-    }
+    Ok(http_.Http2Upgrade(http_.Direct(data))) -> Http2Upgrade(Direct(data:))
+    Ok(http_.Http2Upgrade(http_.Upgrade(request, settings))) ->
+      Http2Upgrade(Upgrade(request:, settings:))
     Error(reason) -> {
       let status = case reason {
-        ewe_http.InvalidVersion -> 505
+        http_.InvalidVersion -> 505
         _ -> 400
       }
 
@@ -122,7 +106,7 @@ fn call(
   handler: fn(Request(Connection)) -> Response(ResponseBody),
   on_crash: Response(ResponseBody),
   idle_timeout: Int,
-) -> Result(Http1Handler, Nil) {
+) -> Result(HttpHandler, Nil) {
   let response = case exception.rescue(fn() { handler(request) }) {
     Ok(response) -> response
     Error(e) -> {
@@ -151,13 +135,13 @@ fn on_sent(
   response: Response(ResponseBody),
   glisten_subject: process.Subject(glisten_handler.Message(_)),
   idle_timeout: Int,
-) -> Result(Http1Handler, Nil) {
+) -> Result(HttpHandler, Nil) {
   case sent, is_connection_close(response) {
     Ok(Nil), False -> {
       let timer =
         process.send_after(glisten_subject, idle_timeout, Internal(Close))
 
-      Ok(Http1Handler(Some(timer)))
+      Ok(HttpHandler(Some(timer)))
     }
     _, _ -> Error(Nil)
   }
@@ -180,7 +164,7 @@ fn send_file(
   }
 
   let sent =
-    ewe_http.append_default_headers(response, request, version)
+    http_.append_default_headers(response, request, version)
     |> encoder.encode_response_partially()
     |> transport.send(request.body.transport, request.body.socket, _)
     |> result.try(fn(_) {
@@ -245,7 +229,7 @@ fn send_body(
       |> response.set_header("content-length", int.to_string(content_length))
   }
 
-  ewe_http.append_default_headers(response, request, version)
+  http_.append_default_headers(response, request, version)
   |> encoder.encode_response()
   |> transport.send(request.body.transport, request.body.socket, _)
 }

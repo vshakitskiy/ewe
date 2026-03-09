@@ -137,7 +137,7 @@
 
 import ewe/internal/file
 import ewe/internal/handler
-import ewe/internal/http1 as ewe_http
+import ewe/internal/http as http_
 import ewe/internal/stream/chunked
 import ewe/internal/stream/sse
 import ewe/internal/stream/websocket
@@ -169,7 +169,7 @@ import websocks
 /// Represents the request body and connection metadata. Access the body using
 /// `ewe.read_body`, or retrieve client information with `ewe.get_client_info`.
 pub type Connection =
-  ewe_http.Connection
+  http_.Connection
 
 // IP ADDRESS
 // -----------------------------------------------------------------------------
@@ -290,22 +290,20 @@ pub type ResponseBody {
 pub type Response =
   HttpResponse(ResponseBody)
 
-fn transform_response_body(
-  resp: Response,
-) -> HttpResponse(ewe_http.ResponseBody) {
+fn transform_response_body(resp: Response) -> HttpResponse(http_.ResponseBody) {
   response.set_body(resp, case resp.body {
-    TextData(text) -> ewe_http.TextData(text)
-    BytesData(bytes) -> ewe_http.BytesData(bytes)
-    BitsData(bits) -> ewe_http.BitsData(bits)
-    StringTreeData(string_tree) -> ewe_http.StringTreeData(string_tree)
+    TextData(text) -> http_.TextData(text)
+    BytesData(bytes) -> http_.BytesData(bytes)
+    BitsData(bits) -> http_.BitsData(bits)
+    StringTreeData(string_tree) -> http_.StringTreeData(string_tree)
 
-    Chunked -> ewe_http.Chunked
-    File(descriptor, offset, size) -> ewe_http.File(descriptor, offset, size)
+    Chunked -> http_.Chunked
+    File(descriptor, offset, size) -> http_.File(descriptor, offset, size)
 
-    Websocket -> ewe_http.Websocket
-    SSE -> ewe_http.SSE
+    Websocket -> http_.Websocket
+    SSE -> http_.SSE
 
-    Empty -> ewe_http.Empty
+    Empty -> http_.Empty
   })
 }
 
@@ -480,9 +478,8 @@ pub fn start(
   let handler = fn(req) { transform_response_body(builder.handler(req)) }
   let on_crash = transform_response_body(builder.on_crash)
 
-  let factory_name = process.new_name("ewe_streams")
-
-  let factory_child =
+  let factory_name = process.new_name("ewe_factory")
+  let factory =
     factory.worker_child(fn(start) { start() })
     |> factory.restart_strategy(supervision.Temporary)
     |> factory.named(factory_name)
@@ -502,9 +499,10 @@ pub fn start(
     }
     |> fn(glisten_builder) {
       case builder.tls {
-        Some(#(cert, key)) -> glisten.with_tls(glisten_builder, cert, key)
-        // Uncomment once http2 will be implemented!
-        // |> glisten.with_http2
+        Some(#(cert, key)) ->
+          glisten.with_tls(glisten_builder, cert, key)
+          // Uncomment once http2 will be implemented!
+          |> glisten.with_http2
         None -> glisten_builder
       }
     }
@@ -529,7 +527,7 @@ pub fn start(
 
   supervisor.new(supervisor.OneForAll)
   |> supervisor.add(glisten_child)
-  |> supervisor.add(factory_child)
+  |> supervisor.add(factory)
   |> supervisor.start()
 }
 
@@ -562,9 +560,9 @@ pub fn read_body(
   req: Request,
   bytes_limit bytes_limit: Int,
 ) -> Result(HttpRequest(BitArray), BodyError) {
-  case ewe_http.read_body(req, bytes_limit) {
+  case http_.read_body(req, bytes_limit) {
     Ok(req) -> Ok(req)
-    Error(ewe_http.BodyTooLarge) -> Error(BodyTooLarge)
+    Error(http_.BodyTooLarge) -> Error(BodyTooLarge)
     Error(_) -> Error(InvalidBody)
   }
 }
@@ -584,19 +582,19 @@ pub type Stream {
 
 /// Returns a consumer for streaming the request body in chunks.
 pub fn stream_body(req: Request) -> Result(Consumer, BodyError) {
-  case ewe_http.stream_body(req) {
+  case http_.stream_body(req) {
     Ok(consumer) -> Ok(consumer_adapter(consumer))
     Error(_) -> Error(InvalidBody)
   }
 }
 
 fn consumer_adapter(
-  internal_consumer: fn(Int) -> Result(ewe_http.Stream, ewe_http.ParseError),
+  internal_consumer: fn(Int) -> Result(http_.Stream, http_.ParseError),
 ) -> Consumer {
   fn(size) {
     case internal_consumer(size) {
-      Ok(ewe_http.Done) -> Ok(Done)
-      Ok(ewe_http.Consumed(data, next)) -> {
+      Ok(http_.Done) -> Ok(Done)
+      Ok(http_.Consumed(data, next)) -> {
         Ok(Consumed(data, consumer_adapter(next)))
       }
       Error(_) -> Error(InvalidBody)
@@ -831,7 +829,7 @@ pub fn upgrade_websocket(
   let socket = req.body.socket
   let factory_name = req.body.factory_name
 
-  case ewe_http.upgrade_websocket(req, transport, socket) {
+  case http_.upgrade_websocket(req, transport, socket) {
     Ok(#(extensions, per_message_deflate)) -> {
       let supervisor = factory.get_by_name(factory_name)
       let start_result =

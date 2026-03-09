@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/bytes_tree
 import gleam/list
 import gleam/pair
 import gleam/result
@@ -400,8 +401,12 @@ fn decode_settings(
     0, True, 0 -> Ok(SettingsAck)
     0, True, _ -> Error(InvalidPayload(AckWithPayload))
     0, False, _ -> do_decode_settings(payload, [])
-    _, _, _ -> Error(ProtocolViolation(SettingsOnWrongStream))
+    _, _, _ -> Error(ProtocolViolation(FrameOnWrongStream))
   }
+}
+
+pub fn decode_settings_payload(payload: BitArray) -> Result(Frame, DecodeError) {
+  do_decode_settings(payload, [])
 }
 
 fn do_decode_settings(
@@ -527,7 +532,7 @@ fn strip_padding(
   }
 }
 
-pub fn encode(frame: Frame) -> BitArray {
+pub fn encode(frame: Frame) -> bytes_tree.BytesTree {
   case frame {
     Data(stream_id:, end_stream:, data:) ->
       <<0:7, encode_flag(end_stream):1>>
@@ -545,7 +550,9 @@ pub fn encode(frame: Frame) -> BitArray {
       <<encode_code(code):32>>
       |> encode_frame(type_: 0x03, flags: <<0:8>>, stream_id:)
 
-    Settings(settings:) -> encode_settings(settings, <<>>)
+    Settings(settings:) ->
+      encode_settings_payload(settings, <<>>)
+      |> encode_frame(type_: 0x04, flags: <<0:8>>, stream_id: 0)
     SettingsAck ->
       <<0:7, 1:1>>
       |> encode_frame(type_: 0x04, stream_id: 0, payload: <<>>)
@@ -574,7 +581,7 @@ pub fn encode(frame: Frame) -> BitArray {
       <<0:5, encode_flag(end_headers):1, 0:2>>
       |> encode_frame(type_: 0x09, stream_id:, payload: field_block)
 
-    Unknown -> <<>>
+    Unknown -> bytes_tree.new()
   }
 }
 
@@ -597,7 +604,10 @@ fn encode_code(code: ErrorCode) -> Int {
   }
 }
 
-fn encode_settings(settings: List(#(SettingId, Int)), acc: BitArray) -> BitArray {
+fn encode_settings_payload(
+  settings: List(#(SettingId, Int)),
+  acc: BitArray,
+) -> BitArray {
   case settings {
     [] -> acc
     [#(id, value), ..remaining] -> {
@@ -610,7 +620,7 @@ fn encode_settings(settings: List(#(SettingId, Int)), acc: BitArray) -> BitArray
         MaxHeaderListSize -> 0x06
       }
 
-      encode_settings(remaining, <<acc:bits, id:16, value:32>>)
+      encode_settings_payload(remaining, <<acc:bits, id:16, value:32>>)
     }
   }
 }
@@ -620,7 +630,7 @@ fn encode_frame(
   flags flags: BitArray,
   stream_id stream_id: Int,
   payload payload: BitArray,
-) -> BitArray {
+) -> bytes_tree.BytesTree {
   <<
     bit_array.byte_size(payload):24,
     type_:8,
@@ -629,6 +639,7 @@ fn encode_frame(
     stream_id:31,
     payload:bits,
   >>
+  |> bytes_tree.from_bit_array
 }
 
 fn encode_flag(flag: Bool) -> Int {

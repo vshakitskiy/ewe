@@ -7,3 +7,4 @@ CLAUDE.md
 /src/preview.gleam
 autobahn/server
 # examples
+bench

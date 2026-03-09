@@ -1,10 +1,10 @@
 import ewe/internal/clock
 import ewe/internal/decoder.{
-  AbsPath, HttpBin, HttpEoh, HttpHeader, HttpRequest, HttphBin, More, Packet,
+  AbsPath, HttpBin, HttpEoh, HttpHeader, HttphBin, More, Packet,
 }
 import ewe/internal/encoder
 import ewe/internal/file
-import ewe/internal/http1/buffer.{type Buffer, Buffer}
+import ewe/internal/http/buffer.{type Buffer, Buffer}
 import gleam/bit_array
 import gleam/bool
 import gleam/bytes_tree.{type BytesTree}
@@ -115,7 +115,7 @@ pub type HttpVersion {
 /// Result of parsing a request.
 /// 
 pub type ParsedRequest {
-  Http1Request(req: Request(Connection), version: HttpVersion)
+  HttpRequest(req: Request(Connection), version: HttpVersion)
   Http2Upgrade(upgrade: Http2Upgrade)
 }
 
@@ -136,7 +136,7 @@ pub fn parse_request(
   let socket = conn.socket
 
   case decoder.decode_packet(HttpBin, buffer) {
-    Ok(Packet(HttpRequest(atom_method, AbsPath(target), version), rest)) -> {
+    Ok(Packet(decoder.HttpRequest(atom_method, AbsPath(target), version), rest)) -> {
       // Request Line
       use method <- try(
         decoder.decode_method(atom_method)
@@ -195,7 +195,7 @@ pub fn parse_request(
         )
 
       case version {
-        #(1, 0) -> Ok(Http1Request(req:, version: Http10))
+        #(1, 0) -> Ok(HttpRequest(req:, version: Http10))
         #(1, 1) -> {
           let connection = dict.get(headers, "connection")
           let upgrade = dict.get(headers, "upgrade")
@@ -208,10 +208,10 @@ pub fn parse_request(
 
               case is_upgrade {
                 True -> Ok(Http2Upgrade(Upgrade(req:, settings:)))
-                False -> Ok(Http1Request(req:, version: Http11))
+                False -> Ok(HttpRequest(req:, version: Http11))
               }
             }
-            _, _, _ -> Ok(Http1Request(req:, version: Http11))
+            _, _, _ -> Ok(HttpRequest(req:, version: Http11))
           }
         }
         _ -> Error(InvalidVersion)

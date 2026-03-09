@@ -1,4 +1,4 @@
-import ewe/internal/http1/buffer
+import ewe/internal/http/buffer
 import gleam/dynamic
 import gleam/http
 import gleam/option

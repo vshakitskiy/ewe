@@ -1,6 +1,6 @@
-import ewe/internal/http1.{type Connection, type ResponseBody} as ewe_http
-import ewe/internal/http1/handler as http1_handler
-import gleam/bytes_tree
+import ewe/internal/http.{type Connection, type ResponseBody} as http_
+import ewe/internal/http/handler as handler_
+import ewe/internal/http2
 import gleam/erlang/process
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
@@ -8,13 +8,11 @@ import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
 import glisten
-import glisten/transport
-import logging
 
 /// State of the request handler.
 ///
 pub type Handler {
-  Http1(state: http1_handler.Http1Handler, self: process.Subject(Nil))
+  Http1(state: handler_.HttpHandler, self: process.Subject(Nil))
 }
 
 /// Initializes the request handler state.
@@ -25,7 +23,7 @@ pub fn init(_) -> #(Handler, Option(process.Selector(Nil))) {
     process.new_selector()
     |> process.select(subject)
 
-  #(Http1(http1_handler.init(), self: subject), Some(selector))
+  #(Http1(handler_.init(), self: subject), Some(selector))
 }
 
 /// Main loop that processes incoming messages.
@@ -44,12 +42,12 @@ pub fn loop(
     conn: glisten.Connection(Nil),
   ) -> glisten.Next(Handler, glisten.Message(Nil)) {
     let sender = conn.subject
-    let conn = ewe_http.transform_connection(conn, factory_name)
+    let conn = http_.transform_connection(conn, factory_name)
 
     case state, message {
       Http1(state, self), glisten.Packet(message) -> {
         let result =
-          http1_handler.handle_packet(
+          handler_.handle_packet(
             state,
             conn,
             message,
@@ -60,26 +58,34 @@ pub fn loop(
           )
 
         case result {
-          http1_handler.Continue(state) -> glisten.continue(Http1(state, self))
-          http1_handler.Http2Upgrade(http1_handler.Direct(_data)) -> {
-            logging.log(logging.Notice, "HTTP/2 upgrade; sending goaway")
-            let goaway = <<
-              0:size(24), 4, 0, 0:size(32), 8:size(24), 7, 0, 0:size(32),
-              0:size(32), 13:size(32),
-            >>
+          handler_.Continue(state) -> glisten.continue(Http1(state, self))
+          handler_.Http2Upgrade(handler_.Direct(data:)) -> {
+            let supervisor = factory.get_by_name(factory_name)
+            let started =
+              factory.start_child(supervisor, fn() {
+                http2.start(
+                  conn.transport,
+                  conn.socket,
+                  data,
+                  factory_name,
+                  option.None,
+                )
+              })
 
-            let _ =
-              transport.send(
-                conn.transport,
-                conn.socket,
-                bytes_tree.from_bit_array(goaway),
-              )
-
-            glisten.stop()
+            case started {
+              Ok(_) -> glisten.stop()
+              Error(_) ->
+                glisten.stop_abnormal("Failed to spawn HTTP/2 connection")
+            }
           }
-          http1_handler.Stop
-          | http1_handler.Http2Upgrade(http1_handler.Upgrade(..)) ->
-            glisten.stop()
+          handler_.Http2Upgrade(handler_.Upgrade(request:, settings:)) ->
+            http2.handle_http_upgrade(
+              conn.transport,
+              conn.socket,
+              request,
+              settings,
+            )
+          handler_.Stop -> glisten.stop()
         }
       }
       _, _ -> glisten.stop()
