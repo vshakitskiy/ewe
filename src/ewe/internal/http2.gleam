@@ -33,25 +33,6 @@ pub type Settings {
   )
 }
 
-fn decode_settings(settings: List(#(frame.SettingId, Int))) -> Settings {
-  list.fold(settings, default_settings(), fn(acc, setting) {
-    case setting.0 {
-      frame.HeaderTableSize -> Settings(..acc, header_table_size: setting.1)
-      frame.EnablePush ->
-        Settings(..acc, enable_push: case setting.1 {
-          1 -> True
-          _ -> False
-        })
-      frame.MaxConcurrentStreams ->
-        Settings(..acc, max_concurrent_streams: option.Some(setting.1))
-      frame.InitialWindowSize -> Settings(..acc, initial_window_size: setting.1)
-      frame.MaxFrameSize -> Settings(..acc, max_frame_size: setting.1)
-      frame.MaxHeaderListSize ->
-        Settings(..acc, max_header_list_size: option.Some(setting.1))
-    }
-  })
-}
-
 fn default_settings() -> Settings {
   Settings(
     header_table_size: 4096,
@@ -72,6 +53,25 @@ fn server_settings() -> Settings {
     max_frame_size: 16_384,
     max_header_list_size: option.Some(8192),
   )
+}
+
+fn decode_settings(settings: List(#(frame.SettingId, Int))) -> Settings {
+  list.fold(settings, default_settings(), fn(acc, setting) {
+    case setting.0 {
+      frame.HeaderTableSize -> Settings(..acc, header_table_size: setting.1)
+      frame.EnablePush ->
+        Settings(..acc, enable_push: case setting.1 {
+          1 -> True
+          _ -> False
+        })
+      frame.MaxConcurrentStreams ->
+        Settings(..acc, max_concurrent_streams: option.Some(setting.1))
+      frame.InitialWindowSize -> Settings(..acc, initial_window_size: setting.1)
+      frame.MaxFrameSize -> Settings(..acc, max_frame_size: setting.1)
+      frame.MaxHeaderListSize ->
+        Settings(..acc, max_header_list_size: option.Some(setting.1))
+    }
+  })
 }
 
 fn encode_settings(settings: Settings) -> bytes_tree.BytesTree {
@@ -179,7 +179,13 @@ pub fn start(
   factory_name: process.Name(_),
   upgrade: option.Option(Upgrade),
 ) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(subject) {
+  actor.new_with_initialiser(1000, fn(_subject) {
+    let _ = transport.controlling_process(transport, socket, process.self())
+    let _ =
+      transport.set_opts(transport, socket, [
+        ActiveMode(Count(socket_active_count)),
+      ])
+
     let local_settings = server_settings()
     let remote_settings = case upgrade {
       option.Some(upgrade) -> upgrade.settings
@@ -194,7 +200,7 @@ pub fn start(
       bytes_tree.new()
       |> bytes_tree.append_tree(encode_settings(local_settings))
 
-    let selector = create_socket_selector()
+    let selector = create_socket_selector(self)
 
     let processed =
       State(
@@ -207,8 +213,8 @@ pub fn start(
         remote_settings:,
         settings_acked: False,
         settings_timeout:,
-        hpack_encoder: alpacki.new_dynamic(local_settings.header_table_size),
-        hpack_decoder: alpacki.new_dynamic(remote_settings.header_table_size),
+        hpack_encoder: alpacki.new_dynamic(remote_settings.header_table_size),
+        hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
         pending:,
         factory_name:,
         streams: dict.new(),
@@ -220,7 +226,7 @@ pub fn start(
         flush_pending(state)
         |> actor.initialised
         |> actor.selecting(selector)
-        |> actor.returning(subject)
+        |> actor.returning(Nil)
         |> Ok
       }
 
@@ -232,11 +238,13 @@ pub fn start(
   })
   |> actor.on_message(handle_message)
   |> actor.start()
-  |> result.map(after_start(_, transport, socket))
 }
 
-fn create_socket_selector() -> process.Selector(Message) {
+fn create_socket_selector(
+  self: process.Subject(Message),
+) -> process.Selector(Message) {
   process.new_selector()
+  |> process.select(self)
   |> process.select_record(atom.create("tcp"), 2, fn(record) {
     Packet(coerce_tcp_message(record))
   })
@@ -252,7 +260,7 @@ fn create_socket_selector() -> process.Selector(Message) {
 fn coerce_tcp_message(record: dynamic.Dynamic) -> BitArray
 
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
-  case message {
+  case echo message {
     Close -> actor.stop()
     TcpPassive -> {
       let _ =
@@ -263,9 +271,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       actor.continue(state)
     }
     Packet(data) -> {
-      case
+      let processed =
         process_buffer(State(..state, buffer: <<state.buffer:bits, data:bits>>))
-      {
+      case processed {
         Ok(state) -> flush_pending(state) |> actor.continue
         Error(#(state, code)) -> {
           send_goaway(state, code)
@@ -273,7 +281,10 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         }
       }
     }
-    SettingsTimeout -> todo
+    SettingsTimeout -> {
+      echo "silly timeout"
+      actor.stop()
+    }
   }
 }
 
@@ -287,7 +298,7 @@ fn send_goaway(state: State, code: frame.ErrorCode) -> Nil {
 }
 
 fn process_buffer(state: State) -> Result(State, #(State, frame.ErrorCode)) {
-  case echo frame.decode(state.buffer) {
+  case frame.decode(state.buffer) {
     Ok(#(frame, remaining)) ->
       case process_frame(State(..state, buffer: remaining), frame) {
         Ok(state) -> process_buffer(state)
@@ -328,17 +339,21 @@ fn process_init(
 ) -> Result(State, #(State, frame.ErrorCode)) {
   case frame {
     frame.Settings(settings) -> {
-      Ok(
-        State(
-          ..state,
-          remote_settings: decode_settings(settings),
-          mode: Open,
-          pending: bytes_tree.append_tree(
-            state.pending,
-            frame.encode(frame.SettingsAck),
-          ),
+      let remote_settings = decode_settings(settings)
+      State(
+        ..state,
+        remote_settings:,
+        hpack_encoder: alpacki.resize_dynamic(
+          state.hpack_encoder,
+          remote_settings.header_table_size,
+        ),
+        mode: Open,
+        pending: bytes_tree.append_tree(
+          state.pending,
+          frame.encode(frame.SettingsAck),
         ),
       )
+      |> Ok
     }
 
     _ -> todo
@@ -351,14 +366,19 @@ fn process_open(
 ) -> Result(State, #(State, frame.ErrorCode)) {
   case frame {
     frame.Settings(settings) -> {
+      let remote_settings = decode_settings(settings)
       let pending =
         bytes_tree.append_tree(state.pending, frame.encode(frame.SettingsAck))
-      Ok(State(..state, remote_settings: decode_settings(settings), pending:))
+      let hpack_encoder =
+        alpacki.resize_dynamic(
+          state.hpack_encoder,
+          remote_settings.header_table_size,
+        )
+
+      Ok(State(..state, remote_settings:, pending:, hpack_encoder:))
     }
     frame.SettingsAck -> {
-      option.map(state.settings_timeout, fn(timeout) {
-        process.cancel_timer(timeout)
-      })
+      option.map(state.settings_timeout, process.cancel_timer)
       Ok(State(..state, settings_acked: True, settings_timeout: option.None))
     }
 
@@ -407,7 +427,7 @@ fn process_continuation(
     -> {
       let fragments = <<fragments:bits, field_block:bits>>
       case end_headers {
-        True -> open_stream(state, stream_id, field_block, end_stream)
+        True -> open_stream(state, stream_id, fragments, end_stream)
         False ->
           State(
             ..state,
@@ -433,10 +453,6 @@ fn open_stream(
       echo build_request(headers)
 
       Ok(state)
-      // case build_request(headers) {
-      //   Ok(req) -> todo
-      //   Error(error) -> todo as "malformed request"
-      // }
     }
     Error(error) -> todo as "compression error"
   }
@@ -558,13 +574,12 @@ fn parse_header(
     }
 
     _ ->
-      Ok(
-        RequestBuilder(
-          ..builder,
-          headers: [#(field.name, field.value), ..builder.headers],
-          seen_regular: True,
-        ),
+      RequestBuilder(
+        ..builder,
+        headers: [#(field.name, field.value), ..builder.headers],
+        seen_regular: True,
       )
+      |> Ok
   }
 }
 
@@ -600,19 +615,4 @@ fn parse_authority(authority: String) -> #(String, option.Option(Int)) {
         Error(Nil) -> #(authority, option.None)
       }
   }
-}
-
-fn after_start(
-  started: actor.Started(a),
-  transport: transport.Transport,
-  socket: socket.Socket,
-) -> actor.Started(Nil) {
-  let _ = transport.controlling_process(transport, socket, started.pid)
-
-  let _ =
-    transport.set_opts(transport, socket, [
-      ActiveMode(Count(socket_active_count)),
-    ])
-
-  actor.Started(..started, data: Nil)
 }

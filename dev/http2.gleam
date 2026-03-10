@@ -6,8 +6,8 @@ import gleam/otp/supervision
 import logging
 
 pub fn main() {
-  logging.set_level(logging.Debug)
   logging.configure()
+  logging.set_level(logging.Debug)
 
   let assert Ok(_started) =
     supervisor.new(supervisor.OneForOne)
