@@ -1,6 +1,8 @@
 import alpacki
 import ewe/internal/http as http_
 import ewe/internal/http2/frame
+import ewe/internal/http2/message.{type ConnectionMessage, type StreamMessage}
+import ewe/internal/http2/stream
 import gleam/bytes_tree
 import gleam/dict
 import gleam/dynamic
@@ -13,12 +15,14 @@ import gleam/list
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import glisten
 import glisten/socket
 import glisten/socket/options.{ActiveMode, Count}
 import glisten/transport
+import logging
 
 const socket_active_count = 100
 
@@ -134,18 +138,22 @@ type State {
     settings_acked: Bool,
     settings_timeout: option.Option(process.Timer),
     pending: bytes_tree.BytesTree,
-    factory_name: process.Name(
-      factory.Message(fn() -> Result(actor.Started(Nil), actor.StartError), Nil),
-    ),
+    connection_subject: process.Subject(ConnectionMessage),
     streams: dict.Dict(Int, Stream),
+    last_stream_id: Int,
+    factory: factory.Supervisor(
+      fn() ->
+        Result(actor.Started(process.Subject(StreamMessage)), actor.StartError),
+      process.Subject(StreamMessage),
+    ),
   )
 }
 
 type Stream {
-  Stream(id: Int, window_size: Int)
+  Stream(id: Int, subject: process.Subject(StreamMessage))
 }
 
-fn append_pending(state: State, pending: bytes_tree.BytesTree) {
+fn append_pending(state: State, pending: bytes_tree.BytesTree) -> State {
   State(..state, pending: bytes_tree.append_tree(state.pending, pending))
 }
 
@@ -166,6 +174,7 @@ type Message {
   TcpPassive
   Packet(BitArray)
   SettingsTimeout
+  FromStream(ConnectionMessage)
 }
 
 pub type Upgrade {
@@ -176,7 +185,6 @@ pub fn start(
   transport: transport.Transport,
   socket: socket.Socket,
   buffer: BitArray,
-  factory_name: process.Name(_),
   upgrade: option.Option(Upgrade),
 ) -> Result(actor.Started(Nil), actor.StartError) {
   actor.new_with_initialiser(1000, fn(_subject) {
@@ -193,6 +201,7 @@ pub fn start(
     }
 
     let self = process.new_subject()
+    let connection_subject = process.new_subject()
     let settings_timeout =
       process.send_after(self, 10_000, SettingsTimeout)
       |> option.Some
@@ -200,40 +209,56 @@ pub fn start(
       bytes_tree.new()
       |> bytes_tree.append_tree(encode_settings(local_settings))
 
-    let selector = create_socket_selector(self)
+    let selector =
+      create_socket_selector(self)
+      |> process.select_map(for: connection_subject, mapping: FromStream)
 
-    let processed =
-      State(
-        transport:,
-        socket:,
-        self:,
-        mode: Init,
-        buffer:,
-        local_settings:,
-        remote_settings:,
-        settings_acked: False,
-        settings_timeout:,
-        hpack_encoder: alpacki.new_dynamic(remote_settings.header_table_size),
-        hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
-        pending:,
-        factory_name:,
-        streams: dict.new(),
-      )
-      |> process_buffer
+    let started =
+      factory.worker_child(fn(fun) { fun() })
+      |> factory.restart_strategy(supervision.Temporary)
+      |> factory.start
 
-    case processed {
-      Ok(state) -> {
-        flush_pending(state)
-        |> actor.initialised
-        |> actor.selecting(selector)
-        |> actor.returning(Nil)
-        |> Ok
+    case started {
+      Ok(actor.Started(data: factory, ..)) -> {
+        let processed =
+          State(
+            transport:,
+            socket:,
+            self:,
+            mode: Init,
+            buffer:,
+            local_settings:,
+            remote_settings:,
+            settings_acked: False,
+            settings_timeout:,
+            hpack_encoder: alpacki.new_dynamic(
+              remote_settings.header_table_size,
+            ),
+            hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
+            pending:,
+            connection_subject:,
+            streams: dict.new(),
+            last_stream_id: 0,
+            factory:,
+          )
+          |> process_buffer
+
+        case processed {
+          Ok(state) -> {
+            flush_pending(state)
+            |> actor.initialised
+            |> actor.selecting(selector)
+            |> actor.returning(Nil)
+            |> Ok
+          }
+
+          Error(state) -> {
+            flush_pending(state)
+            Error("Failed to start HTTP/2 connection")
+          }
+        }
       }
-
-      Error(#(state, code)) -> {
-        send_goaway(state, code)
-        Error("Failed to start a HTTP/2 connection")
-      }
+      Error(_) -> Error("Failed to start HTTP/2 streams factory")
     }
   })
   |> actor.on_message(handle_message)
@@ -275,8 +300,8 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         process_buffer(State(..state, buffer: <<state.buffer:bits, data:bits>>))
       case processed {
         Ok(state) -> flush_pending(state) |> actor.continue
-        Error(#(state, code)) -> {
-          send_goaway(state, code)
+        Error(state) -> {
+          flush_pending(state)
           actor.stop()
         }
       }
@@ -285,19 +310,18 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       echo "silly timeout"
       actor.stop()
     }
+    FromStream(message) -> handle_stream_message(state, message)
   }
 }
 
-fn send_goaway(state: State, code: frame.ErrorCode) -> Nil {
-  let _ =
-    frame.GoAway(0, code, <<>>)
-    |> frame.encode
-    |> bytes_tree.append_tree(state.pending, _)
-    |> transport.send(state.transport, state.socket, _)
-  Nil
+fn handle_stream_message(
+  state: State,
+  message: ConnectionMessage,
+) -> actor.Next(State, Message) {
+  todo
 }
 
-fn process_buffer(state: State) -> Result(State, #(State, frame.ErrorCode)) {
+fn process_buffer(state: State) -> Result(State, State) {
   case frame.decode(state.buffer) {
     Ok(#(frame, remaining)) ->
       case process_frame(State(..state, buffer: remaining), frame) {
@@ -320,10 +344,7 @@ fn process_buffer(state: State) -> Result(State, #(State, frame.ErrorCode)) {
   }
 }
 
-fn process_frame(
-  state: State,
-  frame: frame.Frame,
-) -> Result(State, #(State, frame.ErrorCode)) {
+fn process_frame(state: State, frame: frame.Frame) -> Result(State, State) {
   case state.mode {
     Init -> process_init(state, frame)
     Open -> process_open(state, frame)
@@ -333,10 +354,7 @@ fn process_frame(
   }
 }
 
-fn process_init(
-  state: State,
-  frame: frame.Frame,
-) -> Result(State, #(State, frame.ErrorCode)) {
+fn process_init(state: State, frame: frame.Frame) -> Result(State, State) {
   case frame {
     frame.Settings(settings) -> {
       let remote_settings = decode_settings(settings)
@@ -360,10 +378,7 @@ fn process_init(
   }
 }
 
-fn process_open(
-  state: State,
-  frame: frame.Frame,
-) -> Result(State, #(State, frame.ErrorCode)) {
+fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
   case frame {
     frame.Settings(settings) -> {
       let remote_settings = decode_settings(settings)
@@ -402,7 +417,7 @@ fn process_headers(
   end_headers: Bool,
   end_stream: Bool,
   field_block: BitArray,
-) -> Result(State, #(State, frame.ErrorCode)) {
+) -> Result(State, State) {
   case end_headers {
     True -> open_stream(state, stream_id, field_block, end_stream)
     False ->
@@ -420,7 +435,7 @@ fn process_continuation(
   expected_id: Int,
   fragments: BitArray,
   end_stream: Bool,
-) -> Result(State, #(State, frame.ErrorCode)) {
+) -> Result(State, State) {
   case frame {
     frame.Continuation(stream_id:, end_headers:, field_block:)
       if stream_id == expected_id
@@ -437,8 +452,21 @@ fn process_continuation(
       }
     }
     frame.Continuation(..) -> todo
-    _ -> Error(#(state, frame.ProtocolError))
+    _ ->
+      "received non-continuation frame while reading for field fragments"
+      |> append_goaway(state, frame.ProtocolError, _)
+      |> Error
   }
+}
+
+fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
+  let pending =
+    <<debug:utf8>>
+    |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
+    |> frame.encode
+    |> bytes_tree.append_tree(state.pending, _)
+
+  State(..state, pending:)
 }
 
 fn open_stream(
@@ -446,15 +474,70 @@ fn open_stream(
   stream_id: Int,
   field_block: BitArray,
   end_stream: Bool,
-) {
+) -> Result(State, State) {
   case alpacki.decode_header_block(field_block, state.hpack_decoder) {
     Ok(#(headers, hpack_decoder)) -> {
-      let state = State(..state, hpack_decoder:)
-      echo build_request(headers)
+      let state = State(..state, hpack_decoder:, last_stream_id: stream_id)
 
-      Ok(state)
+      case build_request(headers) {
+        Ok(request) -> {
+          let started =
+            factory.start_child(state.factory, fn() {
+              stream.start(
+                stream_id,
+                request,
+                end_stream,
+                state.connection_subject,
+                state.local_settings.initial_window_size,
+              )
+            })
+
+          case started {
+            Ok(actor.Started(data: subject, ..)) -> {
+              let stream = Stream(id: stream_id, subject:)
+              let streams = dict.insert(state.streams, stream_id, stream)
+              Ok(State(..state, streams:))
+            }
+            Error(err) -> {
+              logging.log(
+                logging.Warning,
+                "failed to start stream "
+                  <> int.to_string(stream_id)
+                  <> ": "
+                  <> string.inspect(err),
+              )
+
+              frame.RstStream(stream_id:, code: frame.InternalError)
+              |> frame.encode
+              |> append_pending(state, _)
+              |> Ok
+            }
+          }
+        }
+        Error(err) -> {
+          logging.log(
+            logging.Warning,
+            "malformed request on stream "
+              <> int.to_string(stream_id)
+              <> ": "
+              <> string.inspect(err),
+          )
+          frame.RstStream(stream_id:, code: frame.ProtocolError)
+          |> frame.encode
+          |> append_pending(state, _)
+          |> Ok
+        }
+      }
     }
-    Error(error) -> todo as "compression error"
+    Error(err) -> {
+      logging.log(
+        logging.Warning,
+        "HPACK decompression error: " <> string.inspect(err),
+      )
+      "HPACK decompression failure"
+      |> append_goaway(state, frame.CompressionError, _)
+      |> Error
+    }
   }
 }
 
@@ -470,6 +553,7 @@ type RequestBuilder {
   RequestBuilder(
     method: option.Option(http.Method),
     path: option.Option(String),
+    query: option.Option(String),
     scheme: option.Option(http.Scheme),
     host: String,
     port: option.Option(Int),
@@ -486,6 +570,7 @@ fn build_request(
     RequestBuilder(
       method: option.None,
       path: option.None,
+      query: option.None,
       scheme: option.None,
       host: "",
       port: option.None,
@@ -497,15 +582,15 @@ fn build_request(
   use builder <- result.try(list.try_fold(headers, builder, parse_header))
 
   use method <- result.try(case builder.method {
-    option.Some(m) -> Ok(m)
+    option.Some(method) -> Ok(method)
     option.None -> Error(MissingPseudoHeader(":method"))
   })
   use path <- result.try(case builder.path {
-    option.Some(p) -> Ok(p)
+    option.Some(path) -> Ok(path)
     option.None -> Error(MissingPseudoHeader(":path"))
   })
   use scheme <- result.try(case builder.scheme {
-    option.Some(s) -> Ok(s)
+    option.Some(scheme) -> Ok(scheme)
     option.None -> Error(MissingPseudoHeader(":scheme"))
   })
 
@@ -518,12 +603,12 @@ fn build_request(
   Ok(request.Request(
     method:,
     path:,
+    query: builder.query,
     scheme:,
     host: builder.host,
     port: builder.port,
     headers:,
     body: "",
-    query: option.None,
   ))
 }
 
@@ -545,7 +630,18 @@ fn parse_header(
 
     ":path" -> {
       use <- require_no_duplicate(builder.path, field.name)
-      Ok(RequestBuilder(..builder, path: option.Some(field.value)))
+      case string.split_once(field.value, "?") {
+        Ok(#(path, query)) ->
+          RequestBuilder(
+            ..builder,
+            path: option.Some(path),
+            query: option.Some(query),
+          )
+          |> Ok
+
+        Error(Nil) ->
+          Ok(RequestBuilder(..builder, path: option.Some(field.value)))
+      }
     }
 
     ":scheme" -> {
@@ -557,10 +653,7 @@ fn parse_header(
     }
 
     ":authority" -> {
-      use <- require_no_duplicate(
-        option.Some(builder.host) |> option.then(string.to_option),
-        field.name,
-      )
+      use <- require_no_duplicate(string.to_option(builder.host), field.name)
       let #(host, port) = parse_authority(field.value)
       Ok(RequestBuilder(..builder, host:, port:))
     }

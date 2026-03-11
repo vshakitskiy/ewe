@@ -7,6 +7,8 @@ import gleam/http/response.{type Response}
 import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
+import gleam/otp/static_supervisor as supervisor
+import gleam/result
 import glisten
 
 /// State of the request handler.
@@ -46,7 +48,7 @@ pub fn loop(
 
     case state, message {
       Http1(state, self), glisten.Packet(message) -> {
-        let result =
+        let handled =
           handler_.handle_packet(
             state,
             conn,
@@ -57,19 +59,13 @@ pub fn loop(
             idle_timeout,
           )
 
-        case result {
+        case handled {
           handler_.Continue(state) -> glisten.continue(Http1(state, self))
           handler_.Http2Upgrade(handler_.Direct(data:)) -> {
             let supervisor = factory.get_by_name(factory_name)
             let started =
               factory.start_child(supervisor, fn() {
-                http2.start(
-                  conn.transport,
-                  conn.socket,
-                  data,
-                  factory_name,
-                  option.None,
-                )
+                http2.start(conn.transport, conn.socket, data, option.None)
               })
 
             case started {
