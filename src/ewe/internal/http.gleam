@@ -33,9 +33,14 @@ import websocks
 // -----------------------------------------------------------------------------
 
 /// Connection to a client.
-/// 
+///
 pub type Connection {
-  Connection(
+  HttpConnection(Http)
+  Http2Connection
+}
+
+pub type Http {
+  Http(
     transport: Transport,
     socket: Socket,
     buffer: Buffer,
@@ -45,13 +50,17 @@ pub type Connection {
   )
 }
 
+pub type Http2 {
+  Http2(transport: Transport, socket: Socket)
+}
+
 /// Transforms a glisten connection.
-/// 
+///
 pub fn transform_connection(
   conn: glisten.Connection(a),
   factory_name: process.Name(_),
-) -> Connection {
-  Connection(
+) -> Http {
+  Http(
     transport: conn.transport,
     socket: conn.socket,
     buffer: Buffer(<<>>, 0),
@@ -60,7 +69,7 @@ pub fn transform_connection(
 }
 
 /// Reads data from the socket with timeout and size limits.
-/// 
+///
 fn read_from_socket(
   transport transport: Transport,
   socket socket: Socket,
@@ -86,7 +95,7 @@ fn read_from_socket(
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur when parsing a request.
-/// 
+///
 pub type ParseError {
   // request line
   InvalidMethod
@@ -106,30 +115,30 @@ pub type ParseError {
 }
 
 /// HTTP version enumeration.
-/// 
+///
 pub type HttpVersion {
   Http10
   Http11
 }
 
 /// Result of parsing a request.
-/// 
+///
 pub type ParsedRequest {
-  HttpRequest(req: Request(Connection), version: HttpVersion)
+  HttpRequest(req: Request(Http), version: HttpVersion)
   Http2Upgrade(upgrade: Http2Upgrade)
 }
 
 /// HTTP/2 upgrade options.
 ///
 pub type Http2Upgrade {
-  Upgrade(req: Request(Connection), settings: String)
+  Upgrade(req: Request(Http), settings: String)
   Direct(data: BitArray)
 }
 
 /// Parses an HTTP request from the given buffer.
-/// 
+///
 pub fn parse_request(
-  conn: Connection,
+  conn: Http,
   buffer: Buffer,
 ) -> Result(ParsedRequest, ParseError) {
   let transport = conn.transport
@@ -182,11 +191,13 @@ pub fn parse_request(
           })
         })
 
+      let conn = Http(..conn, buffer: Buffer(rest, 0))
+
       let req =
         Request(
           method:,
           headers: dict.to_list(headers),
-          body: Connection(..conn, buffer: Buffer(rest, 0)),
+          body: Http(..conn, buffer: Buffer(rest, 0)),
           scheme:,
           host:,
           port:,
@@ -234,7 +245,7 @@ pub fn parse_request(
 }
 
 /// Parses HTTP headers from the buffer.
-/// 
+///
 fn parse_headers(
   transport transport: Transport,
   socket socket: Socket,
@@ -304,7 +315,7 @@ fn parse_headers(
 fn validate_field_value(value: BitArray) -> Result(String, Nil)
 
 /// Inserts a header into the headers dictionary.
-/// 
+///
 fn insert_header(
   headers: Dict(String, String),
   field: String,
@@ -323,7 +334,7 @@ fn insert_header(
 }
 
 /// Finds an available key for set-cookie headers.
-/// 
+///
 fn available_cookie_key(headers: Dict(String, String), idx: Int) -> String {
   let key = case idx {
     0 -> "set-cookie"
@@ -340,15 +351,25 @@ fn available_cookie_key(headers: Dict(String, String), idx: Int) -> String {
 // -----------------------------------------------------------------------------
 
 /// 2MB (2 million bytes).
-/// 
+///
 const max_reading_size = 2_000_000
 
 /// Reads the request body from the socket.
-/// 
+///
 pub fn read_body(
   req: Request(Connection),
   size_limit: Int,
 ) -> Result(Request(BitArray), ParseError) {
+  case req.body {
+    HttpConnection(http) ->
+      request.set_body(req, http)
+      |> http_read_body(size_limit)
+
+    Http2Connection -> todo
+  }
+}
+
+fn http_read_body(req: Request(Http), size_limit: Int) {
   use _ <- try(handle_continue(req))
 
   let transport = req.body.transport
@@ -413,7 +434,7 @@ pub fn read_body(
 }
 
 /// Reads a chunked transfer-encoded body.
-/// 
+///
 fn read_chunked_body(
   transport transport: Transport,
   socket socket: Socket,
@@ -457,7 +478,7 @@ fn read_chunked_body(
 }
 
 /// Parses a single chunk from the chunked body.
-/// 
+///
 fn parse_body_chunk(buffer: Buffer) -> Result(BodyChunk, ParseError) {
   case split(buffer.data, <<"\r\n">>, []) {
     [<<"0">>, rest] -> Ok(FinalChunk(Buffer(rest, 0)))
@@ -550,14 +571,14 @@ fn is_forbidden_trailer(field: String) -> Bool {
 // -----------------------------------------------------------------------------
 
 /// Possible results of consuming some amount of data from the request body.
-/// 
+///
 pub type Stream {
   Consumed(data: BitArray, next: fn(Int) -> Result(Stream, ParseError))
   Done
 }
 
 /// Chunked body parsing result.
-/// 
+///
 type BodyChunk {
   Incomplete
   Chunk(BitArray, size: Int, rest: Buffer)
@@ -565,14 +586,23 @@ type BodyChunk {
 }
 
 /// State of the chunked body parsing.
-/// 
+///
 type ChunkedStreamState {
   ChunkedStreamState(data: Buffer, chunk: Buffer, done: Bool)
 }
 
 /// Streams the request body from the socket.
-/// 
+///
 pub fn stream_body(req: Request(Connection)) {
+  case req.body {
+    HttpConnection(http) ->
+      request.set_body(req, http)
+      |> http_stream_body
+    Http2Connection -> todo
+  }
+}
+
+fn http_stream_body(req: Request(Http)) {
   use _ <- result.try(
     handle_continue(req)
     |> result.replace_error(InvalidBody),
@@ -598,10 +628,10 @@ pub fn stream_body(req: Request(Connection)) {
   }
 }
 
-/// Creates a consumer function that reads `N` amount of bytes from the chunked 
+/// Creates a consumer function that reads `N` amount of bytes from the chunked
 /// request body until it is fully consumed.
 fn do_stream_body_chunked(
-  req: Request(Connection),
+  req: Request(Http),
   chunked_stream_state: ChunkedStreamState,
 ) -> fn(Int) -> Result(Stream, ParseError) {
   fn(size: Int) {
@@ -691,9 +721,9 @@ fn read_from_socket_until(
 
 /// Creates a consumer function that reads `N` amount of bytes from the request
 /// body until it is fully consumed.
-/// 
+///
 fn do_stream_body(
-  req: Request(Connection),
+  req: Request(Http),
   buffer: Buffer,
 ) -> fn(Int) -> Result(Stream, ParseError) {
   fn(size: Int) {
@@ -703,14 +733,14 @@ fn do_stream_body(
       // Request body is fully consumed
       0, 0 -> Ok(Done)
 
-      // Request body is supposed to be fully consumed but there is more data 
+      // Request body is supposed to be fully consumed but there is more data
       // in buffer
       0, _ -> {
         let #(data, rest) = buffer.split(buffer, size)
         Ok(Consumed(data, do_stream_body(req, Buffer(rest, 0))))
       }
 
-      // Request body is not fully consumed and there is enough data in buffer 
+      // Request body is not fully consumed and there is enough data in buffer
       // to consume `size` bytes
       _, buffer_size if buffer_size >= size -> {
         let #(data, rest) = buffer.split(buffer, size)
@@ -718,7 +748,7 @@ fn do_stream_body(
         Ok(Consumed(data, do_stream_body(req, new_buffer)))
       }
 
-      // Request body is not fully consumed and there is not enough data in 
+      // Request body is not fully consumed and there is not enough data in
       // buffer to consume `size` bytes
       _, _ -> {
         use read_buffer <- try(read_from_socket(
@@ -745,7 +775,7 @@ fn do_stream_body(
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur when upgrading a WebSocket connection.
-/// 
+///
 pub type UpgradeWebsocketError {
   MethodNotGet
   MissingConnectionHeader
@@ -757,7 +787,7 @@ pub type UpgradeWebsocketError {
 }
 
 /// Upgrades an HTTP connection to WebSocket.
-/// 
+///
 pub fn upgrade_websocket(
   req: Request(Connection),
   transport: Transport,
@@ -833,7 +863,7 @@ pub fn upgrade_websocket(
 // -----------------------------------------------------------------------------
 
 /// Response body variants.
-/// 
+///
 pub type ResponseBody {
   TextData(String)
   BytesData(BytesTree)
@@ -847,10 +877,10 @@ pub type ResponseBody {
 }
 
 /// Appends default headers to HTTP responses.
-/// 
+///
 pub fn append_default_headers(
   resp: Response(a),
-  req: Request(Connection),
+  req: Request(b),
   version: HttpVersion,
 ) -> Response(a) {
   let set_close = request.get_header(req, "connection") == Ok("close")
@@ -872,7 +902,7 @@ pub fn append_default_headers(
 }
 
 /// Sets the content length header if it is not already set.
-/// 
+///
 pub fn set_content_length(resp: Response(BitArray)) -> Response(BitArray) {
   case response.get_header(resp, "content-length") {
     Ok(_) -> resp
@@ -884,8 +914,8 @@ pub fn set_content_length(resp: Response(BitArray)) -> Response(BitArray) {
 }
 
 /// Handles 100-continue expectations.
-/// 
-pub fn handle_continue(req: Request(Connection)) -> Result(Nil, ParseError) {
+///
+pub fn handle_continue(req: Request(Http)) -> Result(Nil, ParseError) {
   let expect =
     req.headers
     |> list.find(fn(tupple) {

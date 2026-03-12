@@ -225,10 +225,14 @@ pub type SocketAddress {
 pub fn get_client_info(
   connection connection: Connection,
 ) -> Result(SocketAddress, Nil) {
-  transport.peername(connection.transport, connection.socket)
-  |> result.map(fn(server_info) {
-    SocketAddress(glisten_options_to_ewe_ip(server_info.0), server_info.1)
-  })
+  case connection {
+    http_.HttpConnection(connection) ->
+      transport.peername(connection.transport, connection.socket)
+      |> result.map(fn(server_info) {
+        SocketAddress(glisten_options_to_ewe_ip(server_info.0), server_info.1)
+      })
+    http_.Http2Connection -> todo
+  }
 }
 
 /// Gets the server's bound address and port. Requires the server to be running
@@ -421,7 +425,7 @@ pub fn enable_ipv6(builder: Builder) -> Builder {
   Builder(..builder, ipv6: True)
 }
 
-/// Enables TLS (HTTPS) support, with provided certificate and key files. 
+/// Enables TLS (HTTPS) support, with provided certificate and key files.
 /// Crashes the program if the files don't exist or are invalid.
 pub fn enable_tls(
   builder: Builder,
@@ -553,8 +557,8 @@ pub type BodyError {
 pub type Request =
   HttpRequest(Connection)
 
-/// Reads body from the request. Returns `BodyTooLarge` if body exceeds 
-/// `bytes_limit`, or `InvalidBody` if malformed. Supports both chunked and 
+/// Reads body from the request. Returns `BodyTooLarge` if body exceeds
+/// `bytes_limit`, or `InvalidBody` if malformed. Supports both chunked and
 /// content-length bodies.
 pub fn read_body(
   req: Request,
@@ -669,28 +673,34 @@ pub fn chunked_body(
     |> to_internal_chunked_next()
   }
 
-  let transport = req.body.transport
-  let socket = req.body.socket
-  let factory_name = req.body.factory_name
+  case req.body {
+    http_.HttpConnection(conn) -> {
+      let transport = conn.transport
+      let socket = conn.socket
+      let factory_name = conn.factory_name
 
-  case chunked.send_response(resp, transport, socket) {
-    Ok(Nil) -> {
-      let supervisor = factory.get_by_name(factory_name)
+      case chunked.send_response(resp, transport, socket) {
+        Ok(Nil) -> {
+          let supervisor = factory.get_by_name(factory_name)
 
-      let start_result =
-        factory.start_child(supervisor, fn() {
-          chunked.start(transport, socket, on_init, handler, on_close)
-        })
+          let start_result =
+            factory.start_child(supervisor, fn() {
+              chunked.start(transport, socket, on_init, handler, on_close)
+            })
 
-      case start_result {
-        Ok(started) -> {
-          let _ = transport.controlling_process(transport, socket, started.pid)
-          response.new(200) |> response.set_body(Chunked)
+          case start_result {
+            Ok(started) -> {
+              let _ =
+                transport.controlling_process(transport, socket, started.pid)
+              response.new(200) |> response.set_body(Chunked)
+            }
+            Error(_) -> response.new(400) |> response.set_body(Empty)
+          }
         }
-        Error(_) -> response.new(400) |> response.set_body(Empty)
+        Error(Nil) -> response.new(400) |> response.set_body(Empty)
       }
     }
-    Error(Nil) -> response.new(400) |> response.set_body(Empty)
+    http_.Http2Connection -> todo
   }
 }
 
@@ -825,36 +835,42 @@ pub fn upgrade_websocket(
     |> to_internal_websocket_next()
   }
 
-  let transport = req.body.transport
-  let socket = req.body.socket
-  let factory_name = req.body.factory_name
+  case req.body {
+    http_.HttpConnection(conn) -> {
+      let transport = conn.transport
+      let socket = conn.socket
+      let factory_name = conn.factory_name
 
-  case http_.upgrade_websocket(req, transport, socket) {
-    Ok(#(extensions, per_message_deflate)) -> {
-      let supervisor = factory.get_by_name(factory_name)
-      let start_result =
-        factory.start_child(supervisor, fn() {
-          websocket.start(
-            transport,
-            socket,
-            on_init,
-            handler,
-            on_close,
-            extensions,
-            per_message_deflate,
-          )
-        })
+      case http_.upgrade_websocket(req, transport, socket) {
+        Ok(#(extensions, per_message_deflate)) -> {
+          let supervisor = factory.get_by_name(factory_name)
+          let start_result =
+            factory.start_child(supervisor, fn() {
+              websocket.start(
+                transport,
+                socket,
+                on_init,
+                handler,
+                on_close,
+                extensions,
+                per_message_deflate,
+              )
+            })
 
-      case start_result {
-        Ok(started) -> {
-          let _ = transport.controlling_process(transport, socket, started.pid)
+          case start_result {
+            Ok(started) -> {
+              let _ =
+                transport.controlling_process(transport, socket, started.pid)
 
-          response.new(200) |> response.set_body(Websocket)
+              response.new(200) |> response.set_body(Websocket)
+            }
+            Error(_) -> response.new(500) |> response.set_body(Empty)
+          }
         }
-        Error(_) -> response.new(500) |> response.set_body(Empty)
+        Error(_) -> response.new(400) |> response.set_body(Empty)
       }
     }
-    Error(_) -> response.new(400) |> response.set_body(Empty)
+    http_.Http2Connection -> todo
   }
 }
 
@@ -1046,27 +1062,33 @@ pub fn sse(
     |> to_internal_sse_next()
   }
 
-  let transport = req.body.transport
-  let socket = req.body.socket
-  let factory_name = req.body.factory_name
+  case req.body {
+    http_.HttpConnection(conn) -> {
+      let transport = conn.transport
+      let socket = conn.socket
+      let factory_name = conn.factory_name
 
-  case sse.send_response(transport, socket) {
-    Ok(Nil) -> {
-      let supervisor = factory.get_by_name(factory_name)
-      let start_result =
-        factory.start_child(supervisor, fn() {
-          sse.start(transport, socket, on_init, handler, on_close)
-        })
+      case sse.send_response(transport, socket) {
+        Ok(Nil) -> {
+          let supervisor = factory.get_by_name(factory_name)
+          let start_result =
+            factory.start_child(supervisor, fn() {
+              sse.start(transport, socket, on_init, handler, on_close)
+            })
 
-      case start_result {
-        Ok(started) -> {
-          let _ = transport.controlling_process(transport, socket, started.pid)
-          response.new(200) |> response.set_body(SSE)
+          case start_result {
+            Ok(started) -> {
+              let _ =
+                transport.controlling_process(transport, socket, started.pid)
+              response.new(200) |> response.set_body(SSE)
+            }
+            Error(_) -> response.new(400) |> response.set_body(Empty)
+          }
         }
-        Error(_) -> response.new(400) |> response.set_body(Empty)
+        Error(Nil) -> response.new(400) |> response.set_body(Empty)
       }
     }
-    Error(Nil) -> response.new(400) |> response.set_body(Empty)
+    http_.Http2Connection -> todo
   }
 }
 

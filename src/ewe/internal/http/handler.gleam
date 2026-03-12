@@ -40,21 +40,14 @@ pub fn init() -> HttpHandler {
 pub type Next {
   Continue(state: HttpHandler)
   Stop
-  Http2Upgrade(upgrade: Http2Upgrade)
-}
-
-/// HTTP/2 upgrade options.
-///
-pub type Http2Upgrade {
-  Upgrade(request: Request(Connection), settings: String)
-  Direct(data: BitArray)
+  Http2Upgrade(upgrade: http_.Http2Upgrade)
 }
 
 /// Handles received glisten packet.
 ///
 pub fn handle_packet(
   state: HttpHandler,
-  connection: Connection,
+  connection: http_.Http,
   data: BitArray,
   glisten_subject: process.Subject(glisten_handler.Message(_)),
   handler: fn(Request(Connection)) -> Response(ResponseBody),
@@ -76,9 +69,7 @@ pub fn handle_packet(
         Error(Nil) -> Stop
       }
     }
-    Ok(http_.Http2Upgrade(http_.Direct(data))) -> Http2Upgrade(Direct(data:))
-    Ok(http_.Http2Upgrade(http_.Upgrade(request, settings))) ->
-      Http2Upgrade(Upgrade(request:, settings:))
+    Ok(http_.Http2Upgrade(upgrade)) -> Http2Upgrade(upgrade:)
     Error(reason) -> {
       let status = case reason {
         http_.InvalidVersion -> 505
@@ -100,14 +91,19 @@ pub fn handle_packet(
 /// Takes parsed HTTP request and calls the handler.
 ///
 fn call(
-  request: Request(Connection),
+  request: Request(http_.Http),
   version: HttpVersion,
   glisten_subject: process.Subject(glisten_handler.Message(_)),
   handler: fn(Request(Connection)) -> Response(ResponseBody),
   on_crash: Response(ResponseBody),
   idle_timeout: Int,
 ) -> Result(HttpHandler, Nil) {
-  let response = case exception.rescue(fn() { handler(request) }) {
+  let response = case
+    exception.rescue(fn() {
+      request.set_body(request, http_.HttpConnection(request.body))
+      |> handler
+    })
+  {
     Ok(response) -> response
     Error(e) -> {
       logging.log(logging.Error, string.inspect(e))
@@ -150,7 +146,7 @@ fn on_sent(
 /// Sends a file to the client.
 ///
 fn send_file(
-  request: Request(Connection),
+  request: Request(http_.Http),
   version: HttpVersion,
   response: Response(ResponseBody),
   descriptor: file.IoDevice,
@@ -186,7 +182,7 @@ fn send_file(
 /// Sends a body to the client.
 ///
 fn send_body(
-  request: Request(Connection),
+  request: Request(http_.Http),
   version: HttpVersion,
   response: Response(ResponseBody),
 ) -> Result(Nil, glisten.SocketReason) {
@@ -236,7 +232,7 @@ fn send_body(
 
 /// Can the body be encoded to gzip?
 ///
-fn can_encode_gzip(request: Request(Connection), response: Response(_)) -> Bool {
+fn can_encode_gzip(request: Request(http_.Http), response: Response(_)) -> Bool {
   let accept_encoding =
     request.get_header(request, "accept-encoding")
     |> result.map(string.contains(_, "gzip"))

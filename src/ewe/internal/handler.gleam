@@ -7,8 +7,6 @@ import gleam/http/response.{type Response}
 import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
-import gleam/otp/static_supervisor as supervisor
-import gleam/result
 import glisten
 
 /// State of the request handler.
@@ -61,11 +59,17 @@ pub fn loop(
 
         case handled {
           handler_.Continue(state) -> glisten.continue(Http1(state, self))
-          handler_.Http2Upgrade(handler_.Direct(data:)) -> {
+          handler_.Http2Upgrade(http_.Direct(data:)) -> {
             let supervisor = factory.get_by_name(factory_name)
             let started =
               factory.start_child(supervisor, fn() {
-                http2.start(conn.transport, conn.socket, data, option.None)
+                http2.start(
+                  conn.transport,
+                  conn.socket,
+                  data,
+                  option.None,
+                  handler,
+                )
               })
 
             case started {
@@ -74,11 +78,11 @@ pub fn loop(
                 glisten.stop_abnormal("Failed to spawn HTTP/2 connection")
             }
           }
-          handler_.Http2Upgrade(handler_.Upgrade(request:, settings:)) ->
+          handler_.Http2Upgrade(http_.Upgrade(req:, settings:)) ->
             http2.handle_http_upgrade(
               conn.transport,
               conn.socket,
-              request,
+              req,
               settings,
             )
           handler_.Stop -> glisten.stop()

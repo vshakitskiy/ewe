@@ -1,8 +1,12 @@
 import alpacki
-import ewe/internal/http as http_
+import ewe/internal/http.{
+  type ResponseBody, BitsData, BytesData, Chunked, Empty, File, SSE,
+  StringTreeData, TextData, Websocket,
+} as http_
 import ewe/internal/http2/frame
 import ewe/internal/http2/message.{type ConnectionMessage, type StreamMessage}
 import ewe/internal/http2/stream
+import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
 import gleam/dynamic
@@ -10,6 +14,7 @@ import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
+import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option
@@ -18,6 +23,7 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import gleam/string_tree
 import glisten
 import glisten/socket
 import glisten/socket/options.{ActiveMode, Count}
@@ -106,7 +112,7 @@ fn encode_settings(settings: Settings) -> bytes_tree.BytesTree {
 pub fn handle_http_upgrade(
   transport: transport.Transport,
   socket: socket.Socket,
-  _request: request.Request(http_.Connection),
+  _request: request.Request(http_.Http),
   _settings: String,
 ) {
   let _ =
@@ -146,6 +152,8 @@ type State {
         Result(actor.Started(process.Subject(StreamMessage)), actor.StartError),
       process.Subject(StreamMessage),
     ),
+    handler: fn(request.Request(http_.Connection)) ->
+      response.Response(http_.ResponseBody),
   )
 }
 
@@ -162,6 +170,16 @@ fn flush_pending(state: State) -> State {
   State(..state, pending: bytes_tree.new())
 }
 
+fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
+  let pending =
+    <<debug:utf8>>
+    |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
+    |> frame.encode
+    |> bytes_tree.append_tree(state.pending, _)
+
+  State(..state, pending:)
+}
+
 type Mode {
   Init
   Open
@@ -175,6 +193,7 @@ type Message {
   Packet(BitArray)
   SettingsTimeout
   FromStream(ConnectionMessage)
+  StreamDown(process.Down)
 }
 
 pub type Upgrade {
@@ -186,6 +205,8 @@ pub fn start(
   socket: socket.Socket,
   buffer: BitArray,
   upgrade: option.Option(Upgrade),
+  handler: fn(request.Request(http_.Connection)) ->
+    response.Response(http_.ResponseBody),
 ) -> Result(actor.Started(Nil), actor.StartError) {
   actor.new_with_initialiser(1000, fn(_subject) {
     let _ = transport.controlling_process(transport, socket, process.self())
@@ -240,6 +261,7 @@ pub fn start(
             streams: dict.new(),
             last_stream_id: 0,
             factory:,
+            handler:,
           )
           |> process_buffer
 
@@ -279,6 +301,7 @@ fn create_socket_selector(
   |> process.select_record(atom.create("tcp_closed"), 1, fn(_) { Close })
   |> process.select_record(atom.create("ssl_closed"), 1, fn(_) { Close })
   |> process.select_record(atom.create("tcp_passive"), 1, fn(_) { TcpPassive })
+  |> process.select_monitors(StreamDown)
 }
 
 @external(erlang, "ewe_ffi", "coerce_tcp_message")
@@ -311,6 +334,10 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       actor.stop()
     }
     FromStream(message) -> handle_stream_message(state, message)
+    StreamDown(down) -> {
+      echo down as "Stream is down"
+      actor.continue(state)
+    }
   }
 }
 
@@ -318,7 +345,74 @@ fn handle_stream_message(
   state: State,
   message: ConnectionMessage,
 ) -> actor.Next(State, Message) {
-  todo
+  case message {
+    message.WindowUpdate(stream_id:, increment:) -> todo
+    message.SendResponse(stream_id:, response:) ->
+      send_response(state, stream_id, response)
+      |> flush_pending
+      |> actor.continue
+  }
+}
+
+fn send_response(
+  state: State,
+  stream_id: Int,
+  resp: response.Response(ResponseBody),
+) -> State {
+  let body = response_body_to_bits(resp.body)
+
+  let headers = [
+    alpacki.HeaderField(
+      name: ":status",
+      value: int.to_string(resp.status),
+      indexing: alpacki.WithIndexing,
+    ),
+    ..list.map(resp.headers, fn(header) {
+      alpacki.HeaderField(
+        name: header.0,
+        value: header.1,
+        indexing: alpacki.WithIndexing,
+      )
+    })
+  ]
+
+  let #(encoded_headers, hpack_encoder) =
+    alpacki.encode_header_block(headers, state.hpack_encoder, huffman: True)
+  let field_block = bytes_tree.to_bit_array(encoded_headers)
+
+  let has_body = bit_array.byte_size(body) > 0
+
+  let state =
+    frame.Headers(
+      stream_id:,
+      end_headers: True,
+      end_stream: !has_body,
+      field_block:,
+    )
+    |> frame.encode
+    |> append_pending(State(..state, hpack_encoder:), _)
+
+  case has_body {
+    True ->
+      frame.Data(stream_id:, end_stream: True, data: body)
+      |> frame.encode
+      |> append_pending(state, _)
+    False -> state
+  }
+}
+
+fn response_body_to_bits(body: ResponseBody) -> BitArray {
+  case body {
+    TextData(text) -> bit_array.from_string(text)
+    StringTreeData(tree) -> string_tree.to_string(tree) |> bit_array.from_string
+    BitsData(bits) -> bits
+    BytesData(bytes) -> bytes_tree.to_bit_array(bytes)
+    Empty -> <<>>
+    File(..) -> todo as "File responses not yet supported for HTTP/2"
+    Chunked -> todo as "Chunked responses not yet supported for HTTP/2"
+    Websocket -> todo as "WebSocket not yet supported for HTTP/2"
+    SSE -> todo as "SSE not yet supported for HTTP/2"
+  }
 }
 
 fn process_buffer(state: State) -> Result(State, State) {
@@ -459,16 +553,6 @@ fn process_continuation(
   }
 }
 
-fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
-  let pending =
-    <<debug:utf8>>
-    |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
-    |> frame.encode
-    |> bytes_tree.append_tree(state.pending, _)
-
-  State(..state, pending:)
-}
-
 fn open_stream(
   state: State,
   stream_id: Int,
@@ -486,6 +570,7 @@ fn open_stream(
               stream.start(
                 stream_id,
                 request,
+                state.handler,
                 end_stream,
                 state.connection_subject,
                 state.local_settings.initial_window_size,
@@ -493,7 +578,8 @@ fn open_stream(
             })
 
           case started {
-            Ok(actor.Started(data: subject, ..)) -> {
+            Ok(actor.Started(pid:, data: subject)) -> {
+              process.monitor(pid)
               let stream = Stream(id: stream_id, subject:)
               let streams = dict.insert(state.streams, stream_id, stream)
               Ok(State(..state, streams:))
@@ -565,7 +651,7 @@ type RequestBuilder {
 
 fn build_request(
   headers: List(alpacki.HeaderField),
-) -> Result(request.Request(String), RequestError) {
+) -> Result(request.Request(Nil), RequestError) {
   let builder =
     RequestBuilder(
       method: option.None,
@@ -579,7 +665,7 @@ fn build_request(
       seen_regular: False,
     )
 
-  use builder <- result.try(list.try_fold(headers, builder, parse_header))
+  use builder <- result.try(list.try_fold(headers, builder, parse_header_field))
 
   use method <- result.try(case builder.method {
     option.Some(method) -> Ok(method)
@@ -608,11 +694,11 @@ fn build_request(
     host: builder.host,
     port: builder.port,
     headers:,
-    body: "",
+    body: Nil,
   ))
 }
 
-fn parse_header(
+fn parse_header_field(
   builder: RequestBuilder,
   field: alpacki.HeaderField,
 ) -> Result(RequestBuilder, RequestError) {
