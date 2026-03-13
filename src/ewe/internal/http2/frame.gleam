@@ -37,22 +37,22 @@ pub type ErrorCode {
   Http11Required
 }
 
-pub type SettingId {
+pub type Setting {
   // 0x01; Maximum size of the HPACK dynamic table. The initial value is 4096
   // octets.
-  HeaderTableSize
+  HeaderTableSize(Int)
   // 0x02; Whether server push is enabled.
-  EnablePush
+  EnablePush(Int)
   // 0x03; Maximum concurrent streams allowed. There is no limit by default.
-  MaxConcurrentStreams
+  MaxConcurrentStreams(Int)
   // 0x04; Initial flow control window size. The initial value is 65_535 octets.
-  InitialWindowSize
+  InitialWindowSize(Int)
   // 0x05; Maximum frame payload size. The initial value is 16_384 octets. The
   // maximum allowed size is 16_777_215 octets.
-  MaxFrameSize
+  MaxFrameSize(Int)
   // 0x06; Maximum ammount of field section size that the sender is prepared to
   // accept, in units of octets. There is no limit by default.
-  MaxHeaderListSize
+  MaxHeaderListSize(Int)
 }
 
 pub type Frame {
@@ -109,7 +109,7 @@ pub type Frame {
 
   // 6.5 SETTINGS; Consists of zero or more settings for a connection.
   // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5
-  Settings(settings: List(#(SettingId, Int)))
+  Settings(settings: List(Setting))
 
   // 6.5 SETTINGS; Acknowledges the receipt of a SETTINGS frame.
   // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5
@@ -411,32 +411,32 @@ pub fn decode_settings_payload(payload: BitArray) -> Result(Frame, DecodeError) 
 
 fn do_decode_settings(
   payload: BitArray,
-  acc: List(#(SettingId, Int)),
+  acc: List(Setting),
 ) -> Result(Frame, DecodeError) {
   case payload {
     <<>> -> Ok(Settings(settings: list.reverse(acc)))
     <<id:16, value:32, remaining:bits>> -> {
       case id, value {
         0x01, _ ->
-          do_decode_settings(remaining, [#(HeaderTableSize, value), ..acc])
+          do_decode_settings(remaining, [HeaderTableSize(value), ..acc])
 
         0x02, 1 | 0x02, 0 ->
-          do_decode_settings(remaining, [#(EnablePush, value), ..acc])
+          do_decode_settings(remaining, [EnablePush(value), ..acc])
         0x02, _ -> Error(ProtocolViolation(InvalidSettingValue))
 
         0x03, _ ->
-          do_decode_settings(remaining, [#(MaxConcurrentStreams, value), ..acc])
+          do_decode_settings(remaining, [MaxConcurrentStreams(value), ..acc])
 
         0x04, value if value <= 2_147_483_647 ->
-          do_decode_settings(remaining, [#(InitialWindowSize, value), ..acc])
+          do_decode_settings(remaining, [InitialWindowSize(value), ..acc])
         0x04, _ -> Error(ProtocolViolation(InitialWindowSizeOverflow))
 
         0x05, value if value >= 16_384 && value <= 16_777_215 ->
-          do_decode_settings(remaining, [#(MaxFrameSize, value), ..acc])
+          do_decode_settings(remaining, [MaxFrameSize(value), ..acc])
         0x05, _ -> Error(ProtocolViolation(InvalidSettingValue))
 
         0x06, _ ->
-          do_decode_settings(remaining, [#(MaxHeaderListSize, value), ..acc])
+          do_decode_settings(remaining, [MaxHeaderListSize(value), ..acc])
 
         _, _ -> do_decode_settings(remaining, acc)
       }
@@ -604,20 +604,17 @@ fn encode_code(code: ErrorCode) -> Int {
   }
 }
 
-fn encode_settings_payload(
-  settings: List(#(SettingId, Int)),
-  acc: BitArray,
-) -> BitArray {
+fn encode_settings_payload(settings: List(Setting), acc: BitArray) -> BitArray {
   case settings {
     [] -> acc
-    [#(id, value), ..remaining] -> {
-      let id = case id {
-        HeaderTableSize -> 0x01
-        EnablePush -> 0x02
-        MaxConcurrentStreams -> 0x03
-        InitialWindowSize -> 0x04
-        MaxFrameSize -> 0x05
-        MaxHeaderListSize -> 0x06
+    [setting, ..remaining] -> {
+      let #(id, value) = case setting {
+        HeaderTableSize(value) -> #(0x01, value)
+        EnablePush(value) -> #(0x02, value)
+        MaxConcurrentStreams(value) -> #(0x03, value)
+        InitialWindowSize(value) -> #(0x04, value)
+        MaxFrameSize(value) -> #(0x05, value)
+        MaxHeaderListSize(value) -> #(0x06, value)
       }
 
       encode_settings_payload(remaining, <<acc:bits, id:16, value:32>>)

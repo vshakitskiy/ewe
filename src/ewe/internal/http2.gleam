@@ -65,43 +65,41 @@ fn server_settings() -> Settings {
   )
 }
 
-fn decode_settings(settings: List(#(frame.SettingId, Int))) -> Settings {
+fn decode_settings(settings: List(frame.Setting)) -> Settings {
   list.fold(settings, default_settings(), fn(acc, setting) {
-    case setting.0 {
-      frame.HeaderTableSize -> Settings(..acc, header_table_size: setting.1)
-      frame.EnablePush ->
-        Settings(..acc, enable_push: case setting.1 {
-          1 -> True
-          _ -> False
-        })
-      frame.MaxConcurrentStreams ->
-        Settings(..acc, max_concurrent_streams: option.Some(setting.1))
-      frame.InitialWindowSize -> Settings(..acc, initial_window_size: setting.1)
-      frame.MaxFrameSize -> Settings(..acc, max_frame_size: setting.1)
-      frame.MaxHeaderListSize ->
-        Settings(..acc, max_header_list_size: option.Some(setting.1))
+    case setting {
+      frame.HeaderTableSize(value) -> Settings(..acc, header_table_size: value)
+      frame.EnablePush(value) -> Settings(..acc, enable_push: value == 1)
+      frame.MaxConcurrentStreams(value) ->
+        Settings(..acc, max_concurrent_streams: option.Some(value))
+      frame.InitialWindowSize(value) ->
+        Settings(..acc, initial_window_size: value)
+      frame.MaxFrameSize(value) -> Settings(..acc, max_frame_size: value)
+      frame.MaxHeaderListSize(value) ->
+        Settings(..acc, max_header_list_size: option.Some(value))
     }
   })
 }
 
 fn encode_settings(settings: Settings) -> bytes_tree.BytesTree {
   let payload = [
-    #(frame.HeaderTableSize, settings.header_table_size),
-    #(frame.EnablePush, case settings.enable_push {
-      True -> 1
-      False -> 0
-    }),
-    #(frame.InitialWindowSize, settings.initial_window_size),
-    #(frame.MaxFrameSize, settings.max_frame_size),
+    frame.HeaderTableSize(settings.header_table_size),
+    frame.InitialWindowSize(settings.initial_window_size),
+    frame.MaxFrameSize(settings.max_frame_size),
   ]
 
+  let payload = case settings.enable_push {
+    True -> [frame.EnablePush(1), ..payload]
+    False -> payload
+  }
+
   let payload = case settings.max_concurrent_streams {
-    option.Some(value) -> [#(frame.MaxConcurrentStreams, value), ..payload]
+    option.Some(value) -> [frame.MaxConcurrentStreams(value), ..payload]
     option.None -> payload
   }
 
   let payload = case settings.max_header_list_size {
-    option.Some(value) -> [#(frame.MaxHeaderListSize, value), ..payload]
+    option.Some(value) -> [frame.MaxHeaderListSize(value), ..payload]
     option.None -> payload
   }
 
@@ -135,23 +133,25 @@ type State {
     transport: transport.Transport,
     socket: socket.Socket,
     self: process.Subject(Message),
+    connection_recv_window: Int,
+    connection_send_window: Int,
+    connection_subject: process.Subject(ConnectionMessage),
     mode: Mode,
     buffer: BitArray,
     local_settings: Settings,
     remote_settings: Settings,
-    hpack_encoder: alpacki.DynamicTable,
     hpack_decoder: alpacki.DynamicTable,
-    settings_acked: Bool,
+    hpack_encoder: alpacki.DynamicTable,
     settings_timeout: option.Option(process.Timer),
+    settings_acked: Bool,
     pending: bytes_tree.BytesTree,
-    connection_subject: process.Subject(ConnectionMessage),
-    streams: dict.Dict(Int, Stream),
-    last_stream_id: Int,
     factory: factory.Supervisor(
       fn() ->
         Result(actor.Started(process.Subject(StreamMessage)), actor.StartError),
       process.Subject(StreamMessage),
     ),
+    streams: dict.Dict(Int, Stream),
+    last_stream_id: Int,
     handler: fn(request.Request(http_.Connection)) ->
       response.Response(http_.ResponseBody),
   )
@@ -161,8 +161,12 @@ type Stream {
   Stream(id: Int, subject: process.Subject(StreamMessage))
 }
 
-fn append_pending(state: State, pending: bytes_tree.BytesTree) -> State {
-  State(..state, pending: bytes_tree.append_tree(state.pending, pending))
+fn append_pending(state: State, pending: frame.Frame) -> State {
+  let pending =
+    frame.encode(pending)
+    |> bytes_tree.append_tree(state.pending, _)
+
+  State(..state, pending:)
 }
 
 fn flush_pending(state: State) -> State {
@@ -174,10 +178,16 @@ fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
   let pending =
     <<debug:utf8>>
     |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
-    |> frame.encode
-    |> bytes_tree.append_tree(state.pending, _)
+    |> append_pending(state, _)
+}
 
-  State(..state, pending:)
+fn append_rst_stream(
+  state: State,
+  stream_id: Int,
+  code: frame.ErrorCode,
+) -> State {
+  frame.RstStream(stream_id, code)
+  |> append_pending(state, _)
 }
 
 type Mode {
@@ -246,21 +256,23 @@ pub fn start(
             transport:,
             socket:,
             self:,
+            connection_recv_window: local_settings.initial_window_size,
+            connection_send_window: remote_settings.initial_window_size,
+            connection_subject:,
             mode: Init,
             buffer:,
             local_settings:,
             remote_settings:,
-            settings_acked: False,
-            settings_timeout:,
+            hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
             hpack_encoder: alpacki.new_dynamic(
               remote_settings.header_table_size,
             ),
-            hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
+            settings_timeout:,
+            settings_acked: False,
             pending:,
-            connection_subject:,
+            factory:,
             streams: dict.new(),
             last_stream_id: 0,
-            factory:,
             handler:,
           )
           |> process_buffer
@@ -308,7 +320,7 @@ fn create_socket_selector(
 fn coerce_tcp_message(record: dynamic.Dynamic) -> BitArray
 
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
-  case echo message {
+  case message {
     Close -> actor.stop()
     TcpPassive -> {
       let _ =
@@ -347,71 +359,9 @@ fn handle_stream_message(
 ) -> actor.Next(State, Message) {
   case message {
     message.WindowUpdate(stream_id:, increment:) -> todo
-    message.SendResponse(stream_id:, response:) ->
-      send_response(state, stream_id, response)
-      |> flush_pending
-      |> actor.continue
-  }
-}
-
-fn send_response(
-  state: State,
-  stream_id: Int,
-  resp: response.Response(ResponseBody),
-) -> State {
-  let body = response_body_to_bits(resp.body)
-
-  let headers = [
-    alpacki.HeaderField(
-      name: ":status",
-      value: int.to_string(resp.status),
-      indexing: alpacki.WithIndexing,
-    ),
-    ..list.map(resp.headers, fn(header) {
-      alpacki.HeaderField(
-        name: header.0,
-        value: header.1,
-        indexing: alpacki.WithIndexing,
-      )
-    })
-  ]
-
-  let #(encoded_headers, hpack_encoder) =
-    alpacki.encode_header_block(headers, state.hpack_encoder, huffman: True)
-  let field_block = bytes_tree.to_bit_array(encoded_headers)
-
-  let has_body = bit_array.byte_size(body) > 0
-
-  let state =
-    frame.Headers(
-      stream_id:,
-      end_headers: True,
-      end_stream: !has_body,
-      field_block:,
-    )
-    |> frame.encode
-    |> append_pending(State(..state, hpack_encoder:), _)
-
-  case has_body {
-    True ->
-      frame.Data(stream_id:, end_stream: True, data: body)
-      |> frame.encode
-      |> append_pending(state, _)
-    False -> state
-  }
-}
-
-fn response_body_to_bits(body: ResponseBody) -> BitArray {
-  case body {
-    TextData(text) -> bit_array.from_string(text)
-    StringTreeData(tree) -> string_tree.to_string(tree) |> bit_array.from_string
-    BitsData(bits) -> bits
-    BytesData(bytes) -> bytes_tree.to_bit_array(bytes)
-    Empty -> <<>>
-    File(..) -> todo as "File responses not yet supported for HTTP/2"
-    Chunked -> todo as "Chunked responses not yet supported for HTTP/2"
-    Websocket -> todo as "WebSocket not yet supported for HTTP/2"
-    SSE -> todo as "SSE not yet supported for HTTP/2"
+    message.SendResponse(stream_id:, response:) -> {
+      actor.continue(state)
+    }
   }
 }
 
@@ -486,6 +436,7 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
 
       Ok(State(..state, remote_settings:, pending:, hpack_encoder:))
     }
+
     frame.SettingsAck -> {
       option.map(state.settings_timeout, process.cancel_timer)
       Ok(State(..state, settings_acked: True, settings_timeout: option.None))
@@ -493,15 +444,27 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
 
     frame.Ping(ack: False, data:) ->
       frame.Ping(ack: True, data:)
-      |> frame.encode
       |> append_pending(state, _)
       |> Ok
-    frame.Ping(ack: True, ..) -> Ok(state)
 
     frame.Headers(stream_id:, end_headers:, end_stream:, field_block:) ->
       process_headers(state, stream_id, end_headers, end_stream, field_block)
 
-    _ -> todo
+    frame.Data(stream_id:, end_stream:, data:) ->
+      process_data(state, stream_id, end_stream, data)
+
+    frame.WindowUpdate(stream_id: 0, increment:) -> todo
+    frame.WindowUpdate(stream_id:, increment:) -> todo
+
+    frame.RstStream(stream_id:, code:) -> todo
+
+    frame.GoAway(last_stream_id:, code:, debug:) -> todo
+
+    frame.PushPromise(..) -> todo
+
+    frame.Ping(ack: True, ..) | frame.Priority(..) | frame.Unknown -> Ok(state)
+
+    frame.Continuation(..) -> todo
   }
 }
 
@@ -553,6 +516,49 @@ fn process_continuation(
   }
 }
 
+fn process_data(
+  state: State,
+  stream_id: Int,
+  end_stream: Bool,
+  data: BitArray,
+) -> Result(State, State) {
+  let connection_recv_window =
+    state.connection_recv_window - bit_array.byte_size(data)
+
+  case connection_recv_window < 0 {
+    True ->
+      append_goaway(state, frame.FlowControlError, "Flow control was violated")
+      |> Error
+    False -> {
+      let state = case dict.get(state.streams, stream_id) {
+        Ok(stream) -> {
+          process.send(stream.subject, message.Data(data, end_stream))
+          state
+        }
+        Error(Nil) -> append_rst_stream(state, stream_id, frame.StreamClosed)
+      }
+
+      let threshold =
+        connection_recv_window < state.local_settings.initial_window_size / 2
+      case threshold {
+        True -> {
+          let state =
+            state.local_settings.initial_window_size - connection_recv_window
+            |> frame.WindowUpdate(stream_id: 0)
+            |> append_pending(state, _)
+
+          let connection_recv_window =
+            connection_recv_window + state.local_settings.initial_window_size
+
+          Ok(State(..state, connection_recv_window:))
+        }
+
+        False -> Ok(State(..state, connection_recv_window:))
+      }
+    }
+  }
+}
+
 fn open_stream(
   state: State,
   stream_id: Int,
@@ -594,7 +600,6 @@ fn open_stream(
               )
 
               frame.RstStream(stream_id:, code: frame.InternalError)
-              |> frame.encode
               |> append_pending(state, _)
               |> Ok
             }
@@ -609,7 +614,6 @@ fn open_stream(
               <> string.inspect(err),
           )
           frame.RstStream(stream_id:, code: frame.ProtocolError)
-          |> frame.encode
           |> append_pending(state, _)
           |> Ok
         }
@@ -633,6 +637,7 @@ type RequestError {
   MissingPseudoHeader(String)
   InvalidMethod(String)
   InvalidScheme(String)
+  InvalidEncoding
 }
 
 type RequestBuilder {
@@ -702,21 +707,22 @@ fn parse_header_field(
   builder: RequestBuilder,
   field: alpacki.HeaderField,
 ) -> Result(RequestBuilder, RequestError) {
-  case field.name {
-    ":" <> _ if builder.seen_regular ->
-      Error(PseudoHeaderAfterRegular(field.name))
+  case validate_field_name(field.name), validate_field_value(field.value) {
+    Error(Nil), _ | _, Error(Nil) -> Error(InvalidEncoding)
+    Ok(":" <> name), Ok(_value) if builder.seen_regular ->
+      Error(PseudoHeaderAfterRegular(name))
 
-    ":method" -> {
-      use <- require_no_duplicate(builder.method, field.name)
-      case http.parse_method(field.value) {
+    Ok(":method"), Ok(value) -> {
+      use <- require_no_duplicate(builder.method, "method")
+      case http.parse_method(value) {
         Ok(method) -> Ok(RequestBuilder(..builder, method: option.Some(method)))
-        Error(Nil) -> Error(InvalidMethod(field.value))
+        Error(Nil) -> Error(InvalidMethod(value))
       }
     }
 
-    ":path" -> {
-      use <- require_no_duplicate(builder.path, field.name)
-      case string.split_once(field.value, "?") {
+    Ok(":path"), Ok(value) -> {
+      use <- require_no_duplicate(builder.path, "path")
+      case string.split_once(value, "?") {
         Ok(#(path, query)) ->
           RequestBuilder(
             ..builder,
@@ -725,42 +731,47 @@ fn parse_header_field(
           )
           |> Ok
 
-        Error(Nil) ->
-          Ok(RequestBuilder(..builder, path: option.Some(field.value)))
+        Error(Nil) -> Ok(RequestBuilder(..builder, path: option.Some(value)))
       }
     }
 
-    ":scheme" -> {
-      use <- require_no_duplicate(builder.scheme, field.name)
-      case http.scheme_from_string(field.value) {
+    Ok(":scheme"), Ok(value) -> {
+      use <- require_no_duplicate(builder.scheme, "scheme")
+      case http.scheme_from_string(value) {
         Ok(scheme) -> Ok(RequestBuilder(..builder, scheme: option.Some(scheme)))
-        Error(Nil) -> Error(InvalidScheme(field.value))
+        Error(Nil) -> Error(InvalidScheme(value))
       }
     }
 
-    ":authority" -> {
-      use <- require_no_duplicate(string.to_option(builder.host), field.name)
-      let #(host, port) = parse_authority(field.value)
+    Ok(":authority"), Ok(value) -> {
+      use <- require_no_duplicate(string.to_option(builder.host), "authority")
+      let #(host, port) = parse_authority(value)
       Ok(RequestBuilder(..builder, host:, port:))
     }
 
-    "cookie" -> {
+    Ok("cookie"), Ok(value) -> {
       let cookie = case builder.cookie {
-        option.Some(existing) -> option.Some(existing <> "; " <> field.value)
-        option.None -> option.Some(field.value)
+        option.Some(existing) -> option.Some(existing <> "; " <> value)
+        option.None -> option.Some(value)
       }
       Ok(RequestBuilder(..builder, cookie:, seen_regular: True))
     }
 
-    _ ->
+    Ok(name), Ok(value) ->
       RequestBuilder(
         ..builder,
-        headers: [#(field.name, field.value), ..builder.headers],
+        headers: [#(name, value), ..builder.headers],
         seen_regular: True,
       )
       |> Ok
   }
 }
+
+@external(erlang, "ewe_ffi", "h2_validate_field_name")
+fn validate_field_name(name: BitArray) -> Result(String, Nil)
+
+@external(erlang, "ewe_ffi", "validate_field_value")
+fn validate_field_value(value: BitArray) -> Result(String, Nil)
 
 fn require_no_duplicate(
   existing: option.Option(a),

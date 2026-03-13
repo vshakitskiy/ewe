@@ -1,13 +1,16 @@
 -module(ewe_ffi).
 
 -export([close_file/1, decode_packet/3, init_clock_storage/0, lookup_http_date/0, now/0,
-         now_microseconds/0, open_file/1, set_http_date/1, validate_field_value/1, coerce_tcp_message/1]).
+         now_microseconds/0, open_file/1, set_http_date/1, validate_field_value/1,
+         coerce_tcp_message/1, h2_validate_field_name/1]).
 
 % Socket
 % -----------------------------------------------------------------------------
 
-coerce_tcp_message({tcp, _Socket, Data}) -> Data;
-coerce_tcp_message({ssl, _Socket, Data}) -> Data.
+coerce_tcp_message({tcp, _Socket, Data}) ->
+  Data;
+coerce_tcp_message({ssl, _Socket, Data}) ->
+  Data.
 
 % HTTP
 % -----------------------------------------------------------------------------
@@ -116,3 +119,56 @@ close_file(File) ->
     {error, _} ->
       {error, eunknown}
   end.
+
+% HTTP/2
+% ------------------------------------------------------------------------------
+
+h2_validate_field_name(<<>>) ->
+  {error, nil};
+% Allowed Pseudo-Headers.
+h2_validate_field_name(<<":method">>) ->
+  {ok, <<":method">>};
+h2_validate_field_name(<<":path">>) ->
+  {ok, <<":path">>};
+h2_validate_field_name(<<":scheme">>) ->
+  {ok, <<":scheme">>};
+h2_validate_field_name(<<":status">>) ->
+  {ok, <<":status">>};
+h2_validate_field_name(<<":authority">>) ->
+  {ok, <<":authority">>};
+h2_validate_field_name(<<$:, _/binary>>) ->
+  {error, nil};
+% Per RFC (9110 Section 5.6.2 tchar + 9113 Section 8.2.1 mentioning lowercase
+% ASCII) the valid bytes are:
+% - a-z
+% - 0-9
+% - ! # $ % & ' * + - . ^ _  | ~ `
+% See:
+% - https://datatracker.ietf.org/doc/html/rfc9110#section-5.6.2
+% - https://datatracker.ietf.org/doc/html/rfc9113#section-8.2.1
+h2_validate_field_name(Name) ->
+  validate_tchar(Name, Name).
+
+validate_tchar(<<>>, Name) ->
+  {ok, Name};
+validate_tchar(<<C, Remaining/binary>>, Name)
+  when C >= $a andalso C =< $z;
+       C >= $0 andalso C =< $9;
+       C =:= $!;
+       C =:= $#;
+       C =:= $$;
+       C =:= $%;
+       C =:= $&;
+       C =:= $';
+       C =:= $*;
+       C =:= $+;
+       C =:= $-;
+       C =:= $.;
+       C =:= $^;
+       C =:= $_;
+       C =:= $`;
+       C =:= $|;
+       C =:= $~ ->
+  validate_tchar(Remaining, Name);
+validate_tchar(_, _) ->
+  {error, nil}.
