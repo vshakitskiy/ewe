@@ -24,8 +24,6 @@ fn handle_request(req: Request) -> Response {
     http.Post, ["user"] -> {
       case ewe.read_body(req, 40_000_000) {
         Ok(req) -> {
-          echo req.headers
-
           let content_type =
             req
             |> request.get_header("content-type")
