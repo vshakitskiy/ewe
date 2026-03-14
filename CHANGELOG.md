@@ -1,6 +1,6 @@
 # Changelog
 
-# Unreleased
+# v3.0.5 - 15.03.2026
 
 - Remove all usage of `string.inspect` as it is an anti-pattern for logging.
 - Fix infinite loop and adjust allowed entries for trailer headers.
