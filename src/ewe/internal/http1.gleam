@@ -33,7 +33,7 @@ import websocks
 // -----------------------------------------------------------------------------
 
 /// Connection to a client.
-/// 
+///
 pub type Connection {
   Connection(
     transport: Transport,
@@ -46,7 +46,7 @@ pub type Connection {
 }
 
 /// Transforms a glisten connection.
-/// 
+///
 pub fn transform_connection(
   conn: glisten.Connection(a),
   factory_name: process.Name(_),
@@ -60,7 +60,7 @@ pub fn transform_connection(
 }
 
 /// Reads data from the socket with timeout and size limits.
-/// 
+///
 fn read_from_socket(
   transport transport: Transport,
   socket socket: Socket,
@@ -86,7 +86,7 @@ fn read_from_socket(
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur when parsing a request.
-/// 
+///
 pub type ParseError {
   // request line
   InvalidMethod
@@ -106,14 +106,14 @@ pub type ParseError {
 }
 
 /// HTTP version enumeration.
-/// 
+///
 pub type HttpVersion {
   Http10
   Http11
 }
 
 /// Result of parsing a request.
-/// 
+///
 pub type ParsedRequest {
   Http1Request(req: Request(Connection), version: HttpVersion)
   Http2Upgrade(upgrade: Http2Upgrade)
@@ -127,7 +127,7 @@ pub type Http2Upgrade {
 }
 
 /// Parses an HTTP request from the given buffer.
-/// 
+///
 pub fn parse_request(
   conn: Connection,
   buffer: Buffer,
@@ -234,7 +234,7 @@ pub fn parse_request(
 }
 
 /// Parses HTTP headers from the buffer.
-/// 
+///
 fn parse_headers(
   transport transport: Transport,
   socket socket: Socket,
@@ -304,7 +304,7 @@ fn parse_headers(
 fn validate_field_value(value: BitArray) -> Result(String, Nil)
 
 /// Inserts a header into the headers dictionary.
-/// 
+///
 fn insert_header(
   headers: Dict(String, String),
   field: String,
@@ -323,7 +323,7 @@ fn insert_header(
 }
 
 /// Finds an available key for set-cookie headers.
-/// 
+///
 fn available_cookie_key(headers: Dict(String, String), idx: Int) -> String {
   let key = case idx {
     0 -> "set-cookie"
@@ -340,11 +340,11 @@ fn available_cookie_key(headers: Dict(String, String), idx: Int) -> String {
 // -----------------------------------------------------------------------------
 
 /// 2MB (2 million bytes).
-/// 
+///
 const max_reading_size = 2_000_000
 
 /// Reads the request body from the socket.
-/// 
+///
 pub fn read_body(
   req: Request(Connection),
   size_limit: Int,
@@ -413,7 +413,7 @@ pub fn read_body(
 }
 
 /// Reads a chunked transfer-encoded body.
-/// 
+///
 fn read_chunked_body(
   transport transport: Transport,
   socket socket: Socket,
@@ -457,7 +457,7 @@ fn read_chunked_body(
 }
 
 /// Parses a single chunk from the chunked body.
-/// 
+///
 fn parse_body_chunk(buffer: Buffer) -> Result(BodyChunk, ParseError) {
   case split(buffer.data, <<"\r\n">>, []) {
     [<<"0">>, rest] -> Ok(FinalChunk(Buffer(rest, 0)))
@@ -517,13 +517,13 @@ fn handle_trailers(
                   request.set_header(req, field_name, value)
                   |> handle_trailers(set, Buffer(header_rest, 0))
                 }
-                Error(Nil) -> handle_trailers(req, set, rest)
+                Error(Nil) -> handle_trailers(req, set, Buffer(header_rest, 0))
               }
             }
-            False -> handle_trailers(req, set, rest)
+            False -> handle_trailers(req, set, Buffer(header_rest, 0))
           }
         }
-        Error(Nil) -> handle_trailers(req, set, rest)
+        Error(Nil) -> handle_trailers(req, set, Buffer(header_rest, 0))
       }
     }
     _ -> req
@@ -550,14 +550,14 @@ fn is_forbidden_trailer(field: String) -> Bool {
 // -----------------------------------------------------------------------------
 
 /// Possible results of consuming some amount of data from the request body.
-/// 
+///
 pub type Stream {
   Consumed(data: BitArray, next: fn(Int) -> Result(Stream, ParseError))
   Done
 }
 
 /// Chunked body parsing result.
-/// 
+///
 type BodyChunk {
   Incomplete
   Chunk(BitArray, size: Int, rest: Buffer)
@@ -565,13 +565,13 @@ type BodyChunk {
 }
 
 /// State of the chunked body parsing.
-/// 
+///
 type ChunkedStreamState {
   ChunkedStreamState(data: Buffer, chunk: Buffer, done: Bool)
 }
 
 /// Streams the request body from the socket.
-/// 
+///
 pub fn stream_body(req: Request(Connection)) {
   use _ <- result.try(
     handle_continue(req)
@@ -598,7 +598,7 @@ pub fn stream_body(req: Request(Connection)) {
   }
 }
 
-/// Creates a consumer function that reads `N` amount of bytes from the chunked 
+/// Creates a consumer function that reads `N` amount of bytes from the chunked
 /// request body until it is fully consumed.
 fn do_stream_body_chunked(
   req: Request(Connection),
@@ -691,7 +691,7 @@ fn read_from_socket_until(
 
 /// Creates a consumer function that reads `N` amount of bytes from the request
 /// body until it is fully consumed.
-/// 
+///
 fn do_stream_body(
   req: Request(Connection),
   buffer: Buffer,
@@ -703,14 +703,14 @@ fn do_stream_body(
       // Request body is fully consumed
       0, 0 -> Ok(Done)
 
-      // Request body is supposed to be fully consumed but there is more data 
+      // Request body is supposed to be fully consumed but there is more data
       // in buffer
       0, _ -> {
         let #(data, rest) = buffer.split(buffer, size)
         Ok(Consumed(data, do_stream_body(req, Buffer(rest, 0))))
       }
 
-      // Request body is not fully consumed and there is enough data in buffer 
+      // Request body is not fully consumed and there is enough data in buffer
       // to consume `size` bytes
       _, buffer_size if buffer_size >= size -> {
         let #(data, rest) = buffer.split(buffer, size)
@@ -718,7 +718,7 @@ fn do_stream_body(
         Ok(Consumed(data, do_stream_body(req, new_buffer)))
       }
 
-      // Request body is not fully consumed and there is not enough data in 
+      // Request body is not fully consumed and there is not enough data in
       // buffer to consume `size` bytes
       _, _ -> {
         use read_buffer <- try(read_from_socket(
@@ -745,7 +745,7 @@ fn do_stream_body(
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur when upgrading a WebSocket connection.
-/// 
+///
 pub type UpgradeWebsocketError {
   MethodNotGet
   MissingConnectionHeader
@@ -757,7 +757,7 @@ pub type UpgradeWebsocketError {
 }
 
 /// Upgrades an HTTP connection to WebSocket.
-/// 
+///
 pub fn upgrade_websocket(
   req: Request(Connection),
   transport: Transport,
@@ -833,7 +833,7 @@ pub fn upgrade_websocket(
 // -----------------------------------------------------------------------------
 
 /// Response body variants.
-/// 
+///
 pub type ResponseBody {
   TextData(String)
   BytesData(BytesTree)
@@ -847,7 +847,7 @@ pub type ResponseBody {
 }
 
 /// Appends default headers to HTTP responses.
-/// 
+///
 pub fn append_default_headers(
   resp: Response(a),
   req: Request(Connection),
@@ -872,7 +872,7 @@ pub fn append_default_headers(
 }
 
 /// Sets the content length header if it is not already set.
-/// 
+///
 pub fn set_content_length(resp: Response(BitArray)) -> Response(BitArray) {
   case response.get_header(resp, "content-length") {
     Ok(_) -> resp
@@ -884,7 +884,7 @@ pub fn set_content_length(resp: Response(BitArray)) -> Response(BitArray) {
 }
 
 /// Handles 100-continue expectations.
-/// 
+///
 pub fn handle_continue(req: Request(Connection)) -> Result(Nil, ParseError) {
   let expect =
     req.headers
