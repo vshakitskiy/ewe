@@ -508,9 +508,7 @@ fn handle_trailers(
 
       case field_name {
         Ok(field_name) -> {
-          case
-            set.contains(set, field_name) && !is_forbidden_trailer(field_name)
-          {
+          case set.contains(set, field_name) && is_allowed_trailer(field_name) {
             True -> {
               case bit_array.to_string(value) {
                 Ok(value) -> {
@@ -530,18 +528,10 @@ fn handle_trailers(
   }
 }
 
-/// Checks if a header field is forbidden in trailers.
-fn is_forbidden_trailer(field: String) -> Bool {
-  case string.lowercase(field) {
-    "transfer-encoding"
-    | "content-length"
-    | "host"
-    | "cache-control"
-    | "expect"
-    | "max-forwards"
-    | "pragma"
-    | "range"
-    | "te" -> True
+/// Checks if a trailer field is allowed.
+fn is_allowed_trailer(field: String) -> Bool {
+  case field {
+    "server-timing" | "content-digest" | "repr-digest" -> True
     _ -> False
   }
 }
