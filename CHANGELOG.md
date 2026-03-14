@@ -3,6 +3,7 @@
 # Unreleased
 
 - Remove all usage of `string.inspect` as it's a huge anti-pattern for logging.
+- Patch infinite loop on rejected trailer headers inside `handle_trailers`.
 
 # v3.0.4 - 13.03.2026
 
