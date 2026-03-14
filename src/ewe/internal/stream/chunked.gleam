@@ -75,20 +75,17 @@ pub fn start(
           }
           Error(socket_reason) -> {
             let message =
-              "Socket error occured while trying to send the end of chunked response: "
+              "Failed to send chunked response terminator: "
               <> socket.reason_to_string(socket_reason)
 
-            logging.log(logging.Error, message)
+            logging.log(logging.Warning, message)
             on_close(conn, state)
             actor.stop_abnormal(message)
           }
         }
       }
       AbnormalStop(reason) -> {
-        logging.log(
-          logging.Error,
-          "Chunked response stopped abnormally: " <> reason,
-        )
+        logging.log(logging.Warning, "Chunked response stopped: " <> reason)
         on_close(conn, state)
         actor.stop_abnormal(reason)
       }

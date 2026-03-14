@@ -23,7 +23,6 @@ import gleam/result.{replace_error, try}
 import gleam/set.{type Set}
 import gleam/string
 import gleam/string_tree.{type StringTree}
-import gleam/uri
 import glisten
 import glisten/socket.{type Socket}
 import glisten/transport.{type Transport}
@@ -90,7 +89,7 @@ fn read_from_socket(
 pub type ParseError {
   // request line
   InvalidMethod
-  InvalidTarget
+  InvalidPath
   InvalidVersion
   // headers
   InvalidHeaders
@@ -143,10 +142,10 @@ pub fn parse_request(
         |> replace_error(InvalidMethod),
       )
 
-      use uri <- try(
+      use #(path, query) <- try(
         bit_array.to_string(target)
-        |> try(uri.parse)
-        |> replace_error(InvalidTarget),
+        |> try(parse_path)
+        |> replace_error(InvalidPath),
       )
 
       // Headers
@@ -190,8 +189,8 @@ pub fn parse_request(
           scheme:,
           host:,
           port:,
-          path: uri.path,
-          query: uri.query,
+          path:,
+          query:,
         )
 
       case version {
@@ -232,6 +231,9 @@ pub fn parse_request(
     _ -> Error(PacketDiscard)
   }
 }
+
+@external(erlang, "ewe_ffi", "parse_path")
+fn parse_path(string: String) -> Result(#(String, option.Option(String)), Nil)
 
 /// Parses HTTP headers from the buffer.
 ///

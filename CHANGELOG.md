@@ -2,8 +2,10 @@
 
 # Unreleased
 
-- Remove all usage of `string.inspect` as it's a huge anti-pattern for logging.
-- Patch infinite loops and adjust allowed entries for trailer headers.
+- Remove all usage of `string.inspect` as it is an anti-pattern for logging.
+- Fix infinite loop and adjust allowed entries for trailer headers.
+- Improve and expand logging messages.
+- Improve path parsing.
 
 # v3.0.4 - 13.03.2026
 

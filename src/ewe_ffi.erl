@@ -1,13 +1,16 @@
 -module(ewe_ffi).
 
 -export([close_file/1, decode_packet/3, init_clock_storage/0, lookup_http_date/0, now/0,
-         now_microseconds/0, open_file/1, set_http_date/1, validate_field_value/1, coerce_tcp_message/1]).
+         now_microseconds/0, open_file/1, set_http_date/1, validate_field_value/1,
+         coerce_tcp_message/1, parse_path/1]).
 
 % Socket
 % -----------------------------------------------------------------------------
 
-coerce_tcp_message({tcp, _Socket, Data}) -> Data;
-coerce_tcp_message({ssl, _Socket, Data}) -> Data.
+coerce_tcp_message({tcp, _Socket, Data}) ->
+  Data;
+coerce_tcp_message({ssl, _Socket, Data}) ->
+  Data.
 
 % HTTP
 % -----------------------------------------------------------------------------
@@ -28,6 +31,21 @@ decode_packet(Type, Packet, Options) ->
       {ok, {more, {some, Length}}};
     {error, Reason} ->
       {error, Reason}
+  end.
+
+parse_path(Value) ->
+  case uri_string:parse(Value) of
+    {error, _, _} ->
+      {error, nil};
+    Uri ->
+      Query =
+        try
+          {some, maps:get(query, Uri)}
+        catch
+          _:_ ->
+            none
+        end,
+      {ok, {maps:get(path, Uri), Query}}
   end.
 
 validate_field_value(Value) ->

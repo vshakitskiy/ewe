@@ -96,10 +96,54 @@ pub fn handle_packet(
       }
     }
     Error(reason) -> {
-      let status = case reason {
-        ewe_http.InvalidVersion -> 505
-        _ -> 400
+      let #(status, message) = case reason {
+        ewe_http.InvalidMethod -> #(
+          400,
+          "Rejected HTTP request with invalid method",
+        )
+        ewe_http.InvalidPath -> #(
+          400,
+          "Rejected HTTP request with invalid path",
+        )
+        ewe_http.InvalidVersion -> #(
+          505,
+          "Rejected HTTP request with unsupported version",
+        )
+        ewe_http.InvalidHeaders -> #(
+          400,
+          "Rejected HTTP request with malformed headers",
+        )
+        ewe_http.MissingHost -> #(
+          400,
+          "Rejected HTTP request with missing Host header",
+        )
+        ewe_http.DuplicateHost -> #(
+          400,
+          "Rejected HTTP request with duplicate Host header",
+        )
+        ewe_http.InvalidContentLength -> #(
+          400,
+          "Rejected HTTP request with invalid Content-Length",
+        )
+        ewe_http.InvalidBody -> #(
+          400,
+          "Rejected HTTP request with malformed body",
+        )
+        ewe_http.BodyTooLarge -> #(
+          400,
+          "Rejected HTTP request with body exceeding size limit",
+        )
+        ewe_http.MalformedRequest -> #(
+          400,
+          "Rejected HTTP request due to malformed packet",
+        )
+        ewe_http.PacketDiscard -> #(
+          400,
+          "Rejected HTTP request due to unrecognized packet",
+        )
       }
+
+      logging.log(logging.Warning, message)
 
       let _ =
         response.new(status)

@@ -366,10 +366,11 @@ fn handle_close(
 
   case abnormal_reason {
     Some(reason) -> {
-      logging.log(
-        logging.Error,
-        "WebSocket connection closed abnormally: " <> reason,
-      )
+      let level = case reason == crashed {
+        True -> logging.Error
+        False -> logging.Warning
+      }
+      logging.log(level, "WebSocket closed: " <> reason)
       actor.stop_abnormal(reason)
     }
     None -> actor.stop()
