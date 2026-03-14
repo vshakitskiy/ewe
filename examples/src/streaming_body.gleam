@@ -5,7 +5,6 @@ import gleam/http/request
 import gleam/http/response
 import gleam/int
 import gleam/result
-import gleam/string
 import logging
 
 pub fn main() {
@@ -76,8 +75,8 @@ fn handle_stream(req: Request, chunk_size: Int) -> Response {
                 Error(_) -> ewe.chunked_stop_abnormal("Failed to send chunk")
               }
             Done -> ewe.chunked_stop()
-            BodyError(body_error) ->
-              ewe.chunked_stop_abnormal(string.inspect(body_error))
+            BodyError(_body_error) ->
+              ewe.chunked_stop_abnormal("failed to read body")
           }
         },
         on_close: fn(_conn, _state) {
@@ -109,10 +108,7 @@ fn stream_resource(
   case consumer(chunk_size) {
     Ok(ewe.Consumed(data, next)) -> {
       logging.log(logging.Info, {
-        "Consumed "
-        <> int.to_string(bit_array.byte_size(data))
-        <> " bytes: "
-        <> string.inspect(data)
+        "Consumed " <> int.to_string(bit_array.byte_size(data)) <> " bytes."
       })
 
       process.send(subject, Chunk(data))

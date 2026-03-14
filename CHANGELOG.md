@@ -1,5 +1,9 @@
 # Changelog
 
+# Unreleased
+
+- Remove all usage of `string.inspect` as it's a huge anti-pattern for logging.
+
 # v3.0.4 - 13.03.2026
 
 - Fix glisten being incorrectly supervised on start.

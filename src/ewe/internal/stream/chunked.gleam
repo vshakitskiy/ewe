@@ -5,14 +5,13 @@ import gleam/erlang/process.{type Subject}
 import gleam/http/response.{type Response}
 import gleam/otp/actor
 import gleam/result
-import gleam/string
 import glisten
 import glisten/socket.{type Socket}
 import glisten/transport.{type Transport}
 import logging
 
 /// Sends a response for a chunked transfer encoding.
-/// 
+///
 pub fn send_response(
   resp: Response(a),
   transport: Transport,
@@ -28,13 +27,13 @@ pub fn send_response(
 }
 
 /// Represents a chunked response connection.
-/// 
+///
 pub type ChunkedBody {
   ChunkedBody(transport: Transport, socket: Socket)
 }
 
 /// Represents an instruction on how chunked response should proceed.
-/// 
+///
 pub type ChunkedNext(user_state) {
   Continue(user_state)
   NormalStop
@@ -42,7 +41,7 @@ pub type ChunkedNext(user_state) {
 }
 
 /// Starts a new chunked response connection.
-/// 
+///
 pub fn start(
   transport: Transport,
   socket: Socket,
@@ -75,16 +74,13 @@ pub fn start(
             actor.stop()
           }
           Error(socket_reason) -> {
-            logging.log(
-              logging.Error,
-              "Failed to send end of chunked response: "
-                <> string.inspect(socket_reason),
-            )
+            let message =
+              "Socket error occured while trying to send the end of chunked response: "
+              <> socket.reason_to_string(socket_reason)
+
+            logging.log(logging.Error, message)
             on_close(conn, state)
-            actor.stop_abnormal(
-              "Failed to send end of chunked response: "
-              <> string.inspect(socket_reason),
-            )
+            actor.stop_abnormal(message)
           }
         }
       }
@@ -103,7 +99,7 @@ pub fn start(
 }
 
 /// Maps actor's starting value to Nil.
-/// 
+///
 fn after_start(
   started: actor.Started(Subject(user_message)),
   transport: Transport,
@@ -116,7 +112,7 @@ fn after_start(
 }
 
 /// Sends the end marker for chunked transfer encoding.
-/// 
+///
 fn send_end(
   transport: Transport,
   socket: Socket,
@@ -125,7 +121,7 @@ fn send_end(
 }
 
 /// Sends a chunk to the client.
-/// 
+///
 pub fn send_chunk(
   transport: Transport,
   socket: Socket,
@@ -140,12 +136,12 @@ pub fn send_chunk(
 }
 
 /// Converts an integer to a hexadecimal string.
-/// 
+///
 fn to_hex_string(integer: Int) -> String {
   integer_to_list(integer, 16)
 }
 
 /// Converts an integer to a string in the given base.
-/// 
+///
 @external(erlang, "erlang", "integer_to_list")
 fn integer_to_list(integer: Int, base: Int) -> String

@@ -7,7 +7,6 @@ import gleam/erlang/process.{type Selector, type Subject}
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
-import gleam/string
 import glisten/socket.{type Socket, type SocketReason}
 import glisten/socket/options.{ActiveMode, Count}
 import glisten/transport.{type Transport}
@@ -15,7 +14,7 @@ import logging
 import websocks
 
 /// Represents a WebSocket connection.
-/// 
+///
 pub type WebsocketConnection {
   WebsocketConnection(
     transport: Transport,
@@ -25,14 +24,14 @@ pub type WebsocketConnection {
 }
 
 /// Messages that can be sent to or received from the WebSocket.
-/// 
+///
 pub type WebsocketMessage(user_message) {
   Frame(websocks.Frame)
   UserMessage(user_message)
 }
 
 /// Control flow for WebSocket message handling.
-/// 
+///
 pub type WebsocketNext(user_state, user_message) {
   Continue(user_state: user_state, selector: Option(Selector(user_message)))
   NormalStop
@@ -40,13 +39,13 @@ pub type WebsocketNext(user_state, user_message) {
 }
 
 // Internal state maintained by the WebSocket actor.
-// 
+//
 type WebsocketState(user_state) {
   WebsocketState(user_state: user_state, context: websocks.Context)
 }
 
 // Type alias for actor next steps.
-// 
+//
 type ActorNext(user_state, user_message) =
   actor.Next(WebsocketState(user_state), InternalMessage(user_message))
 
@@ -98,7 +97,7 @@ const non_owning_process = "Sending WebSocket message from non-owning process"
 const socket_active_count = 100
 
 /// Starts a new WebSocket connection.
-/// 
+///
 pub fn start(
   transport: Transport,
   socket: Socket,
@@ -165,7 +164,7 @@ pub fn start(
 }
 
 // Creates selector for glisten socket events.
-// 
+//
 fn create_socket_selector() -> Selector(InternalMessage(user_message)) {
   process.new_selector()
   |> process.select_record(atom.create("tcp"), 2, fn(record) {
@@ -183,7 +182,7 @@ fn create_socket_selector() -> Selector(InternalMessage(user_message)) {
 fn coerce_tcp_message(record: dynamic.Dynamic) -> BitArray
 
 // Handles incoming packet data, decoding frames and processing them.
-// 
+//
 fn handle_valid_packet(
   transport: Transport,
   socket: Socket,
@@ -227,7 +226,7 @@ fn handle_valid_packet(
 }
 
 // Represents the state of the WebSocket connection when resolving frames.
-// 
+//
 type ResolveState(user_state, user_message) {
   ResolveState(
     socket: Socket,
@@ -238,7 +237,7 @@ type ResolveState(user_state, user_message) {
 }
 
 /// Processes a list of frames sequentially.
-/// 
+///
 fn handle_frame(
   state: ResolveState(user_state, user_message),
   context: websocks.Context,
@@ -318,7 +317,7 @@ fn handle_frame(
 }
 
 // Handles user messages sent to the WebSocket.
-// 
+//
 fn handle_user_message(
   transport: Transport,
   socket: Socket,
@@ -355,7 +354,7 @@ fn handle_user_message(
 }
 
 // Handles WebSocket connection closure.
-// 
+//
 fn handle_close(
   on_close: OnClose(user_state),
   state: WebsocketState(user_state),
@@ -378,7 +377,7 @@ fn handle_close(
 }
 
 // Maps actor's starting value to Nil.
-// 
+//
 fn after_start(
   started: actor.Started(Subject(InternalMessage(user_message))),
   transport: Transport,
@@ -393,7 +392,7 @@ fn after_start(
 }
 
 /// Sends a frame to the WebSocket.
-/// 
+///
 pub fn send_frame(
   encoder: fn(BitArray, websocks.Context, Option(BitArray)) -> BitArray,
   transport: Transport,
@@ -410,11 +409,10 @@ pub fn send_frame(
 
   case frame {
     Ok(frame) -> frame
-    Error(reason) -> {
+    Error(_socket_reason) -> {
       logging.log(
         logging.Error,
-        "Frame should be sent from the WebSocket connection, but was sent from different process: "
-          <> string.inspect(reason),
+        "Frame should be sent from the WebSocket connection, but was sent from different process.",
       )
       panic as non_owning_process
     }
@@ -422,7 +420,7 @@ pub fn send_frame(
 }
 
 /// Sends a close frame to the WebSocket.
-/// 
+///
 pub fn send_close_frame(
   transport: Transport,
   socket: Socket,
@@ -438,12 +436,14 @@ pub fn send_close_frame(
   case frame {
     Ok(Ok(Nil)) -> NormalStop
     Ok(Error(reason)) ->
-      AbnormalStop("Failed to send close frame: " <> string.inspect(reason))
-    Error(reason) -> {
+      AbnormalStop(
+        "Socket error occured while trying to send close frame: "
+        <> socket.reason_to_string(reason),
+      )
+    Error(_reason) -> {
       logging.log(
         logging.Error,
-        "Frame should be sent from the WebSocket connection, but was sent from different process: "
-          <> string.inspect(reason),
+        "Frame should be sent from the WebSocket connection, but was sent from different process.",
       )
 
       panic as non_owning_process

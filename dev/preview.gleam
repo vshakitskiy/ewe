@@ -12,7 +12,6 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision.{type ChildSpecification}
 import gleam/result
-import gleam/string
 import logging
 
 import ewe.{type Request, type Response}
@@ -99,13 +98,10 @@ fn pubsub_worker(
                 logging.Info,
                 "Publishing text message `" <> text <> "` to topic " <> topic,
               )
-            Bytes(binary) ->
+            Bytes(_binary) ->
               logging.log(
                 logging.Info,
-                "Publishing binary message `"
-                  <> string.inspect(binary)
-                  <> "` to topic "
-                  <> topic,
+                "Publishing binary message to topic " <> topic,
               )
           }
 
@@ -284,10 +280,7 @@ fn stream_resource(
   case consumer(chunk_size) {
     Ok(ewe.Consumed(data, next)) -> {
       logging.log(logging.Info, {
-        "Consumed "
-        <> int.to_string(bit_array.byte_size(data))
-        <> " bytes: "
-        <> string.inspect(data)
+        "Consumed " <> int.to_string(bit_array.byte_size(data)) <> " bytes"
       })
 
       process.send(subject, Chunk(data))
@@ -325,8 +318,8 @@ fn handle_stream(req: Request, chunk_size: Int) -> Response {
                 Error(_) -> ewe.chunked_stop_abnormal("Failed to send chunk")
               }
             Done -> ewe.chunked_stop()
-            BodyError(body_error) ->
-              ewe.chunked_stop_abnormal(string.inspect(body_error))
+            BodyError(_body_error) ->
+              ewe.chunked_stop_abnormal("failed to read body")
           }
         },
         on_close: fn(_conn, _state) {

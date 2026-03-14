@@ -9,7 +9,6 @@ import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision.{type ChildSpecification}
-import gleam/string
 import logging
 
 pub fn main() {
@@ -19,12 +18,12 @@ pub fn main() {
   // Create a named pubsub process for topic-based message broadcasting.
   // Multiple clients can subscribe to different topics and receive messages
   // sent to those topics.
-  // 
+  //
   let pubsub_name = process.new_name("pubsub")
   let pubsub = process.named_subject(pubsub_name)
 
   // Set up supervision for both pubsub and the web server.
-  // 
+  //
   let assert Ok(_) =
     supervisor.new(supervisor.OneForAll)
     |> supervisor.add(pubsub_worker(pubsub_name))
@@ -67,12 +66,12 @@ type Broadcast {
 fn handle_topic(req: Request, pubsub: Subject(PubSubMessage), topic: String) {
   // Upgrade the HTTP connection to WebSocket. Unlike SSE, WebSocket is
   // bidirectional - both client and server can send messages at any time.
-  // 
+  //
   ewe.upgrade_websocket(
     req,
     // Initialize the WebSocket connection. The selector allows receiving
     // messages from both the WebSocket and the pubsub system.
-    // 
+    //
     on_init: fn(_conn, selector) {
       logging.log(
         logging.Info,
@@ -84,7 +83,7 @@ fn handle_topic(req: Request, pubsub: Subject(PubSubMessage), topic: String) {
 
       let state = WebsocketState(pubsub:, topic:, client:)
       // Add the client subject to the selector to receive broadcast messages.
-      // 
+      //
       let selector = process.select(selector, client)
 
       #(state, selector)
@@ -104,7 +103,7 @@ fn handle_topic(req: Request, pubsub: Subject(PubSubMessage), topic: String) {
 
 // Handle three types of messages: text from client, binary from client,
 // and broadcast messages from the pubsub system.
-// 
+//
 fn handle_websocket_message(
   conn: ewe.WebsocketConnection,
   state: WebsocketState,
@@ -112,21 +111,21 @@ fn handle_websocket_message(
 ) -> ewe.WebsocketNext(WebsocketState, Broadcast) {
   case msg {
     // Text message from the client - broadcast to all subscribers.
-    // 
+    //
     ewe.Text(text) -> {
       process.send(state.pubsub, Publish(state.topic, Text(text)))
       ewe.websocket_continue(state)
     }
 
     // Binary message from the client - broadcast to all subscribers.
-    // 
+    //
     ewe.Binary(binary) -> {
       process.send(state.pubsub, Publish(state.topic, Bytes(binary)))
       ewe.websocket_continue(state)
     }
 
     // User message from the pubsub - forward to this client.
-    // 
+    //
     ewe.User(message) -> {
       let assert Ok(_) = case message {
         Text(text) -> ewe.send_text_frame(conn, text)
@@ -191,13 +190,10 @@ fn handle_pubsub_message(state, message) {
             logging.Info,
             "Publishing text message `" <> text <> "` to topic " <> topic,
           )
-        Bytes(binary) ->
+        Bytes(_binary) ->
           logging.log(
             logging.Info,
-            "Publishing binary message `"
-              <> string.inspect(binary)
-              <> "` to topic "
-              <> topic,
+            "Publishing binary message to topic " <> topic,
           )
       }
 

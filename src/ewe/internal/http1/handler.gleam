@@ -125,9 +125,8 @@ fn call(
 ) -> Result(Http1Handler, Nil) {
   let response = case exception.rescue(fn() { handler(request) }) {
     Ok(response) -> response
-    Error(e) -> {
-      logging.log(logging.Error, string.inspect(e))
-
+    Error(_exception) -> {
+      logging.log(logging.Error, "Caught crash in request handler")
       response.set_header(on_crash, "connection", "close")
     }
   }
