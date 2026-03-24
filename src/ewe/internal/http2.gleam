@@ -20,6 +20,7 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import gleam/string_tree
 import glisten
 import glisten/socket
 import glisten/socket/options.{ActiveMode, Count}
@@ -166,7 +167,13 @@ type State {
 }
 
 type Stream {
-  Stream(id: Int, subject: process.Subject(StreamMessage))
+  Stream(
+    id: Int,
+    pid: process.Pid,
+    subject: process.Subject(StreamMessage),
+    send_window: Int,
+    pending: option.Option(BitArray),
+  )
 }
 
 fn append_pending(state: State, pending: frame.Frame) -> State {
@@ -177,9 +184,11 @@ fn append_pending(state: State, pending: frame.Frame) -> State {
   State(..state, pending:)
 }
 
-fn flush_pending(state: State) -> State {
-  let _ = transport.send(state.transport, state.socket, state.pending)
-  State(..state, pending: bytes_tree.new())
+fn flush_pending(state: State) -> Result(State, Nil) {
+  case transport.send(state.transport, state.socket, state.pending) {
+    Ok(Nil) -> Ok(State(..state, pending: bytes_tree.new()))
+    Error(_) -> Error(Nil)
+  }
 }
 
 fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
@@ -206,7 +215,7 @@ type Mode {
 
 type Message {
   Close
-  TcpPassive
+  Passive
   Packet(BitArray)
   SettingsTimeout
   FromStream(ConnectionMessage)
@@ -225,7 +234,7 @@ pub fn start(
   handler: fn(request.Request(http_.Connection)) ->
     response.Response(http_.ResponseBody),
 ) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(self) {
+  actor.new_with_initialiser(10_000, fn(self) {
     let _ = transport.controlling_process(transport, socket, process.self())
     let _ =
       transport.set_opts(transport, socket, [
@@ -278,15 +287,18 @@ pub fn start(
 
         case processed {
           Ok(state) -> {
-            flush_pending(state)
-            |> actor.initialised
-            |> actor.selecting(selector)
-            |> actor.returning(Nil)
-            |> Ok
+            case flush_pending(state) {
+              Ok(state) ->
+                actor.initialised(state)
+                |> actor.selecting(selector)
+                |> actor.returning(Nil)
+                |> Ok
+              Error(Nil) -> Error("Failed to start HTTP/2 connection")
+            }
           }
 
           Error(state) -> {
-            flush_pending(state)
+            let _ = flush_pending(state)
             Error("Failed to start HTTP/2 connection")
           }
         }
@@ -311,7 +323,8 @@ fn create_socket_selector(
   })
   |> process.select_record(atom.create("tcp_closed"), 1, fn(_) { Close })
   |> process.select_record(atom.create("ssl_closed"), 1, fn(_) { Close })
-  |> process.select_record(atom.create("tcp_passive"), 1, fn(_) { TcpPassive })
+  |> process.select_record(atom.create("tcp_passive"), 1, fn(_) { Passive })
+  |> process.select_record(atom.create("ssl_passive"), 1, fn(_) { Passive })
   |> process.select_monitors(StreamDown)
 }
 
@@ -321,7 +334,7 @@ fn coerce_tcp_message(record: dynamic.Dynamic) -> BitArray
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Close -> actor.stop()
-    TcpPassive -> {
+    Passive -> {
       let _ =
         transport.set_opts(state.transport, state.socket, [
           ActiveMode(Count(socket_active_count)),
@@ -333,9 +346,14 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       let processed =
         process_buffer(State(..state, buffer: <<state.buffer:bits, data:bits>>))
       case processed {
-        Ok(state) -> flush_pending(state) |> actor.continue
+        Ok(state) -> {
+          case flush_pending(state) {
+            Ok(state) -> actor.continue(state)
+            Error(Nil) -> actor.stop()
+          }
+        }
         Error(state) -> {
-          flush_pending(state)
+          let _ = flush_pending(state)
           actor.stop()
         }
       }
@@ -346,8 +364,16 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     }
     FromStream(message) -> handle_stream_message(state, message)
     StreamDown(down) -> {
-      echo down as "Stream is down"
-      actor.continue(state)
+      case down {
+        process.ProcessDown(pid:, ..) -> {
+          let streams =
+            dict.filter(state.streams, fn(_id, stream) {
+              stream.pid != pid || stream.pending != option.None
+            })
+          actor.continue(State(..state, streams:))
+        }
+        process.PortDown(..) -> actor.continue(state)
+      }
     }
   }
 }
@@ -357,9 +383,23 @@ fn handle_stream_message(
   message: ConnectionMessage,
 ) -> actor.Next(State, Message) {
   case message {
-    message.WindowUpdate(stream_id:, increment:) -> todo
+    message.WindowUpdate(stream_id:, increment:) -> {
+      let state =
+        frame.WindowUpdate(stream_id:, increment:)
+        |> append_pending(state, _)
+
+      case flush_pending(state) {
+        Ok(state) -> actor.continue(state)
+        Error(Nil) -> actor.stop()
+      }
+    }
+
     message.SendResponse(stream_id:, response:) -> {
-      actor.continue(state)
+      let state = send_response(state, stream_id, response)
+      case flush_pending(state) {
+        Ok(state) -> actor.continue(state)
+        Error(Nil) -> actor.stop()
+      }
     }
   }
 }
@@ -452,18 +492,53 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
     frame.Data(stream_id:, end_stream:, data:) ->
       process_data(state, stream_id, end_stream, data)
 
-    frame.WindowUpdate(stream_id: 0, increment:) -> todo
-    frame.WindowUpdate(stream_id:, increment:) -> todo
+    frame.WindowUpdate(stream_id: 0, increment:) -> {
+      let connection_send_window = state.connection_send_window + increment
+      let state = flush_all_pending(State(..state, connection_send_window:))
+      Ok(state)
+    }
+    frame.WindowUpdate(stream_id:, increment:) -> {
+      case dict.get(state.streams, stream_id) {
+        Error(Nil) -> Ok(state)
+        Ok(stream) -> {
+          let stream =
+            Stream(..stream, send_window: stream.send_window + increment)
+          let streams = dict.insert(state.streams, stream_id, stream)
+          let state = flush_stream_pending(State(..state, streams:), stream_id)
+          Ok(state)
+        }
+      }
+    }
 
-    frame.RstStream(stream_id:, code:) -> todo
+    frame.RstStream(stream_id:, code:) -> {
+      case dict.get(state.streams, stream_id) {
+        Ok(stream) -> {
+          process.send(stream.subject, message.Reset(code))
+          let streams = dict.delete(state.streams, stream_id)
+          Ok(State(..state, streams:))
+        }
+        Error(Nil) -> Ok(state)
+      }
+    }
 
-    frame.GoAway(last_stream_id:, code:, debug:) -> todo
+    frame.GoAway(last_stream_id:, code:, debug:) -> {
+      let _ =
+        bit_array.to_string(debug)
+        |> result.map(fn(debug) {
+          logging.log(logging.Debug, "Received goaway: " <> debug)
+        })
 
-    frame.PushPromise(..) -> todo
+      Ok(State(..state, mode: Closed))
+    }
+
+    frame.PushPromise(..) ->
+      Error(append_goaway(state, frame.ProtocolError, "Received push promise"))
 
     frame.Ping(ack: True, ..) | frame.Priority(..) | frame.Unknown -> Ok(state)
 
-    frame.Continuation(..) -> todo
+    frame.Continuation(..) ->
+      append_goaway(state, frame.ProtocolError, "Unexpected continuation frame")
+      |> Error
   }
 }
 
@@ -476,12 +551,10 @@ fn process_headers(
 ) -> Result(State, State) {
   case end_headers {
     True -> open_stream(state, stream_id, field_block, end_stream)
-    False ->
-      State(
-        ..state,
-        mode: Continuation(stream_id:, fragments: field_block, end_stream:),
-      )
-      |> Ok
+    False -> {
+      let mode = Continuation(stream_id:, fragments: field_block, end_stream:)
+      Ok(State(..state, mode:))
+    }
   }
 }
 
@@ -546,8 +619,7 @@ fn process_data(
             |> frame.WindowUpdate(stream_id: 0)
             |> append_pending(state, _)
 
-          let connection_recv_window =
-            connection_recv_window + state.local_settings.initial_window_size
+          let connection_recv_window = state.local_settings.initial_window_size
 
           Ok(State(..state, connection_recv_window:))
         }
@@ -585,7 +657,14 @@ fn open_stream(
           case started {
             Ok(actor.Started(pid:, data: subject)) -> {
               process.monitor(pid)
-              let stream = Stream(id: stream_id, subject:)
+              let stream =
+                Stream(
+                  id: stream_id,
+                  pid:,
+                  subject:,
+                  send_window: state.remote_settings.initial_window_size,
+                  pending: option.None,
+                )
               let streams = dict.insert(state.streams, stream_id, stream)
               Ok(State(..state, streams:))
             }
@@ -804,4 +883,272 @@ fn parse_authority(authority: String) -> #(String, option.Option(Int)) {
         Error(Nil) -> #(authority, option.None)
       }
   }
+}
+
+fn send_response(
+  state: State,
+  stream_id: Int,
+  response: response.Response(http_.ResponseBody),
+) -> State {
+  let body = case response.body {
+    http_.TextData(s) -> option.Some(<<s:utf8>>)
+    http_.BytesData(tree) -> option.Some(bytes_tree.to_bit_array(tree))
+    http_.BitsData(bits) -> option.Some(bits)
+    http_.StringTreeData(tree) ->
+      option.Some(<<string_tree.to_string(tree):utf8>>)
+    http_.Empty -> option.Some(<<>>)
+    http_.File(..) | http_.Chunked | http_.Websocket | http_.SSE -> option.None
+  }
+
+  case body {
+    option.None -> {
+      let streams = dict.delete(state.streams, stream_id)
+      frame.RstStream(stream_id:, code: frame.InternalError)
+      |> append_pending(State(..state, streams:), _)
+    }
+    option.Some(body) -> {
+      let body_size = bit_array.byte_size(body)
+      let has_body = body_size > 0
+
+      let response = case
+        has_body,
+        response.get_header(response, "content-length")
+      {
+        True, Error(Nil) ->
+          response.set_header(
+            response,
+            "content-length",
+            int.to_string(body_size),
+          )
+        _, _ -> response
+      }
+
+      let state = append_response_headers(state, stream_id, response, !has_body)
+      case has_body {
+        False -> {
+          let streams = dict.delete(state.streams, stream_id)
+          State(..state, streams:)
+        }
+        True -> append_response_body(state, stream_id, body)
+      }
+    }
+  }
+}
+
+fn append_response_headers(
+  state: State,
+  stream_id: Int,
+  response: response.Response(http_.ResponseBody),
+  end_stream: Bool,
+) -> State {
+  let status_field =
+    alpacki.HeaderField(
+      name: <<":status":utf8>>,
+      value: <<int.to_string(response.status):utf8>>,
+      indexing: alpacki.WithIndexing,
+    )
+
+  let header_fields =
+    list.fold(response.headers, [status_field], fn(acc, pair) {
+      let #(name, value) = pair
+      case is_forbidden_response_header(name) {
+        True -> acc
+        False -> {
+          let indexing = case is_sensitive_response_header(name) {
+            True -> alpacki.NeverIndexed
+            False -> alpacki.WithIndexing
+          }
+
+          [
+            alpacki.HeaderField(
+              // TODO: remove string lowercase here!!!
+              name: <<string.lowercase(name):utf8>>,
+              value: <<value:utf8>>,
+              indexing:,
+            ),
+            ..acc
+          ]
+        }
+      }
+    })
+    |> list.reverse
+
+  let #(field_block, hpack_encoder) =
+    alpacki.encode_header_block(
+      header_fields,
+      state.hpack_encoder,
+      huffman: True,
+    )
+
+  let state = State(..state, hpack_encoder:)
+  let max_size = state.remote_settings.max_frame_size
+  append_header_frames(state, stream_id, field_block, end_stream, max_size)
+}
+
+fn append_header_frames(
+  state: State,
+  stream_id: Int,
+  field_block: BitArray,
+  end_stream: Bool,
+  max_size: Int,
+) -> State {
+  case field_block {
+    <<field_block:bytes-size(max_size)>> ->
+      frame.Headers(stream_id:, end_headers: True, end_stream:, field_block:)
+      |> append_pending(state, _)
+    <<chunk:bytes-size(max_size), remaining:bits>> -> {
+      let state =
+        frame.Headers(
+          stream_id:,
+          end_headers: False,
+          end_stream:,
+          field_block: chunk,
+        )
+        |> append_pending(state, _)
+
+      append_continuation_frames(state, stream_id, remaining, max_size)
+    }
+    _ ->
+      frame.Headers(stream_id:, end_headers: True, end_stream:, field_block:)
+      |> append_pending(state, _)
+  }
+}
+
+fn append_continuation_frames(
+  state: State,
+  stream_id: Int,
+  field_block: BitArray,
+  max_size: Int,
+) -> State {
+  case field_block {
+    <<field_block:bytes-size(max_size)>> ->
+      frame.Continuation(stream_id:, end_headers: True, field_block:)
+      |> append_pending(state, _)
+    <<chunk:bytes-size(max_size), remaining:bits>> -> {
+      let state =
+        frame.Continuation(stream_id:, end_headers: False, field_block: chunk)
+        |> append_pending(state, _)
+      append_continuation_frames(state, stream_id, remaining, max_size)
+    }
+    _ ->
+      frame.Continuation(stream_id:, end_headers: True, field_block:)
+      |> append_pending(state, _)
+  }
+}
+
+fn append_response_body(state: State, stream_id: Int, body: BitArray) -> State {
+  case dict.get(state.streams, stream_id) {
+    Error(Nil) -> state
+    Ok(stream) -> {
+      let max_frame = state.remote_settings.max_frame_size
+      let available = int.min(state.connection_send_window, stream.send_window)
+      let body_size = bit_array.byte_size(body)
+      let to_send_size = int.min(int.max(available, 0), body_size)
+
+      case to_send_size {
+        0 -> {
+          let stream = Stream(..stream, pending: option.Some(body))
+          let streams = dict.insert(state.streams, stream_id, stream)
+          State(..state, streams:)
+        }
+        _ -> {
+          let #(to_send, pending) = case body {
+            <<head:bytes-size(to_send_size), remaining:bits>> -> #(
+              head,
+              remaining,
+            )
+            _ -> #(body, <<>>)
+          }
+          let has_pending = bit_array.byte_size(pending) > 0
+          let state =
+            append_data_frames(
+              state,
+              stream_id,
+              to_send,
+              max_frame,
+              !has_pending,
+            )
+          let connection_send_window =
+            state.connection_send_window - to_send_size
+          let streams = case has_pending {
+            False -> dict.delete(state.streams, stream_id)
+            True -> {
+              let send_window = stream.send_window - to_send_size
+              let stream =
+                Stream(..stream, send_window:, pending: option.Some(pending))
+              dict.insert(state.streams, stream_id, stream)
+            }
+          }
+          State(..state, connection_send_window:, streams:)
+        }
+      }
+    }
+  }
+}
+
+fn append_data_frames(
+  state: State,
+  stream_id: Int,
+  data: BitArray,
+  max_per_frame: Int,
+  is_last: Bool,
+) -> State {
+  case data {
+    <<data:bytes-size(max_per_frame)>> ->
+      frame.Data(stream_id:, end_stream: is_last, data:)
+      |> append_pending(state, _)
+    <<chunk:bytes-size(max_per_frame), remaining:bits>> -> {
+      let state =
+        frame.Data(stream_id:, end_stream: False, data: chunk)
+        |> append_pending(state, _)
+
+      append_data_frames(state, stream_id, remaining, max_per_frame, is_last)
+    }
+    _ ->
+      frame.Data(stream_id:, end_stream: is_last, data:)
+      |> append_pending(state, _)
+  }
+}
+
+fn is_forbidden_response_header(name: String) -> Bool {
+  case string.lowercase(name) {
+    "connection"
+    | "keep-alive"
+    | "proxy-connection"
+    | "transfer-encoding"
+    | "upgrade" -> True
+    _ -> False
+  }
+}
+
+fn is_sensitive_response_header(name: String) -> Bool {
+  case string.lowercase(name) {
+    "authorization" | "set-cookie" -> True
+    _ -> False
+  }
+}
+
+fn flush_stream_pending(state: State, stream_id: Int) -> State {
+  case dict.get(state.streams, stream_id) {
+    Error(Nil) -> state
+    Ok(stream) -> {
+      case stream.pending {
+        option.None -> state
+        option.Some(data) -> {
+          let stream = Stream(..stream, pending: option.None)
+          let streams = dict.insert(state.streams, stream_id, stream)
+          append_response_body(State(..state, streams:), stream_id, data)
+        }
+      }
+    }
+  }
+}
+
+fn flush_all_pending(state: State) -> State {
+  dict.fold(state.streams, state, fn(state, stream_id, stream) {
+    case stream.pending {
+      option.None -> state
+      option.Some(_) -> flush_stream_pending(state, stream_id)
+    }
+  })
 }

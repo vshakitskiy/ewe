@@ -3,6 +3,7 @@ import gleam/erlang/process
 import gleam/http/response
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
+import gleam/string
 import logging
 
 pub fn main() {
@@ -43,7 +44,8 @@ fn server_worker(
 }
 
 fn handle_request(_request: ewe.Request) -> ewe.Response {
+  let body = string.repeat("a", 131_072)
   response.new(200)
   |> response.set_header("content-type", "text/plain; charset=utf-8")
-  |> response.set_body(ewe.TextData("Hello, World!"))
+  |> response.set_body(ewe.TextData(body))
 }
