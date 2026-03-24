@@ -1,8 +1,5 @@
 import alpacki
-import ewe/internal/http.{
-  type ResponseBody, BitsData, BytesData, Chunked, Empty, File, SSE,
-  StringTreeData, TextData, Websocket,
-} as http_
+import ewe/internal/http as http_
 import ewe/internal/http2/frame
 import ewe/internal/http2/message.{type ConnectionMessage, type StreamMessage}
 import ewe/internal/http2/stream
@@ -23,7 +20,6 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
-import gleam/string_tree
 import glisten
 import glisten/socket
 import glisten/socket/options.{ActiveMode, Count}
@@ -43,16 +39,14 @@ pub type Settings {
   )
 }
 
-fn default_settings() -> Settings {
-  Settings(
-    header_table_size: 4096,
-    enable_push: True,
-    max_concurrent_streams: option.None,
-    initial_window_size: 65_535,
-    max_frame_size: 16_384,
-    max_header_list_size: option.None,
-  )
-}
+const default_settings = Settings(
+  header_table_size: 4096,
+  enable_push: True,
+  max_concurrent_streams: option.None,
+  initial_window_size: 65_535,
+  max_frame_size: 16_384,
+  max_header_list_size: option.None,
+)
 
 fn server_settings() -> Settings {
   Settings(
@@ -66,7 +60,7 @@ fn server_settings() -> Settings {
 }
 
 fn decode_settings(settings: List(frame.Setting)) -> Settings {
-  list.fold(settings, default_settings(), fn(acc, setting) {
+  list.fold(settings, default_settings, fn(acc, setting) {
     case setting {
       frame.HeaderTableSize(value) -> Settings(..acc, header_table_size: value)
       frame.EnablePush(value) -> Settings(..acc, enable_push: value == 1)
@@ -82,15 +76,30 @@ fn decode_settings(settings: List(frame.Setting)) -> Settings {
 }
 
 fn encode_settings(settings: Settings) -> bytes_tree.BytesTree {
-  let payload = [
-    frame.HeaderTableSize(settings.header_table_size),
-    frame.InitialWindowSize(settings.initial_window_size),
-    frame.MaxFrameSize(settings.max_frame_size),
-  ]
+  let payload = case
+    settings.header_table_size != default_settings.header_table_size
+  {
+    True -> [frame.HeaderTableSize(settings.header_table_size)]
+    False -> []
+  }
+
+  let payload = case
+    settings.initial_window_size != default_settings.initial_window_size
+  {
+    True -> [frame.InitialWindowSize(settings.initial_window_size), ..payload]
+    False -> payload
+  }
+
+  let payload = case
+    settings.max_frame_size != default_settings.max_frame_size
+  {
+    True -> [frame.MaxFrameSize(settings.max_frame_size), ..payload]
+    False -> payload
+  }
 
   let payload = case settings.enable_push {
-    True -> [frame.EnablePush(1), ..payload]
-    False -> payload
+    True -> payload
+    False -> [frame.EnablePush(0), ..payload]
   }
 
   let payload = case settings.max_concurrent_streams {
@@ -140,10 +149,9 @@ type State {
     buffer: BitArray,
     local_settings: Settings,
     remote_settings: Settings,
+    settings_timeout: option.Option(process.Timer),
     hpack_decoder: alpacki.DynamicTable,
     hpack_encoder: alpacki.DynamicTable,
-    settings_timeout: option.Option(process.Timer),
-    settings_acked: Bool,
     pending: bytes_tree.BytesTree,
     factory: factory.Supervisor(
       fn() ->
@@ -175,10 +183,9 @@ fn flush_pending(state: State) -> State {
 }
 
 fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
-  let pending =
-    <<debug:utf8>>
-    |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
-    |> append_pending(state, _)
+  <<debug:utf8>>
+  |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
+  |> append_pending(state, _)
 }
 
 fn append_rst_stream(
@@ -218,7 +225,7 @@ pub fn start(
   handler: fn(request.Request(http_.Connection)) ->
     response.Response(http_.ResponseBody),
 ) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(_subject) {
+  actor.new_with_initialiser(1000, fn(self) {
     let _ = transport.controlling_process(transport, socket, process.self())
     let _ =
       transport.set_opts(transport, socket, [
@@ -226,20 +233,11 @@ pub fn start(
       ])
 
     let local_settings = server_settings()
-    let remote_settings = case upgrade {
-      option.Some(upgrade) -> upgrade.settings
-      option.None -> default_settings()
-    }
+    let remote_settings =
+      option.map(upgrade, fn(upgrade) { upgrade.settings })
+      |> option.unwrap(default_settings)
 
-    let self = process.new_subject()
     let connection_subject = process.new_subject()
-    let settings_timeout =
-      process.send_after(self, 10_000, SettingsTimeout)
-      |> option.Some
-    let pending =
-      bytes_tree.new()
-      |> bytes_tree.append_tree(encode_settings(local_settings))
-
     let selector =
       create_socket_selector(self)
       |> process.select_map(for: connection_subject, mapping: FromStream)
@@ -263,13 +261,14 @@ pub fn start(
             buffer:,
             local_settings:,
             remote_settings:,
+            settings_timeout: process.send_after(self, 10_000, SettingsTimeout)
+              |> option.Some,
             hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
             hpack_encoder: alpacki.new_dynamic(
               remote_settings.header_table_size,
             ),
-            settings_timeout:,
-            settings_acked: False,
-            pending:,
+            pending: bytes_tree.new()
+              |> bytes_tree.append_tree(encode_settings(local_settings)),
             factory:,
             streams: dict.new(),
             last_stream_id: 0,
@@ -439,7 +438,7 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
 
     frame.SettingsAck -> {
       option.map(state.settings_timeout, process.cancel_timer)
-      Ok(State(..state, settings_acked: True, settings_timeout: option.None))
+      Ok(State(..state, settings_timeout: option.None))
     }
 
     frame.Ping(ack: False, data:) ->
