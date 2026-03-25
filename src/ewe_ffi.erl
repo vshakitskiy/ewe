@@ -1,7 +1,8 @@
 -module(ewe_ffi).
 
 -export([close_file/1, decode_packet/3, init_clock_storage/0, lookup_http_date/0, now/0,
-         now_microseconds/0, open_file/1, set_http_date/1, validate_field_value/1,
+         now_microseconds/0, open_file/1, set_http_date/1, validate_lowercase_field/1,
+         validate_field_value/1, validate_lowercase_field_value/1, sanitize_header_value/1,
          coerce_tcp_message/1, parse_path/1]).
 
 % Socket
@@ -48,12 +49,43 @@ parse_path(Value) ->
       {ok, {maps:get(path, Uri), Query}}
   end.
 
+validate_lowercase_field(<<>>) ->
+  {error, invalid_headers};
+validate_lowercase_field(Value) ->
+  validate_lowercase_field(Value, <<>>).
+
+validate_lowercase_field(<<>>, Acc) ->
+  {ok, Acc};
+validate_lowercase_field(<<C, Rest/bits>>, Acc) when C >= $A, C =< $Z ->
+  validate_lowercase_field(Rest, <<Acc/binary, (C + 32)>>);
+validate_lowercase_field(<<C, Rest/bits>>, Acc)
+  when C >= $a, C =< $z;
+       C >= $0, C =< $9;
+       C =:= $!;
+       C =:= $#;
+       C =:= $$;
+       C =:= $%;
+       C =:= $&;
+       C =:= $';
+       C =:= $*;
+       C =:= $+;
+       C =:= $-;
+       C =:= $.;
+       C =:= $^;
+       C =:= $_;
+       C =:= $`;
+       C =:= $|;
+       C =:= $~ ->
+  validate_lowercase_field(Rest, <<Acc/binary, C>>);
+validate_lowercase_field(_, _) ->
+  {error, invalid_headers}.
+
 validate_field_value(Value) ->
   case do_validate_field_value(Value) of
     true ->
       {ok, Value};
     false ->
-      {error, nil}
+      {error, invalid_headers}
   end.
 
 % HTTP field values can contain:
@@ -73,6 +105,31 @@ do_validate_field_value(Value) ->
     _ ->
       false
   end.
+
+validate_lowercase_field_value(Value) ->
+  do_validate_lowercase_field_value(Value, <<>>).
+
+do_validate_lowercase_field_value(<<>>, Acc) ->
+  {ok, Acc};
+do_validate_lowercase_field_value(<<C, Rest/bits>>, Acc) when C >= $A, C =< $Z ->
+  do_validate_lowercase_field_value(Rest, <<Acc/binary, (C + 32)>>);
+do_validate_lowercase_field_value(<<C, Rest/bits>>, Acc)
+  when C =:= 16#09
+       orelse C >= 16#20 andalso C =< 16#7E
+       orelse C >= 16#80 andalso C =< 16#FF ->
+  do_validate_lowercase_field_value(Rest, <<Acc/binary, C>>);
+do_validate_lowercase_field_value(_, _) ->
+  {error, invalid_headers}.
+
+sanitize_header_value(Value) ->
+  sanitize_header_value(Value, <<>>).
+
+sanitize_header_value(<<>>, Acc) ->
+  Acc;
+sanitize_header_value(<<C, Rest/bitstring>>, Acc) when C =:= 16#0D; C =:= 16#0A ->
+  sanitize_header_value(Rest, Acc);
+sanitize_header_value(<<C, Rest/bitstring>>, Acc) ->
+  sanitize_header_value(Rest, <<Acc/binary, C>>).
 
 % CLOCK
 % -----------------------------------------------------------------------------

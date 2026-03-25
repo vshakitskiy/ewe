@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Sanitize CRLF sequences in outgoing HTTP response headers.
+- Eliminate `string.lowercase` in a codebase: validate and lowercase header field names in a single pass, validate and lowercase important protocol header values (like `transfer-encoding`, `connection`, `upgrade` and more) at parse time.
+- Include validation of trailer header field names and values during chunked body parsing.
+
 # v3.0.5 - 15.03.2026
 
 - Remove all usage of `string.inspect` as it is an anti-pattern for logging.
