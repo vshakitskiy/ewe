@@ -202,8 +202,7 @@ pub fn parse_request(
 
           case connection, upgrade, settings {
             Ok(connection), Ok("h2c"), Ok(settings) -> {
-              let is_upgrade =
-                string.contains(string.lowercase(connection), "upgrade")
+              let is_upgrade = string.contains(connection, "upgrade")
 
               case is_upgrade {
                 True -> Ok(Http2Upgrade(Upgrade(req:, settings:)))
@@ -248,16 +247,14 @@ fn parse_headers(
     Ok(Packet(HttpHeader(idx, field, value), rest)) -> {
       use field <- try(case decoder.formatted_field_by_idx(idx) {
         Ok(field) -> Ok(field)
-        Error(Nil) -> {
-          bit_array.to_string(field)
-          |> result.map(string.lowercase)
-          |> replace_error(InvalidHeaders)
-        }
+        Error(Nil) -> validate_lowercase_field(field)
       })
 
-      use value <- try(
-        validate_field_value(value) |> replace_error(InvalidHeaders),
-      )
+      use value <- try(case field {
+        "transfer-encoding" | "connection" | "upgrade" | "expect" | "trailer" ->
+          validate_lowercase_field_value(value)
+        _ -> validate_field_value(value)
+      })
 
       let new_buffer = Buffer(rest, 0)
 
@@ -302,8 +299,14 @@ fn parse_headers(
   }
 }
 
+@external(erlang, "ewe_ffi", "validate_lowercase_field")
+fn validate_lowercase_field(field: BitArray) -> Result(String, ParseError)
+
 @external(erlang, "ewe_ffi", "validate_field_value")
-fn validate_field_value(value: BitArray) -> Result(String, Nil)
+fn validate_field_value(value: BitArray) -> Result(String, ParseError)
+
+@external(erlang, "ewe_ffi", "validate_lowercase_field_value")
+fn validate_lowercase_field_value(value: BitArray) -> Result(String, ParseError)
 
 /// Inserts a header into the headers dictionary.
 ///
@@ -356,11 +359,7 @@ pub fn read_body(
   let transport = req.body.transport
   let socket = req.body.socket
 
-  let transfer_encoding =
-    request.get_header(req, "transfer-encoding")
-    |> result.map(string.lowercase)
-
-  case transfer_encoding {
+  case request.get_header(req, "transfer-encoding") {
     Ok("chunked") -> {
       use #(body, rest_buffer) <- try(read_chunked_body(
         transport,
@@ -379,7 +378,7 @@ pub fn read_body(
             trailer
             |> string.split(",")
             |> list.fold(set.new(), fn(set, field) {
-              set.insert(set, string.trim(field) |> string.lowercase())
+              set.insert(set, string.trim(field))
             })
 
           Ok(handle_trailers(req, set, rest_buffer))
@@ -502,28 +501,25 @@ fn handle_trailers(
     Ok(Packet(HttpHeader(idx, field, value), header_rest)) -> {
       let field_name = case decoder.formatted_field_by_idx(idx) {
         Ok(field_name) -> Ok(field_name)
-        Error(Nil) -> {
-          bit_array.to_string(field)
-          |> result.map(string.lowercase)
-        }
+        Error(Nil) -> validate_lowercase_field(field)
       }
 
       case field_name {
         Ok(field_name) -> {
           case set.contains(set, field_name) && is_allowed_trailer(field_name) {
             True -> {
-              case bit_array.to_string(value) {
+              case validate_field_value(value) {
                 Ok(value) -> {
                   request.set_header(req, field_name, value)
                   |> handle_trailers(set, Buffer(header_rest, 0))
                 }
-                Error(Nil) -> handle_trailers(req, set, Buffer(header_rest, 0))
+                Error(_) -> handle_trailers(req, set, Buffer(header_rest, 0))
               }
             }
             False -> handle_trailers(req, set, Buffer(header_rest, 0))
           }
         }
-        Error(Nil) -> handle_trailers(req, set, Buffer(header_rest, 0))
+        Error(_) -> handle_trailers(req, set, Buffer(header_rest, 0))
       }
     }
     _ -> req
@@ -759,9 +755,7 @@ pub fn upgrade_websocket(
 
   let is_upgrade =
     request.get_header(req, "connection")
-    |> result.map(fn(connection) {
-      string.lowercase(connection) |> string.contains("upgrade")
-    })
+    |> result.map(string.contains(_, "upgrade"))
 
   use _ <- try(case is_upgrade {
     Ok(True) -> Ok(Nil)
@@ -769,13 +763,11 @@ pub fn upgrade_websocket(
     Error(_) -> Error(MissingConnectionHeader)
   })
 
-  use _ <- try(
-    case request.get_header(req, "upgrade") |> result.map(string.lowercase) {
-      Ok("websocket") -> Ok(Nil)
-      Ok(_) -> Error(InvalidUpgradeHeader)
-      Error(_) -> Error(MissingUpgradeHeader)
-    },
-  )
+  use _ <- try(case request.get_header(req, "upgrade") {
+    Ok("websocket") -> Ok(Nil)
+    Ok(_) -> Error(InvalidUpgradeHeader)
+    Error(_) -> Error(MissingUpgradeHeader)
+  })
 
   use <- bool.guard(
     request.get_header(req, "sec-websocket-version") == Error(Nil),
@@ -881,7 +873,7 @@ pub fn handle_continue(req: Request(Connection)) -> Result(Nil, ParseError) {
   let expect =
     req.headers
     |> list.find(fn(tupple) {
-      tupple.0 == "expect" && string.lowercase(tupple.1) == "100-continue"
+      tupple.0 == "expect" && tupple.1 == "100-continue"
     })
 
   case expect {

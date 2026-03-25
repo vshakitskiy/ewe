@@ -4,7 +4,7 @@ import gleam/int
 import gleam/list
 
 /// Encodes an HTTP response into bytes.
-/// 
+///
 pub fn encode_response(
   response: response.Response(BitArray),
 ) -> bytes_tree.BytesTree {
@@ -15,7 +15,7 @@ pub fn encode_response(
 }
 
 /// Encodes the HTTP status line and headers of an HTTP response.
-/// 
+///
 pub fn encode_response_partially(
   response: response.Response(a),
 ) -> bytes_tree.BytesTree {
@@ -25,7 +25,7 @@ pub fn encode_response_partially(
 }
 
 /// Encodes the HTTP status line.
-/// 
+///
 fn encode_status_line(status: Int) -> BitArray {
   let status_name = status_to_bit_array(status)
   let status = int.to_string(status)
@@ -34,20 +34,29 @@ fn encode_status_line(status: Int) -> BitArray {
 }
 
 /// Encodes HTTP headers into bytes.
-/// 
+///
 fn encode_headers(headers: List(#(String, String))) -> BitArray {
   let headers =
     list.fold(headers, <<>>, fn(acc, headers) {
       let #(key, value) = headers
 
-      <<acc:bits, key:utf8, ": ", value:utf8, "\r\n">>
+      <<
+        acc:bits,
+        sanitize_header_value(key):utf8,
+        ": ",
+        sanitize_header_value(value):utf8,
+        "\r\n",
+      >>
     })
 
   <<headers:bits, "\r\n">>
 }
 
+@external(erlang, "ewe_ffi", "sanitize_header_value")
+fn sanitize_header_value(value: String) -> String
+
 /// Maps HTTP status codes to their text descriptions.
-/// 
+///
 fn status_to_bit_array(status: Int) -> BitArray {
   case status {
     100 -> <<"Continue">>
