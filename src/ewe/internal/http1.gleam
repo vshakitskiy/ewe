@@ -72,7 +72,6 @@ fn read_from_socket(
     transport.receive_timeout(transport, socket, read_size, 5000)
     |> replace_error(on_error),
   )
-
   let new_buffer = buffer.append(buffer, data)
 
   case new_buffer.pending {
@@ -202,9 +201,7 @@ pub fn parse_request(
 
           case connection, upgrade, settings {
             Ok(connection), Ok("h2c"), Ok(settings) -> {
-              let is_upgrade = string.contains(connection, "upgrade")
-
-              case is_upgrade {
+              case string.contains(connection, "upgrade") {
                 True -> Ok(Http2Upgrade(Upgrade(req:, settings:)))
                 False -> Ok(Http1Request(req:, version: Http11))
               }
@@ -498,7 +495,7 @@ fn handle_trailers(
 ) -> Request(BitArray) {
   case decoder.decode_packet(HttphBin, rest) {
     Ok(Packet(HttpEoh, _)) -> req
-    Ok(Packet(HttpHeader(idx, field, value), header_rest)) -> {
+    Ok(Packet(HttpHeader(idx, field, value), headers)) -> {
       let field_name = case decoder.formatted_field_by_idx(idx) {
         Ok(field_name) -> Ok(field_name)
         Error(Nil) -> validate_lowercase_field(field)
@@ -511,15 +508,15 @@ fn handle_trailers(
               case validate_field_value(value) {
                 Ok(value) -> {
                   request.set_header(req, field_name, value)
-                  |> handle_trailers(set, Buffer(header_rest, 0))
+                  |> handle_trailers(set, Buffer(headers, 0))
                 }
-                Error(_) -> handle_trailers(req, set, Buffer(header_rest, 0))
+                Error(_) -> handle_trailers(req, set, Buffer(headers, 0))
               }
             }
-            False -> handle_trailers(req, set, Buffer(header_rest, 0))
+            False -> handle_trailers(req, set, Buffer(headers, 0))
           }
         }
-        Error(_) -> handle_trailers(req, set, Buffer(header_rest, 0))
+        Error(_) -> handle_trailers(req, set, Buffer(headers, 0))
       }
     }
     _ -> req
