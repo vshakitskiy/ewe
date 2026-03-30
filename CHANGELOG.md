@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v3.0.6 - 30.03.2026
 
 - Sanitize CRLF sequences in outgoing HTTP response headers.
 - Eliminate `string.lowercase` in a codebase: validate and lowercase header field names in a single pass, validate and lowercase important protocol header values (like `transfer-encoding`, `connection`, `upgrade` and more) at parse time.
