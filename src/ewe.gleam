@@ -423,7 +423,7 @@ pub fn enable_ipv6(builder: Builder) -> Builder {
   Builder(..builder, ipv6: True)
 }
 
-/// Enables TLS (HTTPS) support, with provided certificate and key files. 
+/// Enables TLS (HTTPS) support, with provided certificate and key files.
 /// Crashes the program if the files don't exist or are invalid.
 pub fn enable_tls(
   builder: Builder,
@@ -494,25 +494,22 @@ pub fn start(
       handler.loop(handler, on_crash, factory_name, builder.idle_timeout),
     )
     |> glisten.bind(builder.interface)
-    |> fn(glisten_builder) {
-      case builder.ipv6 {
-        True -> glisten.with_ipv6(glisten_builder)
-        False -> glisten_builder
-      }
-    }
-    |> fn(glisten_builder) {
-      case builder.tls {
-        Some(#(cert, key)) -> glisten.with_tls(glisten_builder, cert, key)
-        // Uncomment once http2 will be implemented!
-        // |> glisten.with_http2
-        None -> glisten_builder
-      }
-    }
     |> glisten.with_listener_name(builder.listener_name)
-    |> glisten.supervised(builder.port)
+
+  let glisten = case builder.ipv6 {
+    True -> glisten.with_ipv6(glisten)
+    False -> glisten
+  }
+
+  let glisten = case builder.tls {
+    Some(#(cert, key)) -> glisten.with_tls(glisten, cert, key)
+    // Uncomment once http2 will be implemented!
+    // |> glisten.with_http2
+    None -> glisten
+  }
 
   supervisor.new(supervisor.OneForAll)
-  |> supervisor.add(glisten)
+  |> supervisor.add(glisten.supervised(glisten, builder.port))
   |> supervisor.add(factory_child)
   |> supervisor.start()
   |> result.map(fn(started) {
@@ -554,8 +551,8 @@ pub type BodyError {
 pub type Request =
   HttpRequest(Connection)
 
-/// Reads body from the request. Returns `BodyTooLarge` if body exceeds 
-/// `bytes_limit`, or `InvalidBody` if malformed. Supports both chunked and 
+/// Reads body from the request. Returns `BodyTooLarge` if body exceeds
+/// `bytes_limit`, or `InvalidBody` if malformed. Supports both chunked and
 /// content-length bodies.
 pub fn read_body(
   req: Request,
@@ -672,18 +669,16 @@ pub fn chunked_body(
 
   let transport = req.body.transport
   let socket = req.body.socket
-  let factory_name = req.body.factory_name
 
   case chunked.send_response(resp, transport, socket) {
     Ok(Nil) -> {
-      let supervisor = factory.get_by_name(factory_name)
-
-      let start_result =
-        factory.start_child(supervisor, fn() {
+      let started =
+        factory.get_by_name(req.body.factory_name)
+        |> factory.start_child(fn() {
           chunked.start(transport, socket, on_init, handler, on_close)
         })
 
-      case start_result {
+      case started {
         Ok(started) -> {
           let _ = transport.controlling_process(transport, socket, started.pid)
           response.new(200) |> response.set_body(Chunked)
@@ -788,12 +783,15 @@ fn transform_websocket_message(
 ) -> Result(WebsocketMessage(user_message), Nil) {
   case message {
     websocket.Frame(websocks.Text(payload)) ->
-      bit_array.to_string(payload) |> result.map(Text)
+      Ok(Text(unsafe_to_string(payload)))
     websocket.Frame(websocks.Binary(payload)) -> Ok(Binary(payload))
     websocket.UserMessage(user_message) -> Ok(User(user_message))
     _ -> Error(Nil)
   }
 }
+
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_to_string(a: BitArray) -> String
 
 /// Upgrade request to a WebSocket connection. If the initial request is not
 /// valid for WebSocket upgrade, 400 response is sent.
@@ -828,13 +826,12 @@ pub fn upgrade_websocket(
 
   let transport = req.body.transport
   let socket = req.body.socket
-  let factory_name = req.body.factory_name
 
   case ewe_http.upgrade_websocket(req, transport, socket) {
     Ok(#(extensions, per_message_deflate)) -> {
-      let supervisor = factory.get_by_name(factory_name)
-      let start_result =
-        factory.start_child(supervisor, fn() {
+      let started =
+        factory.get_by_name(req.body.factory_name)
+        |> factory.start_child(fn() {
           websocket.start(
             transport,
             socket,
@@ -846,10 +843,9 @@ pub fn upgrade_websocket(
           )
         })
 
-      case start_result {
-        Ok(started) -> {
-          let _ = transport.controlling_process(transport, socket, started.pid)
-
+      case started {
+        Ok(actor.Started(pid:, ..)) -> {
+          let _ = transport.controlling_process(transport, socket, pid)
           response.new(200) |> response.set_body(Websocket)
         }
         Error(_) -> response.new(500) |> response.set_body(Empty)
@@ -864,13 +860,8 @@ pub fn send_binary_frame(
   conn: WebsocketConnection,
   bits: BitArray,
 ) -> Result(Nil, glisten.SocketReason) {
-  websocket.send_frame(
-    websocks.encode_binary_frame,
-    conn.transport,
-    conn.socket,
-    conn.context,
-    bits,
-  )
+  websocks.encode_binary_frame
+  |> websocket.send_frame(conn.transport, conn.socket, conn.context, bits)
 }
 
 /// Sends a text frame to the websocket client.
@@ -1049,19 +1040,18 @@ pub fn sse(
 
   let transport = req.body.transport
   let socket = req.body.socket
-  let factory_name = req.body.factory_name
 
   case sse.send_response(transport, socket) {
     Ok(Nil) -> {
-      let supervisor = factory.get_by_name(factory_name)
-      let start_result =
-        factory.start_child(supervisor, fn() {
+      let started =
+        factory.get_by_name(req.body.factory_name)
+        |> factory.start_child(fn() {
           sse.start(transport, socket, on_init, handler, on_close)
         })
 
-      case start_result {
-        Ok(started) -> {
-          let _ = transport.controlling_process(transport, socket, started.pid)
+      case started {
+        Ok(actor.Started(pid:, ..)) -> {
+          let _ = transport.controlling_process(transport, socket, pid)
           response.new(200) |> response.set_body(SSE)
         }
         Error(_) -> response.new(400) |> response.set_body(Empty)

@@ -3,10 +3,9 @@ import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dynamic
 import gleam/erlang/atom
-import gleam/erlang/process.{type Selector, type Subject}
+import gleam/erlang/process.{type Selector}
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import gleam/result
 import glisten/socket.{type Socket, type SocketReason}
 import glisten/socket/options.{ActiveMode, Count}
 import glisten/transport.{type Transport}
@@ -107,7 +106,12 @@ pub fn start(
   extensions: List(String),
   permessage_deflate: Bool,
 ) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(subject) {
+  actor.new_with_initialiser(1000, fn(_self) {
+    let _ =
+      transport.set_opts(transport, socket, [
+        ActiveMode(Count(socket_active_count)),
+      ])
+
     let context_takeovers = websocks.get_context_takeovers(extensions)
     let compression = case permessage_deflate {
       True -> Some(context_takeovers)
@@ -126,7 +130,7 @@ pub fn start(
     WebsocketState(user_state:, context:)
     |> actor.initialised()
     |> actor.selecting(selector)
-    |> actor.returning(subject)
+    |> actor.returning(Nil)
     |> Ok
   })
   |> actor.on_message(fn(state, msg) {
@@ -160,7 +164,7 @@ pub fn start(
     }
   })
   |> actor.start()
-  |> result.map(after_start(_, transport, socket))
+  // |> result.map(after_start(_, transport, socket))
 }
 
 // Creates selector for glisten socket events.
@@ -375,21 +379,6 @@ fn handle_close(
     }
     None -> actor.stop()
   }
-}
-
-// Maps actor's starting value to Nil.
-//
-fn after_start(
-  started: actor.Started(Subject(InternalMessage(user_message))),
-  transport: Transport,
-  socket: Socket,
-) -> actor.Started(Nil) {
-  let _ =
-    transport.set_opts(transport, socket, [
-      ActiveMode(Count(socket_active_count)),
-    ])
-
-  actor.Started(..started, data: Nil)
 }
 
 /// Sends a frame to the WebSocket.

@@ -58,7 +58,7 @@ pub fn start(
       |> process.select(subject)
 
     actor.initialised(state)
-    |> actor.returning(subject)
+    |> actor.returning(Nil)
     |> actor.selecting(selector)
     |> Ok
   })
@@ -92,20 +92,6 @@ pub fn start(
     }
   })
   |> actor.start()
-  |> result.map(after_start(_, transport, socket))
-}
-
-/// Maps actor's starting value to Nil.
-///
-fn after_start(
-  started: actor.Started(Subject(user_message)),
-  transport: Transport,
-  socket: Socket,
-) -> actor.Started(Nil) {
-  let assert Ok(pid) = process.subject_owner(started.data)
-  let _ = transport.controlling_process(transport, socket, pid)
-
-  actor.Started(..started, data: Nil)
 }
 
 /// Sends the end marker for chunked transfer encoding.

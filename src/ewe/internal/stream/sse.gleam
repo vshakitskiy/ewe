@@ -14,7 +14,7 @@ import glisten/socket/options.{Active, ActiveMode}
 import glisten/transport.{type Transport}
 
 /// Sends a response for a Server-Sent Events connection.
-/// 
+///
 pub fn send_response(transport: Transport, socket: Socket) -> Result(Nil, Nil) {
   response.new(200)
   |> response.set_header("content-type", "text/event-stream")
@@ -26,29 +26,29 @@ pub fn send_response(transport: Transport, socket: Socket) -> Result(Nil, Nil) {
 }
 
 /// Represents a Server-Sent Events connection.
-/// 
+///
 pub type SSEConnection {
   SSEConnection(transport: Transport, socket: Socket)
 }
 
 /// Represents an instruction on how Server-Sent Events connection should proceed.
-/// 
+///
 pub type SSENext(user_state) {
   Continue(user_state)
   NormalStop
   AbnormalStop(reason: String)
 }
 
-/// Represents a message that can be sent to or received from the Server-Sent 
+/// Represents a message that can be sent to or received from the Server-Sent
 /// Events connection.
-/// 
+///
 pub type SSEMessages(user_message) {
   User(user_message)
   Close
 }
 
 /// Starts a new Server-Sent Events connection.
-/// 
+///
 pub fn start(
   transport: Transport,
   socket: Socket,
@@ -56,13 +56,15 @@ pub fn start(
   handler: fn(SSEConnection, user_state, user_message) -> SSENext(user_state),
   on_close: fn(SSEConnection, user_state) -> Nil,
 ) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(_subject) {
+  actor.new_with_initialiser(1000, fn(_self) {
+    let _ = transport.set_opts(transport, socket, [ActiveMode(Active)])
+
     let subject = process.new_subject()
     let state = on_init(subject)
     let selector = create_socket_selector(subject)
 
     actor.initialised(state)
-    |> actor.returning(subject)
+    |> actor.returning(Nil)
     |> actor.selecting(selector)
     |> Ok
   })
@@ -89,11 +91,10 @@ pub fn start(
     }
   })
   |> actor.start()
-  |> result.map(after_start(_, transport, socket))
 }
 
 /// Creates a selector for the Server-Sent Events connection.
-/// 
+///
 fn create_socket_selector(
   user_subject: Subject(user_message),
 ) -> Selector(SSEMessages(user_message)) {
@@ -103,23 +104,8 @@ fn create_socket_selector(
   |> process.select_record(atom.create("ssl_closed"), 1, fn(_) { Close })
 }
 
-/// Maps actor's starting value to Nil.
-/// 
-fn after_start(
-  started: actor.Started(Subject(user_message)),
-  transport: Transport,
-  socket: Socket,
-) -> actor.Started(Nil) {
-  let assert Ok(pid) = process.subject_owner(started.data)
-  let _ = transport.controlling_process(transport, socket, pid)
-
-  let _ = transport.set_opts(transport, socket, [ActiveMode(Active)])
-
-  actor.Started(..started, data: Nil)
-}
-
 /// Represents a Server-Sent Events event.
-/// 
+///
 pub type SSEEvent {
   SSEEvent(
     event: Option(String),
@@ -130,7 +116,7 @@ pub type SSEEvent {
 }
 
 /// Sends an event to the client.
-/// 
+///
 pub fn send_event(
   transport: Transport,
   socket: Socket,
@@ -166,7 +152,7 @@ pub fn send_event(
 }
 
 /// Formats a field and value for a Server-Sent Events event.
-/// 
+///
 fn format(field: String, value: String) {
   field <> ": " <> value <> "\n"
 }
