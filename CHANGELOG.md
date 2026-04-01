@@ -1,5 +1,9 @@
 # Changelog
 
+## v3.0.7 - 01.04.2026
+
+- Bump `websocks` to next major.
+
 ## v3.0.6 - 30.03.2026
 
 - Sanitize CRLF sequences in outgoing HTTP response headers.

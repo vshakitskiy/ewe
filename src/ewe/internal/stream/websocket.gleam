@@ -112,12 +112,12 @@ pub fn start(
         ActiveMode(Count(socket_active_count)),
       ])
 
-    let context_takeovers = websocks.get_context_takeovers(extensions)
     let compression = case permessage_deflate {
-      True -> Some(context_takeovers)
+      True -> Some(websocks.get_compression_extensions(extensions))
       False -> None
     }
-    let context = websocks.create_context(compression)
+
+    let context = websocks.create_context(compression, websocks.Server)
 
     let #(user_state, user_selector) =
       WebsocketConnection(transport, socket, context)
