@@ -1,5 +1,9 @@
 # Changelog
 
+## v3.0.8 - 21.04.2026
+
+- Bumb `gleam_stdlib` to the v1.
+
 ## v3.0.7 - 01.04.2026
 
 - Bump `websocks` to next major.

@@ -1,5 +1,5 @@
 name = "ewe"
-version = "3.0.7"
+version = "3.0.8"
 
 description = "🐑 a fluffy Gleam web server"
 target = "erlang"
@@ -10,7 +10,7 @@ links = [
 ]
 
 [dependencies]
-gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 glisten = ">= 9.0.0 and < 10.0.0"
 gleam_otp = ">= 1.1.0 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
