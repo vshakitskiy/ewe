@@ -27,8 +27,6 @@ import glisten/socket/options.{ActiveMode, Count}
 import glisten/transport
 import logging
 
-const socket_active_count = 100
-
 pub type Settings {
   Settings(
     header_table_size: Int,
@@ -49,16 +47,14 @@ const default_settings = Settings(
   max_header_list_size: option.None,
 )
 
-fn server_settings() -> Settings {
-  Settings(
-    header_table_size: 4096,
-    enable_push: False,
-    max_concurrent_streams: option.Some(128),
-    initial_window_size: 65_535,
-    max_frame_size: 16_384,
-    max_header_list_size: option.Some(8192),
-  )
-}
+const server_settings = Settings(
+  header_table_size: 4096,
+  enable_push: False,
+  max_concurrent_streams: option.Some(128),
+  initial_window_size: 65_535,
+  max_frame_size: 16_384,
+  max_header_list_size: option.Some(8192),
+)
 
 fn decode_settings(settings: List(frame.Setting)) -> Settings {
   list.fold(settings, default_settings, fn(acc, setting) {
@@ -117,6 +113,95 @@ fn encode_settings(settings: Settings) -> bytes_tree.BytesTree {
   |> frame.encode
 }
 
+pub type Upgrade {
+  Upgrade(req: request.Request(http_.Connection), settings: Settings)
+}
+
+const socket_active_count = 100
+
+pub fn start(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  buffer: BitArray,
+  upgrade: option.Option(Upgrade),
+  handler: fn(request.Request(http_.Connection)) ->
+    response.Response(http_.ResponseBody),
+) -> Result(actor.Started(Nil), actor.StartError) {
+  actor.new_with_initialiser(10_000, fn(self) {
+    let _ = transport.controlling_process(transport, socket, process.self())
+    let _ =
+      transport.set_opts(transport, socket, [
+        ActiveMode(Count(socket_active_count)),
+      ])
+
+    let local_settings = server_settings
+    let remote_settings =
+      option.map(upgrade, fn(upgrade) { upgrade.settings })
+      |> option.unwrap(default_settings)
+
+    let inbox = process.new_subject()
+    let selector =
+      create_socket_selector(self)
+      |> process.select_map(for: inbox, mapping: FromStream)
+
+    let started =
+      factory.worker_child(fn(fun) { fun() })
+      |> factory.restart_strategy(supervision.Temporary)
+      |> factory.start
+
+    case started {
+      Ok(actor.Started(data: factory, ..)) -> {
+        let state =
+          State(
+            transport:,
+            socket:,
+            self:,
+            mode: Init,
+            buffer:,
+            recv_window: local_settings.initial_window_size,
+            send_window: remote_settings.initial_window_size,
+            pending: bytes_tree.new()
+              |> bytes_tree.append_tree(encode_settings(local_settings)),
+            local_settings:,
+            remote_settings:,
+            settings_timeout: process.send_after(self, 10_000, SettingsTimeout)
+              |> option.Some,
+            hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
+            hpack_encoder: alpacki.new_dynamic(
+              remote_settings.header_table_size,
+            ),
+            inbox:,
+            streams: dict.new(),
+            factory:,
+            last_stream_id: 0,
+            handler:,
+          )
+
+        case process_buffer(state) {
+          Ok(state) -> {
+            case flush(state) {
+              Ok(state) ->
+                actor.initialised(state)
+                |> actor.selecting(selector)
+                |> actor.returning(Nil)
+                |> Ok
+              Error(Nil) -> Error("Failed to start HTTP/2 connection")
+            }
+          }
+
+          Error(state) -> {
+            let _ = flush(state)
+            Error("Failed to start HTTP/2 connection")
+          }
+        }
+      }
+      Error(_) -> Error("Failed to start HTTP/2 streams factory")
+    }
+  })
+  |> actor.on_message(handle_message)
+  |> actor.start()
+}
+
 pub fn handle_http_upgrade(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -138,74 +223,6 @@ pub fn handle_http_upgrade(
   glisten.stop()
 }
 
-type State {
-  State(
-    transport: transport.Transport,
-    socket: socket.Socket,
-    self: process.Subject(Message),
-    connection_recv_window: Int,
-    connection_send_window: Int,
-    connection_subject: process.Subject(ConnectionMessage),
-    mode: Mode,
-    buffer: BitArray,
-    local_settings: Settings,
-    remote_settings: Settings,
-    settings_timeout: option.Option(process.Timer),
-    hpack_decoder: alpacki.DynamicTable,
-    hpack_encoder: alpacki.DynamicTable,
-    pending: bytes_tree.BytesTree,
-    factory: factory.Supervisor(
-      fn() ->
-        Result(actor.Started(process.Subject(StreamMessage)), actor.StartError),
-      process.Subject(StreamMessage),
-    ),
-    streams: dict.Dict(Int, Stream),
-    last_stream_id: Int,
-    handler: fn(request.Request(http_.Connection)) ->
-      response.Response(http_.ResponseBody),
-  )
-}
-
-type Stream {
-  Stream(
-    id: Int,
-    pid: process.Pid,
-    subject: process.Subject(StreamMessage),
-    send_window: Int,
-    pending: option.Option(BitArray),
-  )
-}
-
-fn append_pending(state: State, pending: frame.Frame) -> State {
-  let pending =
-    frame.encode(pending)
-    |> bytes_tree.append_tree(state.pending, _)
-
-  State(..state, pending:)
-}
-
-fn flush_pending(state: State) -> Result(State, Nil) {
-  case transport.send(state.transport, state.socket, state.pending) {
-    Ok(Nil) -> Ok(State(..state, pending: bytes_tree.new()))
-    Error(_) -> Error(Nil)
-  }
-}
-
-fn append_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
-  <<debug:utf8>>
-  |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
-  |> append_pending(state, _)
-}
-
-fn append_rst_stream(
-  state: State,
-  stream_id: Int,
-  code: frame.ErrorCode,
-) -> State {
-  frame.RstStream(stream_id, code)
-  |> append_pending(state, _)
-}
-
 type Mode {
   Init
   Open
@@ -222,92 +239,77 @@ type Message {
   StreamDown(process.Down)
 }
 
-pub type Upgrade {
-  Upgrade(req: request.Request(http_.Connection), settings: Settings)
+type Stream {
+  Stream(
+    id: Int,
+    pid: process.Pid,
+    subject: process.Subject(StreamMessage),
+    send_window: Int,
+    pending: option.Option(BitArray),
+  )
 }
 
-pub fn start(
-  transport: transport.Transport,
-  socket: socket.Socket,
-  buffer: BitArray,
-  upgrade: option.Option(Upgrade),
-  handler: fn(request.Request(http_.Connection)) ->
-    response.Response(http_.ResponseBody),
-) -> Result(actor.Started(Nil), actor.StartError) {
-  actor.new_with_initialiser(10_000, fn(self) {
-    let _ = transport.controlling_process(transport, socket, process.self())
-    let _ =
-      transport.set_opts(transport, socket, [
-        ActiveMode(Count(socket_active_count)),
-      ])
+type State {
+  State(
+    // Socket
+    transport: transport.Transport,
+    socket: socket.Socket,
+    self: process.Subject(Message),
+    // Connection
+    mode: Mode,
+    buffer: BitArray,
+    recv_window: Int,
+    send_window: Int,
+    pending: bytes_tree.BytesTree,
+    // Settings
+    local_settings: Settings,
+    remote_settings: Settings,
+    settings_timeout: option.Option(process.Timer),
+    // HPACK
+    hpack_decoder: alpacki.DynamicTable,
+    hpack_encoder: alpacki.DynamicTable,
+    inbox: process.Subject(ConnectionMessage),
+    // Stream
+    streams: dict.Dict(Int, Stream),
+    factory: factory.Supervisor(
+      fn() ->
+        Result(actor.Started(process.Subject(StreamMessage)), actor.StartError),
+      process.Subject(StreamMessage),
+    ),
+    last_stream_id: Int,
+    handler: fn(request.Request(http_.Connection)) ->
+      response.Response(http_.ResponseBody),
+  )
+}
 
-    let local_settings = server_settings()
-    let remote_settings =
-      option.map(upgrade, fn(upgrade) { upgrade.settings })
-      |> option.unwrap(default_settings)
+fn enqueue(state: State, pending: frame.Frame) -> State {
+  let pending =
+    frame.encode(pending)
+    |> bytes_tree.append_tree(state.pending, _)
 
-    let connection_subject = process.new_subject()
-    let selector =
-      create_socket_selector(self)
-      |> process.select_map(for: connection_subject, mapping: FromStream)
+  State(..state, pending:)
+}
 
-    let started =
-      factory.worker_child(fn(fun) { fun() })
-      |> factory.restart_strategy(supervision.Temporary)
-      |> factory.start
+fn flush(state: State) -> Result(State, Nil) {
+  case transport.send(state.transport, state.socket, state.pending) {
+    Ok(Nil) -> Ok(State(..state, pending: bytes_tree.new()))
+    Error(_) -> Error(Nil)
+  }
+}
 
-    case started {
-      Ok(actor.Started(data: factory, ..)) -> {
-        let processed =
-          State(
-            transport:,
-            socket:,
-            self:,
-            connection_recv_window: local_settings.initial_window_size,
-            connection_send_window: remote_settings.initial_window_size,
-            connection_subject:,
-            mode: Init,
-            buffer:,
-            local_settings:,
-            remote_settings:,
-            settings_timeout: process.send_after(self, 10_000, SettingsTimeout)
-              |> option.Some,
-            hpack_decoder: alpacki.new_dynamic(local_settings.header_table_size),
-            hpack_encoder: alpacki.new_dynamic(
-              remote_settings.header_table_size,
-            ),
-            pending: bytes_tree.new()
-              |> bytes_tree.append_tree(encode_settings(local_settings)),
-            factory:,
-            streams: dict.new(),
-            last_stream_id: 0,
-            handler:,
-          )
-          |> process_buffer
+fn enqueue_goaway(state: State, code: frame.ErrorCode, debug: String) -> State {
+  <<debug:utf8>>
+  |> frame.GoAway(last_stream_id: state.last_stream_id, code:)
+  |> enqueue(state, _)
+}
 
-        case processed {
-          Ok(state) -> {
-            case flush_pending(state) {
-              Ok(state) ->
-                actor.initialised(state)
-                |> actor.selecting(selector)
-                |> actor.returning(Nil)
-                |> Ok
-              Error(Nil) -> Error("Failed to start HTTP/2 connection")
-            }
-          }
-
-          Error(state) -> {
-            let _ = flush_pending(state)
-            Error("Failed to start HTTP/2 connection")
-          }
-        }
-      }
-      Error(_) -> Error("Failed to start HTTP/2 streams factory")
-    }
-  })
-  |> actor.on_message(handle_message)
-  |> actor.start()
+fn enqueue_rst_stream(
+  state: State,
+  stream_id: Int,
+  code: frame.ErrorCode,
+) -> State {
+  frame.RstStream(stream_id, code)
+  |> enqueue(state, _)
 }
 
 fn create_socket_selector(
@@ -331,7 +333,10 @@ fn create_socket_selector(
 @external(erlang, "ewe_ffi", "coerce_tcp_message")
 fn coerce_tcp_message(record: dynamic.Dynamic) -> BitArray
 
-fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
+fn handle_message(
+  state: State,
+  message: Message,
+) -> actor.Next(State, Message) {
   case message {
     Close -> actor.stop()
     Passive -> {
@@ -347,13 +352,13 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         process_buffer(State(..state, buffer: <<state.buffer:bits, data:bits>>))
       case processed {
         Ok(state) -> {
-          case flush_pending(state) {
+          case flush(state) {
             Ok(state) -> actor.continue(state)
             Error(Nil) -> actor.stop()
           }
         }
         Error(state) -> {
-          let _ = flush_pending(state)
+          let _ = flush(state)
           actor.stop()
         }
       }
@@ -386,9 +391,9 @@ fn handle_stream_message(
     message.WindowUpdate(stream_id:, increment:) -> {
       let state =
         frame.WindowUpdate(stream_id:, increment:)
-        |> append_pending(state, _)
+        |> enqueue(state, _)
 
-      case flush_pending(state) {
+      case flush(state) {
         Ok(state) -> actor.continue(state)
         Error(Nil) -> actor.stop()
       }
@@ -396,7 +401,7 @@ fn handle_stream_message(
 
     message.SendResponse(stream_id:, response:) -> {
       let state = send_response(state, stream_id, response)
-      case flush_pending(state) {
+      case flush(state) {
         Ok(state) -> actor.continue(state)
         Error(Nil) -> actor.stop()
       }
@@ -482,9 +487,7 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
     }
 
     frame.Ping(ack: False, data:) ->
-      frame.Ping(ack: True, data:)
-      |> append_pending(state, _)
-      |> Ok
+      Ok(enqueue(state, frame.Ping(ack: True, data:)))
 
     frame.Headers(stream_id:, end_headers:, end_stream:, field_block:) ->
       process_headers(state, stream_id, end_headers, end_stream, field_block)
@@ -493,9 +496,8 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
       process_data(state, stream_id, end_stream, data)
 
     frame.WindowUpdate(stream_id: 0, increment:) -> {
-      let connection_send_window = state.connection_send_window + increment
-      let state = flush_all_pending(State(..state, connection_send_window:))
-      Ok(state)
+      let send_window = state.send_window + increment
+      Ok(resume_all_streams(State(..state, send_window:)))
     }
     frame.WindowUpdate(stream_id:, increment:) -> {
       case dict.get(state.streams, stream_id) {
@@ -504,7 +506,7 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
           let stream =
             Stream(..stream, send_window: stream.send_window + increment)
           let streams = dict.insert(state.streams, stream_id, stream)
-          let state = flush_stream_pending(State(..state, streams:), stream_id)
+          let state = resume_stream(State(..state, streams:), stream_id)
           Ok(state)
         }
       }
@@ -532,29 +534,14 @@ fn process_open(state: State, frame: frame.Frame) -> Result(State, State) {
     }
 
     frame.PushPromise(..) ->
-      Error(append_goaway(state, frame.ProtocolError, "Received push promise"))
+      Error(enqueue_goaway(state, frame.ProtocolError, "Received push promise"))
 
     frame.Ping(ack: True, ..) | frame.Priority(..) | frame.Unknown -> Ok(state)
 
     frame.Continuation(..) ->
-      append_goaway(state, frame.ProtocolError, "Unexpected continuation frame")
+      "Unexpected continuation frame"
+      |> enqueue_goaway(state, frame.ProtocolError, _)
       |> Error
-  }
-}
-
-fn process_headers(
-  state: State,
-  stream_id: Int,
-  end_headers: Bool,
-  end_stream: Bool,
-  field_block: BitArray,
-) -> Result(State, State) {
-  case end_headers {
-    True -> open_stream(state, stream_id, field_block, end_stream)
-    False -> {
-      let mode = Continuation(stream_id:, fragments: field_block, end_stream:)
-      Ok(State(..state, mode:))
-    }
   }
 }
 
@@ -571,7 +558,7 @@ fn process_continuation(
     -> {
       let fragments = <<fragments:bits, field_block:bits>>
       case end_headers {
-        True -> open_stream(state, stream_id, fragments, end_stream)
+        True -> spawn_stream(state, stream_id, fragments, end_stream)
         False ->
           State(
             ..state,
@@ -583,8 +570,24 @@ fn process_continuation(
     frame.Continuation(..) -> todo
     _ ->
       "received non-continuation frame while reading for field fragments"
-      |> append_goaway(state, frame.ProtocolError, _)
+      |> enqueue_goaway(state, frame.ProtocolError, _)
       |> Error
+  }
+}
+
+fn process_headers(
+  state: State,
+  stream_id: Int,
+  end_headers: Bool,
+  end_stream: Bool,
+  field_block: BitArray,
+) -> Result(State, State) {
+  case end_headers {
+    True -> spawn_stream(state, stream_id, field_block, end_stream)
+    False -> {
+      let mode = Continuation(stream_id:, fragments: field_block, end_stream:)
+      Ok(State(..state, mode:))
+    }
   }
 }
 
@@ -594,12 +597,11 @@ fn process_data(
   end_stream: Bool,
   data: BitArray,
 ) -> Result(State, State) {
-  let connection_recv_window =
-    state.connection_recv_window - bit_array.byte_size(data)
+  let recv_window = state.recv_window - bit_array.byte_size(data)
 
-  case connection_recv_window < 0 {
+  case recv_window < 0 {
     True ->
-      append_goaway(state, frame.FlowControlError, "Flow control was violated")
+      enqueue_goaway(state, frame.FlowControlError, "Flow control was violated")
       |> Error
     False -> {
       let state = case dict.get(state.streams, stream_id) {
@@ -607,30 +609,29 @@ fn process_data(
           process.send(stream.subject, message.Data(data, end_stream))
           state
         }
-        Error(Nil) -> append_rst_stream(state, stream_id, frame.StreamClosed)
+        Error(Nil) -> enqueue_rst_stream(state, stream_id, frame.StreamClosed)
       }
 
-      let threshold =
-        connection_recv_window < state.local_settings.initial_window_size / 2
+      let threshold = recv_window < state.local_settings.initial_window_size / 2
       case threshold {
         True -> {
           let state =
-            state.local_settings.initial_window_size - connection_recv_window
+            state.local_settings.initial_window_size - recv_window
             |> frame.WindowUpdate(stream_id: 0)
-            |> append_pending(state, _)
+            |> enqueue(state, _)
 
-          let connection_recv_window = state.local_settings.initial_window_size
+          let recv_window = state.local_settings.initial_window_size
 
-          Ok(State(..state, connection_recv_window:))
+          Ok(State(..state, recv_window:))
         }
 
-        False -> Ok(State(..state, connection_recv_window:))
+        False -> Ok(State(..state, recv_window:))
       }
     }
   }
 }
 
-fn open_stream(
+fn spawn_stream(
   state: State,
   stream_id: Int,
   field_block: BitArray,
@@ -649,7 +650,7 @@ fn open_stream(
                 request,
                 state.handler,
                 end_stream,
-                state.connection_subject,
+                state.inbox,
                 state.local_settings.initial_window_size,
               )
             })
@@ -678,7 +679,7 @@ fn open_stream(
               )
 
               frame.RstStream(stream_id:, code: frame.InternalError)
-              |> append_pending(state, _)
+              |> enqueue(state, _)
               |> Ok
             }
           }
@@ -691,8 +692,9 @@ fn open_stream(
               <> ": "
               <> string.inspect(err),
           )
+
           frame.RstStream(stream_id:, code: frame.ProtocolError)
-          |> append_pending(state, _)
+          |> enqueue(state, _)
           |> Ok
         }
       }
@@ -702,11 +704,37 @@ fn open_stream(
         logging.Warning,
         "HPACK decompression error: " <> string.inspect(err),
       )
+
       "HPACK decompression failure"
-      |> append_goaway(state, frame.CompressionError, _)
+      |> enqueue_goaway(state, frame.CompressionError, _)
       |> Error
     }
   }
+}
+
+fn resume_stream(state: State, stream_id: Int) -> State {
+  case dict.get(state.streams, stream_id) {
+    Error(Nil) -> state
+    Ok(stream) -> {
+      case stream.pending {
+        option.None -> state
+        option.Some(data) -> {
+          let stream = Stream(..stream, pending: option.None)
+          let streams = dict.insert(state.streams, stream_id, stream)
+          enqueue_response_body(State(..state, streams:), stream_id, data)
+        }
+      }
+    }
+  }
+}
+
+fn resume_all_streams(state: State) -> State {
+  dict.fold(state.streams, state, fn(state, stream_id, stream) {
+    case stream.pending {
+      option.None -> state
+      option.Some(_) -> resume_stream(state, stream_id)
+    }
+  })
 }
 
 type RequestError {
@@ -904,7 +932,7 @@ fn send_response(
     option.None -> {
       let streams = dict.delete(state.streams, stream_id)
       frame.RstStream(stream_id:, code: frame.InternalError)
-      |> append_pending(State(..state, streams:), _)
+      |> enqueue(State(..state, streams:), _)
     }
     option.Some(body) -> {
       let body_size = bit_array.byte_size(body)
@@ -923,19 +951,20 @@ fn send_response(
         _, _ -> response
       }
 
-      let state = append_response_headers(state, stream_id, response, !has_body)
+      let state =
+        enqueue_response_headers(state, stream_id, response, !has_body)
       case has_body {
         False -> {
           let streams = dict.delete(state.streams, stream_id)
           State(..state, streams:)
         }
-        True -> append_response_body(state, stream_id, body)
+        True -> enqueue_response_body(state, stream_id, body)
       }
     }
   }
 }
 
-fn append_response_headers(
+fn enqueue_response_headers(
   state: State,
   stream_id: Int,
   response: response.Response(http_.ResponseBody),
@@ -982,10 +1011,10 @@ fn append_response_headers(
 
   let state = State(..state, hpack_encoder:)
   let max_size = state.remote_settings.max_frame_size
-  append_header_frames(state, stream_id, field_block, end_stream, max_size)
+  enqueue_header_frames(state, stream_id, field_block, end_stream, max_size)
 }
 
-fn append_header_frames(
+fn enqueue_header_frames(
   state: State,
   stream_id: Int,
   field_block: BitArray,
@@ -995,7 +1024,7 @@ fn append_header_frames(
   case field_block {
     <<field_block:bytes-size(max_size)>> ->
       frame.Headers(stream_id:, end_headers: True, end_stream:, field_block:)
-      |> append_pending(state, _)
+      |> enqueue(state, _)
     <<chunk:bytes-size(max_size), remaining:bits>> -> {
       let state =
         frame.Headers(
@@ -1004,17 +1033,17 @@ fn append_header_frames(
           end_stream:,
           field_block: chunk,
         )
-        |> append_pending(state, _)
+        |> enqueue(state, _)
 
-      append_continuation_frames(state, stream_id, remaining, max_size)
+      enqueue_continuation_frames(state, stream_id, remaining, max_size)
     }
     _ ->
       frame.Headers(stream_id:, end_headers: True, end_stream:, field_block:)
-      |> append_pending(state, _)
+      |> enqueue(state, _)
   }
 }
 
-fn append_continuation_frames(
+fn enqueue_continuation_frames(
   state: State,
   stream_id: Int,
   field_block: BitArray,
@@ -1023,25 +1052,29 @@ fn append_continuation_frames(
   case field_block {
     <<field_block:bytes-size(max_size)>> ->
       frame.Continuation(stream_id:, end_headers: True, field_block:)
-      |> append_pending(state, _)
+      |> enqueue(state, _)
     <<chunk:bytes-size(max_size), remaining:bits>> -> {
       let state =
         frame.Continuation(stream_id:, end_headers: False, field_block: chunk)
-        |> append_pending(state, _)
-      append_continuation_frames(state, stream_id, remaining, max_size)
+        |> enqueue(state, _)
+      enqueue_continuation_frames(state, stream_id, remaining, max_size)
     }
     _ ->
       frame.Continuation(stream_id:, end_headers: True, field_block:)
-      |> append_pending(state, _)
+      |> enqueue(state, _)
   }
 }
 
-fn append_response_body(state: State, stream_id: Int, body: BitArray) -> State {
+fn enqueue_response_body(
+  state: State,
+  stream_id: Int,
+  body: BitArray,
+) -> State {
   case dict.get(state.streams, stream_id) {
     Error(Nil) -> state
     Ok(stream) -> {
       let max_frame = state.remote_settings.max_frame_size
-      let available = int.min(state.connection_send_window, stream.send_window)
+      let available = int.min(state.send_window, stream.send_window)
       let body_size = bit_array.byte_size(body)
       let to_send_size = int.min(int.max(available, 0), body_size)
 
@@ -1061,15 +1094,14 @@ fn append_response_body(state: State, stream_id: Int, body: BitArray) -> State {
           }
           let has_pending = bit_array.byte_size(pending) > 0
           let state =
-            append_data_frames(
+            enqueue_data_frames(
               state,
               stream_id,
               to_send,
               max_frame,
               !has_pending,
             )
-          let connection_send_window =
-            state.connection_send_window - to_send_size
+          let send_window = state.send_window - to_send_size
           let streams = case has_pending {
             False -> dict.delete(state.streams, stream_id)
             True -> {
@@ -1079,14 +1111,14 @@ fn append_response_body(state: State, stream_id: Int, body: BitArray) -> State {
               dict.insert(state.streams, stream_id, stream)
             }
           }
-          State(..state, connection_send_window:, streams:)
+          State(..state, send_window:, streams:)
         }
       }
     }
   }
 }
 
-fn append_data_frames(
+fn enqueue_data_frames(
   state: State,
   stream_id: Int,
   data: BitArray,
@@ -1095,18 +1127,11 @@ fn append_data_frames(
 ) -> State {
   case data {
     <<data:bytes-size(max_per_frame)>> ->
-      frame.Data(stream_id:, end_stream: is_last, data:)
-      |> append_pending(state, _)
-    <<chunk:bytes-size(max_per_frame), remaining:bits>> -> {
-      let state =
-        frame.Data(stream_id:, end_stream: False, data: chunk)
-        |> append_pending(state, _)
-
-      append_data_frames(state, stream_id, remaining, max_per_frame, is_last)
-    }
-    _ ->
-      frame.Data(stream_id:, end_stream: is_last, data:)
-      |> append_pending(state, _)
+      enqueue(state, frame.Data(stream_id:, end_stream: is_last, data:))
+    <<chunk:bytes-size(max_per_frame), remaining:bits>> ->
+      enqueue(state, frame.Data(stream_id:, end_stream: False, data: chunk))
+      |> enqueue_data_frames(stream_id, remaining, max_per_frame, is_last)
+    _ -> enqueue(state, frame.Data(stream_id:, end_stream: is_last, data:))
   }
 }
 
@@ -1126,29 +1151,4 @@ fn is_sensitive_response_header(name: String) -> Bool {
     "authorization" | "set-cookie" -> True
     _ -> False
   }
-}
-
-fn flush_stream_pending(state: State, stream_id: Int) -> State {
-  case dict.get(state.streams, stream_id) {
-    Error(Nil) -> state
-    Ok(stream) -> {
-      case stream.pending {
-        option.None -> state
-        option.Some(data) -> {
-          let stream = Stream(..stream, pending: option.None)
-          let streams = dict.insert(state.streams, stream_id, stream)
-          append_response_body(State(..state, streams:), stream_id, data)
-        }
-      }
-    }
-  }
-}
-
-fn flush_all_pending(state: State) -> State {
-  dict.fold(state.streams, state, fn(state, stream_id, stream) {
-    case stream.pending {
-      option.None -> state
-      option.Some(_) -> flush_stream_pending(state, stream_id)
-    }
-  })
 }

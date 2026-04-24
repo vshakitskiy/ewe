@@ -50,6 +50,13 @@ pub type Http {
   )
 }
 
+//  Http2Connection(
+//     stream_id: Int,
+//     end_stream: Bool,
+//     connection_inbox: process.Subject(ConnectionMessage),
+//     initial_window: Int,
+//   )
+
 pub type Http2 {
   Http2(transport: Transport, socket: Socket)
 }
