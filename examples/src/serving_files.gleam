@@ -1,6 +1,8 @@
 import ewe.{type Response}
+import gleam/bool
 import gleam/erlang/process
 import gleam/http/response
+import gleam/list
 import gleam/option.{None}
 import gleam/string
 import logging
@@ -26,6 +28,13 @@ fn serve_file(path: String) -> Response {
   //
   let dir = absname("public")
   let relative = string.drop_start(path, 1)
+  let segments = string.split(relative, "/")
+
+  use <- bool.guard(
+    when: list.any(segments, fn(seg) { seg == ".." }),
+    return: not_found(),
+  )
+
   let resolved = absname_join(dir, relative)
 
   case string.starts_with(resolved, dir <> "/") {
