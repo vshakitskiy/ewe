@@ -234,7 +234,9 @@ fn handle_stream(req: Request, chunk_size: Int) -> Response {
 Static files can be sent using [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file). It accepts a path and optional `offset`/`limit` parameters. This allows serving HTML pages, assets, or binary files with minimal effort.
 
 ```gleam
+import gleam/bool
 import gleam/http/response
+import gleam/list
 import gleam/string
 
 fn serve_file(path: String) -> Response {
@@ -243,6 +245,13 @@ fn serve_file(path: String) -> Response {
   //
   let dir = absname("public")
   let relative = string.drop_start(path, 1)
+  let segments = string.split(relative, "/")
+
+  use <- bool.guard(
+    when: list.any(segments, fn(seg) { seg == ".." }),
+    return: not_found(),
+  )
+
   let resolved = absname_join(dir, relative)
 
   case string.starts_with(resolved, dir <> "/") {
