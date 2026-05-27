@@ -18,7 +18,7 @@
 ////       "bind",
 ////       "listening",
 ////       "listening_random",
-////       "enable_ipv6",
+////       "force_ipv6",
 ////       "enable_tls",
 ////       "with_name",
 ////       "quiet",
@@ -398,10 +398,9 @@ pub fn new(handler: fn(Request) -> Response) -> Builder {
   )
 }
 
-/// Binds server to a specific network interface (e.g., "0.0.0.0" for all IPv4
-/// interfaces or "127.0.0.1" for localhost). To bind to IPv6 addresses like
-/// "::" or "::1", you must use `ewe.enable_ipv6`. Crashes the program if the
-/// interface is invalid.
+/// Binds server to a specific network interface; e.g., "0.0.0.0" for all IPv4
+/// interfaces, "127.0.0.1" for localhost, "::" for all IPv6 interfaces, or
+/// "::1" for IPv6 loopback. Crashes the program if the interface is invalid.
 pub fn bind(builder: Builder, interface interface: String) -> Builder {
   Builder(..builder, interface:)
 }
@@ -417,9 +416,11 @@ pub fn listening_random(builder: Builder) -> Builder {
   Builder(..builder, port: 0)
 }
 
-/// Enables IPv6 support, allowing the server to accept connections over IPv6
-/// addresses. Must be called for binding to IPv6 addresses via `ewe.bind`.
-pub fn enable_ipv6(builder: Builder) -> Builder {
+/// Forces the underlying socket to use IPv6. On IPv4 provided in `ewe.bind` or
+/// if the system does not support IPv6, the server crashes. The exceptions are
+/// `localhost`, `127.0.0.1` or `0.0.0.0`, they are automatically bound to work
+/// with either address family.
+pub fn force_ipv6(builder: Builder) -> Builder {
   Builder(..builder, ipv6: True)
 }
 
@@ -493,13 +494,14 @@ pub fn start(
       handler.init,
       handler.loop(handler, on_crash, factory_name, builder.idle_timeout),
     )
-    |> glisten.bind(builder.interface)
     |> glisten.with_listener_name(builder.listener_name)
 
   let glisten = case builder.ipv6 {
     True -> glisten.with_ipv6(glisten)
     False -> glisten
   }
+
+  let glisten = glisten.bind(glisten, builder.interface)
 
   let glisten = case builder.tls {
     Some(#(cert, key)) -> glisten.with_tls(glisten, cert, key)
@@ -813,8 +815,7 @@ pub fn upgrade_websocket(
     WebsocketConnection,
     user_state,
     WebsocketMessage(user_message),
-  ) ->
-    WebsocketNext(user_state, user_message),
+  ) -> WebsocketNext(user_state, user_message),
   on_close on_close: fn(WebsocketConnection, user_state) -> Nil,
 ) -> Response {
   let handler = fn(conn, state, msg) {

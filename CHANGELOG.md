@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Resolve misleading IPv6 support documentation.
+
 ## v3.0.8 - 21.04.2026
 
 - Bumb `gleam_stdlib` to the v1.
