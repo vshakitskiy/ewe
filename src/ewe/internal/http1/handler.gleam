@@ -295,7 +295,10 @@ fn send_body(
 
 /// Can the body be encoded to gzip?
 ///
-fn can_encode_gzip(request: Request(Connection), response: Response(_)) -> Bool {
+fn can_encode_gzip(
+  request: Request(Connection),
+  response: Response(_),
+) -> Bool {
   let accept_encoding =
     request.get_header(request, "accept-encoding")
     |> result.map(string.contains(_, "gzip"))

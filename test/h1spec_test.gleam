@@ -25,7 +25,10 @@ fn run_request(socket: Socket, req: String) -> Response(String) {
   resp
 }
 
-pub fn expect_status(req: String, status: List(#(Int, Int))) -> Response(String) {
+pub fn expect_status(
+  req: String,
+  status: List(#(Int, Int)),
+) -> Response(String) {
   let socket_address = server.start(server.echoer())
   use socket <- client.with_socket(socket_address.port, active: False)
 

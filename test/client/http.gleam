@@ -23,7 +23,10 @@ pub fn parse(data: BitArray) -> Result(Response(String), ParseError) {
   }
 }
 
-fn do_parse(lines: String, body: String) -> Result(Response(String), ParseError) {
+fn do_parse(
+  lines: String,
+  body: String,
+) -> Result(Response(String), ParseError) {
   case string.split(lines, "\r\n") {
     [status, ..headers] -> {
       use status <- result.try(parse_status(status))
