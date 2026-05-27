@@ -135,7 +135,10 @@ fn pubsub_worker(
   })
 }
 
-fn handle_pubsub_message(clients: List(Subject(String)), message: PubSubMessage) {
+fn handle_pubsub_message(
+  clients: List(Subject(String)),
+  message: PubSubMessage,
+) {
   case message {
     Subscribe(client) -> {
       let assert Ok(pid) = process.subject_owner(client)

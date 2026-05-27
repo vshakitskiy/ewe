@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## v4.0.0 - 27.05.2026
 
 - Resolve misleading IPv6 support documentation.
+- Rename `enable_ipv6` to `force_ipv6`.
 
 ## v3.0.8 - 21.04.2026
 
