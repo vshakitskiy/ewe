@@ -21,7 +21,13 @@ decode_packet(Type, Packet, Options) ->
     {ok, {http_request, <<"PRI">>, '*', {2, 0}}, Rest} ->
       {ok, {packet, http2_upgrade, Rest}};
     {ok, {http_request, Method, Uri, Version}, Rest} ->
-      {ok, {packet, {http_request, atom_to_binary(Method), Uri, Version}, Rest}};
+      MethodBin =
+        if is_atom(Method) ->
+             atom_to_binary(Method);
+           true ->
+             Method
+        end,
+      {ok, {packet, {http_request, MethodBin, Uri, Version}, Rest}};
     {ok, {http_header, Idx, _, Field, Value}, Rest} ->
       {ok, {packet, {http_header, Idx, Field, Value}, Rest}};
     {ok, Bin, Rest} ->

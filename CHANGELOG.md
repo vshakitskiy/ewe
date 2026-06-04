@@ -1,5 +1,9 @@
 # Changelog
 
+## v4.0.1 - 04.06.2026
+
+- Fix issue with `decode_packet` not handling http method as binary.
+
 ## v4.0.0 - 27.05.2026
 
 - Resolve misleading IPv6 support documentation.

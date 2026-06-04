@@ -1,5 +1,5 @@
 name = "ewe"
-version = "4.0.0"
+version = "4.0.1"
 
 description = "🐑 a fluffy Gleam web server"
 target = "erlang"
