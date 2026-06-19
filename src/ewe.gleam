@@ -213,7 +213,7 @@ fn ewe_to_glisten_ip(ip: IpAddress) -> glisten.IpAddress {
 // INFORMATION
 // -----------------------------------------------------------------------------
 
-/// Represents a socket address with IP and port. Use `ewe.get_lcient_info` to
+/// Represents a socket address with IP and port. Use `ewe.get_client_info` to
 /// get the client's address from a connection, or `ewe.get_server_info` to get
 /// the server's bound address.
 pub type SocketAddress {
