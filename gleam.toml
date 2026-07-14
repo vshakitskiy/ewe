@@ -1,5 +1,5 @@
 name = "ewe"
-version = "4.0.1"
+version = "5.0.0"
 
 description = "🐑 a fluffy Gleam web server"
 target = "erlang"
@@ -9,20 +9,18 @@ links = [{ title = "Gleam", href = "https://gleam.run" }]
 
 [dependencies]
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
-glisten = ">= 9.0.0 and < 10.0.0"
+# glisten = ">= 9.0.0 and < 10.0.0"
+glisten = { git = "https://github.com/vshakitskiy/glisten.git", ref = "ab2422b" }
 gleam_otp = ">= 1.1.0 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
 logging = ">= 1.3.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
-compresso = "0.1.0"
 websocks = ">= 3.0.0 and < 4.0.0"
 exception = ">= 2.1.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
 gleam_httpc = ">= 5.0.0 and < 6.0.0"
-gleam_json = ">= 3.0.2 and < 4.0.0"
-gleam_crypto = ">= 1.5.1 and < 2.0.0"
 
 [erlang]
-application_start_module = "ewe@internal@clock"
+# application_start_module = "ewe@internal@clock"
