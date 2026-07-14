@@ -10,7 +10,7 @@ links = [{ title = "Gleam", href = "https://gleam.run" }]
 [dependencies]
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 # glisten = ">= 9.0.0 and < 10.0.0"
-glisten = { git = "https://github.com/vshakitskiy/glisten.git", ref = "ab2422b" }
+glisten = { git = "https://github.com/vshakitskiy/glisten.git", ref = "63e9a39" }
 gleam_otp = ">= 1.1.0 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
 logging = ">= 1.3.0 and < 2.0.0"
