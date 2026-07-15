@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add support for unix sockets.
+- Add support for in-memory certificate files for the tls.
+- Change some of the function argument lables.
+- Builder's `new` now requires listener and connection factory names provided in
+  order to prevent possible atom table exhaustion.
+- Switch from `erlang:decode_packet` to self implemented parsing solution.
+
 ## v4.0.1 - 04.06.2026
 
 - Fix issue with `decode_packet` not handling http method as binary.

@@ -23,4 +23,4 @@ gleeunit = ">= 1.0.0 and < 2.0.0"
 gleam_httpc = ">= 5.0.0 and < 6.0.0"
 
 [erlang]
-# application_start_module = "ewe@internal@clock"
+application_start_module = "ewe@internal@clock"

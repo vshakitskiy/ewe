@@ -4,6 +4,7 @@ import gleam/http/request
 import gleam/http/response
 import gleam/int
 import gleam/io
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
 import gleam/otp/static_supervisor as supervisor
@@ -82,12 +83,36 @@ type BindTarget {
   UnixBind(path: String)
 }
 
+type TlsConfig {
+  CertKeyFiles(certfile: String, keyfile: String)
+  CertKeyPem(cert: BitArray, key: BitArray)
+  CertKeyDer(cert: BitArray, key_type: TlsKeyType, key: BitArray)
+}
+
+/// The private key encoding type, required when providing DER-encoded
+/// certificate and key via `with_tls_der`.
+pub type TlsKeyType {
+  /// Traditional RSA key.
+  RsaPrivateKey
+  /// Elliptic curve key.
+  EcPrivateKey
+  /// DSA key.
+  DsaPrivateKey
+  /// PKCS#8 key.
+  PrivateKeyInfo
+}
+
+// TlsKeyType and options.TlsKeyType are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType
+
 /// Contains all server configurations, can be adjusted by different builder
 /// functions.
 pub opaque type Builder {
   Builder(
     handler: fn(request.Request(Connection)) -> response.Response(Body),
     bind_target: BindTarget,
+    tls: Option(TlsConfig),
     listener_name: process.Name(listener.Message),
     connection_factory_name: process.Name(
       factory.Message(socket.Socket, process.Subject(handler.Message(Nil))),
@@ -110,6 +135,7 @@ pub fn new(
   Builder(
     handler:,
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
+    tls: None,
     listener_name:,
     connection_factory_name:,
     on_start: fn(scheme, address) {
@@ -181,6 +207,35 @@ pub fn unix(builder: Builder, path: String) -> Builder {
   Builder(..builder, bind_target: UnixBind(path))
 }
 
+/// Enables TLS using a certificate and key file on disk.
+pub fn with_tls(
+  builder: Builder,
+  certfile cert: String,
+  keyfile key: String,
+) -> Builder {
+  Builder(..builder, tls: Some(CertKeyFiles(cert, key)))
+}
+
+/// Enables TLS using in-memory PEM-encoded certificate and key data.
+pub fn with_tls_pem(
+  builder: Builder,
+  cert cert: BitArray,
+  key key: BitArray,
+) -> Builder {
+  Builder(..builder, tls: Some(CertKeyPem(cert, key)))
+}
+
+/// Enables TLS using in-memory DER-encoded certificate and key data. The key
+/// type must match the encoding of the provided key binary.
+pub fn with_tls_der(
+  builder: Builder,
+  cert cert: BitArray,
+  key_type key_type: TlsKeyType,
+  key key: BitArray,
+) -> Builder {
+  Builder(..builder, tls: Some(CertKeyDer(cert, key_type, key)))
+}
+
 /// Sets a callback function called after the server starts. Receives the scheme
 /// and server's socket address.
 pub fn on_start(
@@ -199,12 +254,59 @@ pub fn quiet(builder: Builder) -> Builder {
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  todo
+  let pool =
+    glisten.new(
+      listener_name: builder.listener_name,
+      connection_factory_name: builder.connection_factory_name,
+      on_init: todo,
+      loop: todo,
+    )
+
+  let pool = case builder.tls {
+    Some(CertKeyFiles(certfile:, keyfile:)) ->
+      glisten.with_tls(pool, certfile:, keyfile:)
+    Some(CertKeyPem(cert:, key:)) -> glisten.with_tls_pem(pool, cert:, key:)
+    Some(CertKeyDer(cert:, key_type:, key:)) ->
+      glisten.with_tls_der(
+        pool,
+        cert:,
+        key_type: unsafe_to_internal_tls_key_type(key_type),
+        key:,
+      )
+    None -> pool
+  }
+
+  use started <- result.map(over: case builder.bind_target {
+    TcpBind(interface:, port:, ipv6:) -> {
+      let pool = glisten.bind(pool, interface)
+
+      let pool = case ipv6 {
+        True -> glisten.with_ipv6(pool)
+        False -> pool
+      }
+
+      glisten.start(pool, port)
+    }
+    UnixBind(path:) -> glisten.start_unix(pool, path)
+  })
+
+  let scheme = case builder.tls {
+    Some(_) -> http.Https
+    None -> http.Http
+  }
+  let address =
+    process.named_subject(builder.listener_name)
+    |> get_server_info
+
+  builder.on_start(scheme, address)
+
+  started
 }
 
 /// Returns a child specification for use in a supervision tree.
 pub fn supervised(
   builder: Builder,
 ) -> supervision.ChildSpecification(supervisor.Supervisor) {
-  todo
+  fn() { start(builder) }
+  |> supervision.supervisor
 }
