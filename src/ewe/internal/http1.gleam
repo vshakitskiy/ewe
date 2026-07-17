@@ -2,9 +2,13 @@ import ewe/internal/connection
 import gleam/bit_array
 import gleam/erlang/process
 import gleam/http
+import gleam/http/request
 import gleam/int
 import gleam/list
 import gleam/option
+import glisten
+import glisten/transport
+import logging
 
 pub type State {
   State(buffer: BitArray, idle_timer: option.Option(process.Timer))
@@ -15,8 +19,50 @@ pub type Next {
   Close
 }
 
-pub fn handle_message(state: State, connection: connection.Connection) -> Next {
-  Continue(state)
+pub fn handle_message(
+  state: State,
+  connection: glisten.Connection(connection.Message),
+) -> Next {
+  case parse(state.buffer) {
+    Ok(Complete(head, _metadata, remaining)) -> {
+      let scheme = case connection.transport {
+        transport.Tcp -> http.Http
+        transport.Ssl -> http.Https
+      }
+
+      let connection =
+        connection.Http1(
+          transport: connection.transport,
+          socket: connection.socket,
+          self: connection.subject,
+          buffer: remaining,
+        )
+
+      let request =
+        request.Request(
+          method: head.method,
+          headers: head.headers,
+          body: connection,
+          scheme:,
+          host: head.host,
+          port: head.port,
+          path: head.path,
+          query: head.query,
+        )
+
+      echo request
+
+      Continue(State(..state, buffer: remaining))
+    }
+    Ok(Incomplete) -> Continue(state)
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "Failed to parse HTTP/1.x request: " <> error_to_string(error),
+      )
+      Close
+    }
+  }
 }
 
 pub type Version {
@@ -66,10 +112,32 @@ pub type ParseError {
   AmbiguousFraming
 }
 
+pub fn error_to_string(error: ParseError) -> String {
+  case error {
+    RequestLineTooLong ->
+      "request line exceeds " <> int.to_string(max_request_line) <> " bytes"
+    BadRequestLine -> "malformed request line"
+    BadMethod -> "invalid request method"
+    BadTarget -> "invalid request target"
+    BadVersion -> "unsupported or malformed HTTP version"
+    HeaderLineTooLong ->
+      "header line exceeds " <> int.to_string(max_header_line) <> " bytes"
+    BadHeader -> "malformed header line"
+    TooManyHeaders ->
+      "too many headers (max " <> int.to_string(max_headers) <> ")"
+    DuplicateContentLength -> "duplicate Content-Length header"
+    BadContentLength -> "invalid Content-Length value"
+    DuplicateHost -> "duplicate Host header"
+    BadHost -> "invalid Host header"
+    MissingHost -> "missing required Host header"
+    AmbiguousFraming ->
+      "conflicting Content-Length and Transfer-Encoding headers"
+  }
+}
+
 pub type Parsed {
   Complete(head: Head, metadata: Metadata, remaining: BitArray)
   Incomplete
-  Failed(ParseError)
 }
 
 const max_request_line = 8192
@@ -79,7 +147,7 @@ const max_header_line = 8192
 const max_headers = 100
 
 /// Parses as much of a request head as `buffer` contains.
-pub fn parse(buffer: BitArray) -> Parsed {
+pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
   let step = {
     use #(method, target, version, remaining) <- try_step(parse_request_line(
       buffer,
@@ -109,9 +177,9 @@ pub fn parse(buffer: BitArray) -> Parsed {
   }
 
   case step {
-    Done(parsed) -> parsed
-    More -> Incomplete
-    ParseError(error) -> Failed(error)
+    Done(parsed) -> Ok(parsed)
+    More -> Ok(Incomplete)
+    ParseError(error) -> Error(error)
   }
 }
 

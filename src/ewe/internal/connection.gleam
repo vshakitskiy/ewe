@@ -10,7 +10,6 @@ pub type Connection {
     self: process.Subject(handler.Message(Message)),
     buffer: BitArray,
   )
-  Http2
 }
 
 pub type Message {

@@ -2,8 +2,10 @@ import ewe/internal/connection
 import ewe/internal/http1
 import gleam/bit_array
 import gleam/erlang/process
+import gleam/http
 import gleam/option
 import glisten
+import glisten/transport
 
 /// The state of a connection for its entire lifetime. It starts at 
 /// `Initialised`, is classified into `Http1` or `Http2` and then stays in that 
@@ -49,14 +51,6 @@ fn classify(
     NeedMoreData -> glisten.continue(Initialised(buffer:))
     Http2Preface(_remaining) -> glisten.continue(Http2)
     NotHttp2(buffer:) -> {
-      let connection =
-        connection.Http1(
-          connection.transport,
-          connection.socket,
-          connection.subject,
-          buffer: <<>>,
-        )
-
       let next =
         http1.State(buffer:, idle_timer: option.None)
         |> http1.handle_message(connection)

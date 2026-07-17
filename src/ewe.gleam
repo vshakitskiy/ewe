@@ -19,11 +19,13 @@ import glisten/socket
 import glisten/socket/options
 import glisten/transport
 
-pub opaque type Connection {
-  Connection(transport: transport.Transport, socket: socket.Socket)
-}
+pub type Connection =
+  connection.Connection
 
-pub type Body
+pub type Body {
+  Bytes(BitArray)
+  Text(String)
+}
 
 pub type IpAddress {
   IpV4(Int, Int, Int, Int)
@@ -45,17 +47,27 @@ fn unsafe_from_internal_options_ip_address(
   address: options.IpAddress,
 ) -> IpAddress
 
+// glisten.IpAddress and IpAddress are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_from_internal_ip_address(address: glisten.IpAddress) -> IpAddress
+
 /// The address a socket is bound to, or the address of a connected peer.
 pub type SocketAddress {
   TcpSocketAddress(ip_address: IpAddress, port: Int)
   UnixSocketAddress(path: String)
 }
 
-// SocketAddress and glisten.SocketAddress are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_internal_socket_address(
-  address: glisten.SocketAddress,
-) -> SocketAddress
+// Field order differs between `SocketAddress` and `glisten.SocketAddress`.
+fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
+  case address {
+    glisten.TcpSocketAddress(port:, ip_address:) ->
+      TcpSocketAddress(
+        ip_address: unsafe_from_internal_ip_address(ip_address),
+        port:,
+      )
+    glisten.UnixSocketAddress(path:) -> UnixSocketAddress(path:)
+  }
+}
 
 /// Retrieves the client's socket address from the connection. Returns error if
 /// the socket information is unavailable.
@@ -77,7 +89,7 @@ pub fn get_server_info(
   listener: process.Subject(listener.Message),
 ) -> SocketAddress {
   glisten.get_server_info(listener, 1000)
-  |> unsafe_from_internal_socket_address
+  |> convert_socket_address
 }
 
 type BindTarget {
