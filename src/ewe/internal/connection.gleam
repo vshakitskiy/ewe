@@ -1,3 +1,4 @@
+import gleam/bytes_tree
 import gleam/erlang/process
 import glisten/internal/handler
 import glisten/socket
@@ -10,6 +11,17 @@ pub type Connection {
     self: process.Subject(handler.Message(Message)),
     buffer: BitArray,
   )
+}
+
+pub type Body {
+  Bytes(bytes_tree.BytesTree)
+  Text(String)
+  Empty
+  File(File)
+}
+
+pub type File {
+  FileMetadata(path: String, offset: Int, length: Int)
 }
 
 pub type Message {

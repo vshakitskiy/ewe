@@ -2,10 +2,12 @@ import ewe/internal/connection
 import ewe/internal/http1
 import gleam/bit_array
 import gleam/erlang/process
-import gleam/http
+import gleam/http/request
+import gleam/http/response
 import gleam/option
 import glisten
-import glisten/transport
+import glisten/internal/handler
+import logging
 
 /// The state of a connection for its entire lifetime. It starts at 
 /// `Initialised`, is classified into `Http1` or `Http2` and then stays in that 
@@ -13,16 +15,39 @@ import glisten/transport
 pub type State {
   /// Accumulates bytes in `buffer` until `sniff_preface` can tell HTTP/1.x 
   /// apart from an HTTP/2 prior-knowledge preface.
-  Initialised(buffer: BitArray)
+  Initialised(
+    handler: fn(request.Request(connection.Connection)) ->
+      response.Response(connection.Body),
+    buffer: BitArray,
+    idle_timer: option.Option(process.Timer),
+  )
   Http1(http1.State)
   /// No HTTP/2 connection handling exists yet!
   Http2
 }
 
+pub const idle_timeout = 10_000
+
 pub fn on_init(
-  _connection: glisten.Connection(connection.Message),
-) -> #(State, option.Option(process.Selector(connection.Message))) {
-  #(Initialised(buffer: <<>>), option.None)
+  handler: fn(request.Request(connection.Connection)) ->
+    response.Response(connection.Body),
+) {
+  fn(connection: glisten.Connection(connection.Message)) -> #(
+    State,
+    option.Option(process.Selector(connection.Message)),
+  ) {
+    let timer =
+      process.send_after(
+        connection.subject,
+        idle_timeout,
+        handler.User(connection.Timeout),
+      )
+
+    #(
+      Initialised(handler:, buffer: <<>>, idle_timer: option.Some(timer)),
+      option.None,
+    )
+  }
 }
 
 pub fn loop(
@@ -31,35 +56,47 @@ pub fn loop(
   connection: glisten.Connection(connection.Message),
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {
   case message {
-    glisten.User(connection.Timeout) -> todo as "Timeout not implemented yet"
+    glisten.User(connection.Timeout) -> {
+      logging.log(logging.Debug, "Connection idled for too long, closing.")
+      glisten.stop()
+    }
     glisten.Packet(data) ->
       case state {
-        Initialised(buffer:) -> classify(<<buffer:bits, data:bits>>, connection)
+        Initialised(handler:, buffer:, idle_timer:) -> {
+          case idle_timer {
+            option.Some(timer) -> process.cancel_timer(timer)
+            option.None -> process.TimerNotFound
+          }
+
+          let buffer = <<buffer:bits, data:bits>>
+          case sniff_preface(buffer) {
+            NeedMoreData -> {
+              let timer =
+                process.send_after(
+                  connection.subject,
+                  idle_timeout,
+                  handler.User(connection.Timeout),
+                )
+
+              Initialised(handler:, buffer:, idle_timer: option.Some(timer))
+              |> glisten.continue
+            }
+            Http2Preface(_remaining) -> glisten.continue(Http2)
+            NotHttp2(buffer:) -> {
+              let next =
+                http1.State(handler:, buffer:, idle_timer: option.None)
+                |> http1.handle_message(connection)
+
+              case next {
+                http1.Continue(state) -> glisten.continue(Http1(state))
+                http1.Close -> glisten.stop()
+              }
+            }
+          }
+        }
         Http1(..) -> todo as "HTTP/1.x connection loop not implemented yet"
         Http2(..) -> todo as "HTTP/2 connection handling not implemented yet"
       }
-  }
-}
-
-// Runs the preface sniff exactly once, on the accumulated bytes from
-// `Initialised`, and hands off to whichever protocol state it resolves to.
-fn classify(
-  buffer: BitArray,
-  connection: glisten.Connection(connection.Message),
-) -> glisten.Next(State, glisten.Message(connection.Message)) {
-  case sniff_preface(buffer) {
-    NeedMoreData -> glisten.continue(Initialised(buffer:))
-    Http2Preface(_remaining) -> glisten.continue(Http2)
-    NotHttp2(buffer:) -> {
-      let next =
-        http1.State(buffer:, idle_timer: option.None)
-        |> http1.handle_message(connection)
-
-      case next {
-        http1.Continue(state) -> glisten.continue(Http1(state))
-        http1.Close -> glisten.stop()
-      }
-    }
   }
 }
 

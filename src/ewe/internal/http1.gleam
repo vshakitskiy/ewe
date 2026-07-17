@@ -1,18 +1,32 @@
+import ewe/internal/clock
 import ewe/internal/connection
+import ewe/internal/file
 import gleam/bit_array
+import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
+import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option
+import gleam/result
+import gleam/string
 import glisten
+import glisten/internal/handler
 import glisten/transport
 import logging
 
 pub type State {
-  State(buffer: BitArray, idle_timer: option.Option(process.Timer))
+  State(
+    handler: fn(request.Request(connection.Connection)) ->
+      response.Response(connection.Body),
+    buffer: BitArray,
+    idle_timer: option.Option(process.Timer),
+  )
 }
+
+pub const idle_timeout = 10_000
 
 pub type Next {
   Continue(State)
@@ -23,26 +37,28 @@ pub fn handle_message(
   state: State,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
+  case state.idle_timer {
+    option.Some(timer) -> process.cancel_timer(timer)
+    option.None -> process.TimerNotFound
+  }
+
   case parse(state.buffer) {
-    Ok(Complete(head, _metadata, remaining)) -> {
+    Ok(Complete(head, metadata, remaining)) -> {
       let scheme = case connection.transport {
         transport.Tcp -> http.Http
         transport.Ssl -> http.Https
       }
 
-      let connection =
-        connection.Http1(
-          transport: connection.transport,
-          socket: connection.socket,
-          self: connection.subject,
-          buffer: remaining,
-        )
-
       let request =
         request.Request(
           method: head.method,
           headers: head.headers,
-          body: connection,
+          body: connection.Http1(
+            transport: connection.transport,
+            socket: connection.socket,
+            self: connection.subject,
+            buffer: remaining,
+          ),
           scheme:,
           host: head.host,
           port: head.port,
@@ -50,19 +66,283 @@ pub fn handle_message(
           query: head.query,
         )
 
-      echo request
+      let response = state.handler(request)
 
-      Continue(State(..state, buffer: remaining))
+      let sent = case encode_response(response, head.method, metadata) {
+        Ok(Encoded(bytes:, keep_alive:, file: file_body)) -> {
+          use Nil <- result.try(transport.send(
+            connection.transport,
+            connection.socket,
+            bytes,
+          ))
+
+          case file_body {
+            option.None -> Ok(keep_alive)
+            option.Some(data) ->
+              case file.send(connection.transport, connection.socket, data) {
+                Ok(Nil) -> Ok(keep_alive)
+                Error(reason) -> Error(reason)
+              }
+          }
+        }
+        Error(UnsafeHeader(name)) -> {
+          logging.log(
+            logging.Error,
+            "Handler produced an unsafe response header: " <> name,
+          )
+
+          use Nil <- result.try(transport.send(
+            connection.transport,
+            connection.socket,
+            internal_server_error(),
+          ))
+
+          Ok(False)
+        }
+      }
+
+      case sent {
+        Ok(True) -> {
+          let timer =
+            process.send_after(
+              connection.subject,
+              idle_timeout,
+              handler.User(connection.Timeout),
+            )
+
+          State(..state, buffer: remaining, idle_timer: option.Some(timer))
+          |> Continue
+        }
+        Ok(False) -> Close
+        Error(_reason) -> Close
+      }
     }
-    Ok(Incomplete) -> Continue(state)
+    Ok(Incomplete) -> {
+      let timer =
+        process.send_after(
+          connection.subject,
+          idle_timeout,
+          handler.User(connection.Timeout),
+        )
+
+      Continue(State(..state, idle_timer: option.Some(timer)))
+    }
     Error(error) -> {
       logging.log(
         logging.Error,
         "Failed to parse HTTP/1.x request: " <> error_to_string(error),
       )
+
       Close
     }
   }
+}
+
+/// Errors that can occur while turning a handler's `response.Response` into 
+/// wire bytes.
+pub type EncodeError {
+  /// A header name or value contained a CR, LF, or NUL byte, which would let 
+  /// it inject a new header or terminate the header block early.
+  UnsafeHeader(name: String)
+}
+
+// Threaded through the pass over `response.headers` with the tree built so far 
+// and whether the handler's own `connection` header asked to close.
+type EncodeState {
+  EncodeState(tree: bytes_tree.BytesTree, force_close: Bool)
+}
+
+fn initial_encode_state() -> EncodeState {
+  EncodeState(tree: bytes_tree.new(), force_close: False)
+}
+
+/// The result of encoding a response: `bytes` is ready for a single
+/// `transport.send`, and `file`, when present, still needs to be streamed
+/// separately since it was never loaded into `bytes`.
+pub type Encoded {
+  Encoded(
+    bytes: bytes_tree.BytesTree,
+    keep_alive: Bool,
+    file: option.Option(connection.File),
+  )
+}
+
+/// Builds the response as a `BytesTree`. `Bytes`, `Text` and `Empty` bodies
+/// are folded straight into it, so the whole response goes out in a single
+/// `transport.send`.
+pub fn encode_response(
+  response: response.Response(connection.Body),
+  method: http.Method,
+  metadata: Metadata,
+) -> Result(Encoded, EncodeError) {
+  use state <- result.try(encode_headers(response.headers))
+  let length = body_length(response.body)
+  let keep_alive = metadata.keep_alive && !state.force_close
+
+  let head =
+    state.tree
+    |> append_date()
+    |> append_connection(keep_alive)
+    |> bytes_tree.prepend(status_line(response.status))
+    |> bytes_tree.append_string("content-length: " <> int.to_string(length))
+    |> bytes_tree.append(<<"\r\n\r\n":utf8>>)
+
+  case method, response.body {
+    http.Head, _body -> Ok(Encoded(head, keep_alive, option.None))
+    _method, connection.File(data) ->
+      Ok(Encoded(head, keep_alive, option.Some(data)))
+    _method, connection.Bytes(tree) ->
+      Ok(Encoded(bytes_tree.append_tree(head, tree), keep_alive, option.None))
+    _method, connection.Text(text) ->
+      Ok(Encoded(bytes_tree.append_string(head, text), keep_alive, option.None))
+    _method, connection.Empty -> Ok(Encoded(head, keep_alive, option.None))
+  }
+}
+
+// Builds the header block.
+fn encode_headers(
+  headers: List(#(String, String)),
+) -> Result(EncodeState, EncodeError) {
+  use state, #(name, value) <- list.try_fold(headers, initial_encode_state())
+  case name {
+    "content-length" | "transfer-encoding" | "date" -> Ok(state)
+    "connection" ->
+      case find_unsafe_header_byte(value) {
+        Error(Nil) -> {
+          let lowered = value |> bit_array.from_string |> lowercase_ascii
+          let force_close =
+            state.force_close || has_token(lowered, <<"close":utf8>>)
+          Ok(EncodeState(..state, force_close:))
+        }
+        Ok(_position) -> Error(UnsafeHeader(name))
+      }
+    _name ->
+      case find_unsafe_header_byte(name), find_unsafe_header_byte(value) {
+        Error(Nil), Error(Nil) -> {
+          let tree =
+            bytes_tree.append_string(state.tree, name)
+            |> bytes_tree.append(<<": ":utf8>>)
+            |> bytes_tree.append_string(value)
+            |> bytes_tree.append(<<"\r\n":utf8>>)
+
+          Ok(EncodeState(..state, tree:))
+        }
+        _other, _other -> Error(UnsafeHeader(name))
+      }
+  }
+}
+
+// Fills in `Date` from the shared clock (RFC 9110 §6.6.1). The clock actor 
+// refreshes the cached value once a second.
+fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
+  bytes_tree.append_string(tree, "date: ")
+  |> bytes_tree.append(clock.get())
+  |> bytes_tree.append(<<"\r\n":utf8>>)
+}
+
+fn append_connection(
+  tree: bytes_tree.BytesTree,
+  keep_alive: Bool,
+) -> bytes_tree.BytesTree {
+  let value = case keep_alive {
+    True -> <<"keep-alive":utf8>>
+    False -> <<"close":utf8>>
+  }
+
+  bytes_tree.append(tree, <<"connection: ":utf8>>)
+  |> bytes_tree.append(value)
+  |> bytes_tree.append(<<"\r\n":utf8>>)
+}
+
+// Precomputed `HTTP/1.1 NNN Reason\r\n` literals for every standard status 
+// code. Codes with no registered meaning in this range fall through to the 
+// general form with an empty reason phrase.
+fn status_line(status: Int) -> BitArray {
+  case status {
+    100 -> <<"HTTP/1.1 100 Continue\r\n":utf8>>
+    101 -> <<"HTTP/1.1 101 Switching Protocols\r\n":utf8>>
+    102 -> <<"HTTP/1.1 102 Processing\r\n":utf8>>
+    103 -> <<"HTTP/1.1 103 Early Hints\r\n":utf8>>
+    200 -> <<"HTTP/1.1 200 OK\r\n":utf8>>
+    201 -> <<"HTTP/1.1 201 Created\r\n":utf8>>
+    202 -> <<"HTTP/1.1 202 Accepted\r\n":utf8>>
+    203 -> <<"HTTP/1.1 203 Non-Authoritative Information\r\n":utf8>>
+    204 -> <<"HTTP/1.1 204 No Content\r\n":utf8>>
+    205 -> <<"HTTP/1.1 205 Reset Content\r\n":utf8>>
+    206 -> <<"HTTP/1.1 206 Partial Content\r\n":utf8>>
+    207 -> <<"HTTP/1.1 207 Multi-Status\r\n":utf8>>
+    208 -> <<"HTTP/1.1 208 Already Reported\r\n":utf8>>
+    226 -> <<"HTTP/1.1 226 IM Used\r\n":utf8>>
+    300 -> <<"HTTP/1.1 300 Multiple Choices\r\n":utf8>>
+    301 -> <<"HTTP/1.1 301 Moved Permanently\r\n":utf8>>
+    302 -> <<"HTTP/1.1 302 Found\r\n":utf8>>
+    303 -> <<"HTTP/1.1 303 See Other\r\n":utf8>>
+    304 -> <<"HTTP/1.1 304 Not Modified\r\n":utf8>>
+    305 -> <<"HTTP/1.1 305 Use Proxy\r\n":utf8>>
+    307 -> <<"HTTP/1.1 307 Temporary Redirect\r\n":utf8>>
+    308 -> <<"HTTP/1.1 308 Permanent Redirect\r\n":utf8>>
+    400 -> <<"HTTP/1.1 400 Bad Request\r\n":utf8>>
+    401 -> <<"HTTP/1.1 401 Unauthorized\r\n":utf8>>
+    402 -> <<"HTTP/1.1 402 Payment Required\r\n":utf8>>
+    403 -> <<"HTTP/1.1 403 Forbidden\r\n":utf8>>
+    404 -> <<"HTTP/1.1 404 Not Found\r\n":utf8>>
+    405 -> <<"HTTP/1.1 405 Method Not Allowed\r\n":utf8>>
+    406 -> <<"HTTP/1.1 406 Not Acceptable\r\n":utf8>>
+    407 -> <<"HTTP/1.1 407 Proxy Authentication Required\r\n":utf8>>
+    408 -> <<"HTTP/1.1 408 Request Timeout\r\n":utf8>>
+    409 -> <<"HTTP/1.1 409 Conflict\r\n":utf8>>
+    410 -> <<"HTTP/1.1 410 Gone\r\n":utf8>>
+    411 -> <<"HTTP/1.1 411 Length Required\r\n":utf8>>
+    412 -> <<"HTTP/1.1 412 Precondition Failed\r\n":utf8>>
+    413 -> <<"HTTP/1.1 413 Content Too Large\r\n":utf8>>
+    414 -> <<"HTTP/1.1 414 URI Too Long\r\n":utf8>>
+    415 -> <<"HTTP/1.1 415 Unsupported Media Type\r\n":utf8>>
+    416 -> <<"HTTP/1.1 416 Range Not Satisfiable\r\n":utf8>>
+    417 -> <<"HTTP/1.1 417 Expectation Failed\r\n":utf8>>
+    418 -> <<"HTTP/1.1 418 I'm a Teapot\r\n":utf8>>
+    421 -> <<"HTTP/1.1 421 Misdirected Request\r\n":utf8>>
+    422 -> <<"HTTP/1.1 422 Unprocessable Content\r\n":utf8>>
+    423 -> <<"HTTP/1.1 423 Locked\r\n":utf8>>
+    424 -> <<"HTTP/1.1 424 Failed Dependency\r\n":utf8>>
+    425 -> <<"HTTP/1.1 425 Too Early\r\n":utf8>>
+    426 -> <<"HTTP/1.1 426 Upgrade Required\r\n":utf8>>
+    428 -> <<"HTTP/1.1 428 Precondition Required\r\n":utf8>>
+    429 -> <<"HTTP/1.1 429 Too Many Requests\r\n":utf8>>
+    431 -> <<"HTTP/1.1 431 Request Header Fields Too Large\r\n":utf8>>
+    451 -> <<"HTTP/1.1 451 Unavailable For Legal Reasons\r\n":utf8>>
+    500 -> <<"HTTP/1.1 500 Internal Server Error\r\n":utf8>>
+    501 -> <<"HTTP/1.1 501 Not Implemented\r\n":utf8>>
+    502 -> <<"HTTP/1.1 502 Bad Gateway\r\n":utf8>>
+    503 -> <<"HTTP/1.1 503 Service Unavailable\r\n":utf8>>
+    504 -> <<"HTTP/1.1 504 Gateway Timeout\r\n":utf8>>
+    505 -> <<"HTTP/1.1 505 HTTP Version Not Supported\r\n":utf8>>
+    506 -> <<"HTTP/1.1 506 Variant Also Negotiates\r\n":utf8>>
+    507 -> <<"HTTP/1.1 507 Insufficient Storage\r\n":utf8>>
+    508 -> <<"HTTP/1.1 508 Loop Detected\r\n":utf8>>
+    510 -> <<"HTTP/1.1 510 Not Extended\r\n":utf8>>
+    511 -> <<"HTTP/1.1 511 Network Authentication Required\r\n":utf8>>
+    _other -> <<"HTTP/1.1 ":utf8, int.to_string(status):utf8, " \r\n":utf8>>
+  }
+}
+
+fn body_length(body: connection.Body) -> Int {
+  case body {
+    connection.Bytes(tree) -> bytes_tree.byte_size(tree)
+    connection.Text(text) -> string.byte_size(text)
+    connection.Empty -> 0
+    connection.File(data) -> data.length
+  }
+}
+
+fn internal_server_error() -> bytes_tree.BytesTree {
+  bytes_tree.new()
+  |> bytes_tree.append(<<
+    "HTTP/1.1 500 Internal Server Error\r\ndate: ":utf8,
+  >>)
+  |> bytes_tree.append(clock.get())
+  |> bytes_tree.append(<<
+    "\r\nconnection: close\r\ncontent-length: 0\r\n\r\n":utf8,
+  >>)
 }
 
 pub type Version {
@@ -716,6 +996,9 @@ fn find_question(bits: BitArray) -> Result(Int, Nil)
 
 @external(erlang, "http1_ffi", "find_close_bracket")
 fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)
+
+@external(erlang, "http1_ffi", "find_unsafe_header_byte")
+fn find_unsafe_header_byte(bits: String) -> Result(Int, Nil)
 
 @external(erlang, "http1_ffi", "split_comma")
 fn split_comma(bits: BitArray) -> List(BitArray)

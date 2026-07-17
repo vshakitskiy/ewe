@@ -1,5 +1,7 @@
 import ewe/internal/connection
+import ewe/internal/file
 import ewe/internal/handler as handler_
+import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -23,8 +25,10 @@ pub type Connection =
   connection.Connection
 
 pub type Body {
-  Bytes(BitArray)
+  Bytes(bytes_tree.BytesTree)
   Text(String)
+  Empty
+  File(connection.File)
 }
 
 pub type IpAddress {
@@ -270,15 +274,26 @@ pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
 
+// Body and connection.Body are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_to_internal_response(
+  response: response.Response(Body),
+) -> response.Response(connection.Body)
+
 /// Starts the server with the provided configuration.
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
+  let handler = fn(request) {
+    builder.handler(request)
+    |> unsafe_to_internal_response
+  }
+
   let pool =
     glisten.new(
       listener_name: builder.listener_name,
       connection_factory_name: builder.connection_factory_name,
-      on_init: handler_.on_init,
+      on_init: handler_.on_init(handler),
       loop: handler_.loop,
     )
 
@@ -311,7 +326,7 @@ pub fn start(
   })
 
   let scheme = case builder.tls {
-    Some(_) -> http.Https
+    Some(_config) -> http.Https
     None -> http.Http
   }
   let address =
@@ -329,4 +344,31 @@ pub fn supervised(
 ) -> supervision.ChildSpecification(supervisor.Supervisor) {
   fn() { start(builder) }
   |> supervision.supervisor
+}
+
+pub type FileError {
+  NotFound
+  IsDirectory
+  AccessDenied
+  UnknownError
+  InvalidOffset
+  InvalidLimit
+}
+
+// FileError and file.FileError are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_from_internal_file_error(error: file.FileError) -> FileError
+
+/// Prepares a file to be streamed as a response body. `offset` and `limit` in 
+/// bytes let you serve a byte range from the file. leave either as `None` to 
+/// serve from the start or through the end.
+pub fn file(
+  path: String,
+  offset offset: Option(Int),
+  limit limit: Option(Int),
+) -> Result(Body, FileError) {
+  case file.resolve(path, offset, limit) {
+    Ok(file) -> Ok(File(file))
+    Error(error) -> Error(unsafe_from_internal_file_error(error))
+  }
 }

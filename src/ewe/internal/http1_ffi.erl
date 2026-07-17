@@ -8,6 +8,7 @@
     find_space/1,
     find_question/1,
     find_close_bracket/1,
+    find_unsafe_header_byte/1,
     split_comma/1,
     list_to_bit_array/1,
     bit_array_to_string/1
@@ -21,6 +22,10 @@ init() ->
   persistent_term:put({?MODULE, question}, binary:compile_pattern(<<"?">>)),
   persistent_term:put({?MODULE, comma}, binary:compile_pattern(<<",">>)),
   persistent_term:put({?MODULE, close_bracket}, binary:compile_pattern(<<"]">>)),
+  persistent_term:put(
+    {?MODULE, unsafe_header},
+    binary:compile_pattern([<<"\r">>, <<"\n">>, <<0>>])
+  ),
   ok.
 
 find_lf(Bin) -> find(Bin, lf).
@@ -28,6 +33,7 @@ find_colon(Bin) -> find(Bin, colon).
 find_space(Bin) -> find(Bin, space).
 find_question(Bin) -> find(Bin, question).
 find_close_bracket(Bin) -> find(Bin, close_bracket).
+find_unsafe_header_byte(Bin) -> find(Bin, unsafe_header).
 
 find(Bin, Key) ->
   case binary:match(Bin, persistent_term:get({?MODULE, Key})) of
