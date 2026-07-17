@@ -107,6 +107,16 @@ pub fn mixed_case_and_ows_headers_test() {
   assert remaining == <<"HELLO WORLD!!":utf8>>
 }
 
+pub fn tab_ows_trimmed_test() {
+  let buffer = <<
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name:\t\tvalue\t\t\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(head, _metadata, _remaining) = http1.parse(buffer)
+
+  assert head.headers == [#("host", "example.com"), #("x-name", "value")]
+}
+
 pub fn chunked_transfer_encoding_test() {
   let buffer = <<
     "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
@@ -115,6 +125,32 @@ pub fn chunked_transfer_encoding_test() {
   let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
 
   assert metadata.chunked
+}
+
+pub fn transfer_encoding_chunked_among_multiple_tokens_test() {
+  let buffer = <<
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.chunked
+}
+
+pub fn conflicting_content_length_and_chunked_rejected_test() {
+  let buffer = <<
+    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello":utf8,
+  >>
+
+  assert http1.parse(buffer) == http1.Failed(http1.AmbiguousFraming)
+}
+
+pub fn conflicting_transfer_encoding_and_content_length_reversed_order_rejected_test() {
+  let buffer = <<
+    "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello":utf8,
+  >>
+
+  assert http1.parse(buffer) == http1.Failed(http1.AmbiguousFraming)
 }
 
 pub fn connection_close_lookalike_is_not_close_test() {
@@ -132,6 +168,35 @@ pub fn connection_close_among_multiple_tokens_test() {
     "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, Close\r\n\r\n":utf8,
   >>
 
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert !metadata.keep_alive
+}
+
+pub fn http11_defaults_to_keep_alive_test() {
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.keep_alive
+    as "HTTP/1.1 without Connection defaults to keep-alive"
+}
+
+pub fn http10_defaults_to_close_test() {
+  let buffer = <<"GET / HTTP/1.0\r\n\r\n":utf8>>
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert !metadata.keep_alive as "HTTP/1.0 without Connection defaults to close"
+}
+
+pub fn http10_explicit_keep_alive_test() {
+  let buffer = <<"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n":utf8>>
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.keep_alive
+}
+
+pub fn http10_explicit_close_stays_close_test() {
+  let buffer = <<"GET / HTTP/1.0\r\nConnection: close\r\n\r\n":utf8>>
   let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
 
   assert !metadata.keep_alive
@@ -215,7 +280,71 @@ pub fn no_query_string_test() {
         version: http1.Http11,
         headers: [#("host", "example.com")],
       ),
-      http1.Metadata(content_length: None, chunked: False, keep_alive: True),
+      http1.Metadata(
+        content_length: None,
+        chunked: False,
+        keep_alive: True,
+        upgrade: None,
+      ),
       <<>>,
     )
+}
+
+pub fn websocket_upgrade_requested_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == Some("websocket")
+}
+
+pub fn upgrade_token_case_insensitive_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == Some("websocket")
+}
+
+pub fn upgrade_among_multiple_connection_tokens_test() {
+  let buffer = <<
+    "GET /h2c HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == Some("h2c")
+}
+
+pub fn upgrade_header_without_connection_token_ignored_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == None
+    as "Upgrade requires Connection: upgrade to be honored (RFC 9110 §7.8)"
+}
+
+pub fn upgrade_header_before_connection_header_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n":utf8,
+  >>
+
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == Some("websocket")
+    as "order of Upgrade vs. Connection headers shouldn't matter"
+}
+
+pub fn no_upgrade_requested_test() {
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let assert http1.Complete(_head, metadata, _remaining) = http1.parse(buffer)
+
+  assert metadata.upgrade == None
 }

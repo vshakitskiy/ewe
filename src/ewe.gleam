@@ -1,3 +1,5 @@
+import ewe/internal/connection
+import ewe/internal/handler as handler_
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -115,7 +117,10 @@ pub opaque type Builder {
     tls: Option(TlsConfig),
     listener_name: process.Name(listener.Message),
     connection_factory_name: process.Name(
-      factory.Message(socket.Socket, process.Subject(handler.Message(Nil))),
+      factory.Message(
+        socket.Socket,
+        process.Subject(handler.Message(connection.Message)),
+      ),
     ),
     on_start: fn(http.Scheme, SocketAddress) -> Nil,
   )
@@ -128,7 +133,10 @@ pub opaque type Builder {
 pub fn new(
   listener_name listener_name: process.Name(listener.Message),
   connection_factory_name connection_factory_name: process.Name(
-    factory.Message(socket.Socket, process.Subject(handler.Message(Nil))),
+    factory.Message(
+      socket.Socket,
+      process.Subject(handler.Message(connection.Message)),
+    ),
   ),
   handler handler: fn(request.Request(Connection)) -> response.Response(Body),
 ) {
@@ -258,8 +266,8 @@ pub fn start(
     glisten.new(
       listener_name: builder.listener_name,
       connection_factory_name: builder.connection_factory_name,
-      on_init: todo,
-      loop: todo,
+      on_init: handler_.on_init,
+      loop: handler_.loop,
     )
 
   let pool = case builder.tls {

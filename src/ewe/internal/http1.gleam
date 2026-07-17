@@ -1,8 +1,23 @@
+import ewe/internal/connection
 import gleam/bit_array
+import gleam/erlang/process
 import gleam/http
 import gleam/int
 import gleam/list
 import gleam/option
+
+pub type State {
+  State(buffer: BitArray, idle_timer: option.Option(process.Timer))
+}
+
+pub type Next {
+  Continue(State)
+  Close
+}
+
+pub fn handle_message(state: State, connection: connection.Connection) -> Next {
+  Continue(state)
+}
 
 pub type Version {
   Http10
@@ -26,7 +41,12 @@ pub type Head {
 
 /// Cheap conclusions drawn from `Head.headers` in one pass.
 pub type Metadata {
-  Metadata(content_length: option.Option(Int), chunked: Bool, keep_alive: Bool)
+  Metadata(
+    content_length: option.Option(Int),
+    chunked: Bool,
+    keep_alive: Bool,
+    upgrade: option.Option(String),
+  )
 }
 
 pub type ParseError {
@@ -43,6 +63,7 @@ pub type ParseError {
   DuplicateHost
   BadHost
   MissingHost
+  AmbiguousFraming
 }
 
 pub type Parsed {
@@ -78,9 +99,11 @@ pub fn parse(buffer: BitArray) -> Parsed {
       state.host,
     ))
 
+    use metadata <- try_step(resolve_metadata(state, version))
+
     Done(Complete(
       Head(method:, host:, port:, path:, query:, version:, headers:),
-      state.metadata,
+      metadata,
       remaining,
     ))
   }
@@ -340,24 +363,50 @@ fn parse_port_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
   }
 }
 
-// Threaded through `parse_headers`. `metadata` mirrors `Head.headers` in
-// one pass, `host` holds the `Host` header once seen.
+// Threaded through `parse_headers`. 
 type HeaderState {
   HeaderState(
-    metadata: Metadata,
+    content_length: option.Option(Int),
+    chunked: Bool,
+    connection: option.Option(Bool),
+    connection_upgrade: Bool,
+    upgrade: option.Option(String),
     host: option.Option(#(String, option.Option(Int))),
   )
 }
 
 fn initial_header_state() -> HeaderState {
   HeaderState(
-    metadata: Metadata(
-      content_length: option.None,
-      chunked: False,
-      keep_alive: True,
-    ),
+    content_length: option.None,
+    chunked: False,
+    connection: option.None,
+    connection_upgrade: False,
+    upgrade: option.None,
     host: option.None,
   )
+}
+
+// HTTP/1.1 connections default to persistent, HTTP/1.0 ones default to
+// closing (RFC 9112 §9.3); an explicit `Connection` header overrides
+// either default. A message framed by both `Content-Length` and
+// `Transfer-Encoding` is rejected outright, since the two disagree on
+// where the body ends. (RFC 9112 §6.1).
+fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
+  case state.content_length, state.chunked {
+    option.Some(_length), True -> ParseError(AmbiguousFraming)
+    content_length, chunked -> {
+      let keep_alive = case state.connection, version {
+        option.Some(keep_alive), _version -> keep_alive
+        option.None, Http11 -> True
+        option.None, Http10 -> False
+      }
+      let upgrade = case state.connection_upgrade {
+        True -> state.upgrade
+        False -> option.None
+      }
+      Done(Metadata(content_length:, chunked:, keep_alive:, upgrade:))
+    }
+  }
 }
 
 fn parse_headers(
@@ -408,37 +457,51 @@ fn parse_header_line(
   }
 }
 
-// Updates `metadata` and `host` from a single already decoded header.
+// Updates `content_length`, `chunked`, `connection`, `connection_upgrade`,
+// `upgrade`, and `host` from a single already decoded header.
 fn classify(
   name: String,
   value: String,
   state: HeaderState,
 ) -> Step(HeaderState) {
-  let meta = state.metadata
   case name {
     "content-length" ->
-      case meta.content_length {
+      case state.content_length {
         option.Some(_length) -> ParseError(DuplicateContentLength)
         option.None ->
           case int.parse(value) {
-            Ok(length) if length >= 0 -> {
-              let content_length = option.Some(length)
-              let metadata = Metadata(..meta, content_length:)
-              Done(HeaderState(..state, metadata:))
-            }
+            Ok(length) if length >= 0 ->
+              Done(HeaderState(..state, content_length: option.Some(length)))
             _bad -> ParseError(BadContentLength)
           }
       }
     "transfer-encoding" -> {
       let lowered = value |> bit_array.from_string |> lowercase_ascii
-      let chunked = meta.chunked || lowered == <<"chunked":utf8>>
-      Done(HeaderState(..state, metadata: Metadata(..meta, chunked:)))
+      let chunked = state.chunked || has_token(lowered, <<"chunked":utf8>>)
+      Done(HeaderState(..state, chunked:))
     }
     "connection" -> {
       let lowered = value |> bit_array.from_string |> lowercase_ascii
-      let closing = has_token(lowered, <<"close":utf8>>)
-      HeaderState(..state, metadata: Metadata(..meta, keep_alive: !closing))
-      |> Done
+      let connection = case has_token(lowered, <<"close":utf8>>) {
+        True -> option.Some(False)
+        False ->
+          case has_token(lowered, <<"keep-alive":utf8>>) {
+            True -> option.Some(True)
+            False -> state.connection
+          }
+      }
+      let connection_upgrade =
+        state.connection_upgrade || has_token(lowered, <<"upgrade":utf8>>)
+      Done(HeaderState(..state, connection:, connection_upgrade:))
+    }
+    "upgrade" -> {
+      // ASCII-lowered bytes of a validated `String` are valid UTF-8.
+      let lowered =
+        value
+        |> bit_array.from_string
+        |> lowercase_ascii
+        |> unsafe_to_string
+      Done(HeaderState(..state, upgrade: option.Some(lowered)))
     }
     "host" ->
       case state.host {
@@ -554,8 +617,8 @@ fn trim_trailing_ows(bits: BitArray) -> BitArray {
     0 -> bits
     size ->
       case bits {
-        <<init:bytes-size(size - 1), 32>> -> trim_trailing_ows(init)
-        <<init:bytes-size(size - 1), 9>> -> trim_trailing_ows(init)
+        <<init:bytes-size(size - 1), " ":utf8>> -> trim_trailing_ows(init)
+        <<init:bytes-size(size - 1), "\t":utf8>> -> trim_trailing_ows(init)
         _bits -> bits
       }
   }
