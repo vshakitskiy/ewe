@@ -1,3 +1,4 @@
+import ewe/internal/connection
 import ewe/internal/http1
 import gleam/http
 import gleam/option.{None, Some}
@@ -18,8 +19,7 @@ pub fn simple_get_test() {
   assert head.headers
     == [#("host", "example.com"), #("connection", "keep-alive")]
   assert metadata.keep_alive
-  assert !metadata.chunked
-  assert metadata.content_length == None
+  assert metadata.framing == connection.NoBody
   assert remaining == <<>>
 }
 
@@ -99,8 +99,7 @@ pub fn mixed_case_and_ows_headers_test() {
     "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length:  13  \r\nConnection: close\r\n\r\nHELLO WORLD!!":utf8,
   >>
 
-  let assert Ok(http1.Complete(head, metadata, remaining)) =
-    http1.parse(buffer)
+  let assert Ok(http1.Complete(head, metadata, remaining)) = http1.parse(buffer)
 
   assert head.headers
     == [
@@ -108,7 +107,7 @@ pub fn mixed_case_and_ows_headers_test() {
       #("content-length", "13"),
       #("connection", "close"),
     ]
-  assert metadata.content_length == Some(13)
+  assert metadata.framing == connection.Fixed(13)
   assert !metadata.keep_alive
   assert remaining == <<"HELLO WORLD!!":utf8>>
 }
@@ -132,7 +131,7 @@ pub fn chunked_transfer_encoding_test() {
   let assert Ok(http1.Complete(_head, metadata, _remaining)) =
     http1.parse(buffer)
 
-  assert metadata.chunked
+  assert metadata.framing == connection.Chunked
 }
 
 pub fn transfer_encoding_chunked_among_multiple_tokens_test() {
@@ -143,7 +142,7 @@ pub fn transfer_encoding_chunked_among_multiple_tokens_test() {
   let assert Ok(http1.Complete(_head, metadata, _remaining)) =
     http1.parse(buffer)
 
-  assert metadata.chunked
+  assert metadata.framing == connection.Chunked
 }
 
 pub fn conflicting_content_length_and_chunked_rejected_test() {
@@ -288,24 +287,25 @@ pub fn no_query_string_test() {
   let buffer = <<"GET /plain HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
 
   assert http1.parse(buffer)
-    == Ok(http1.Complete(
-      http1.Head(
-        method: http.Get,
-        host: "example.com",
-        port: None,
-        path: "/plain",
-        query: None,
-        version: http1.Http11,
-        headers: [#("host", "example.com")],
+    == Ok(
+      http1.Complete(
+        http1.Head(
+          method: http.Get,
+          host: "example.com",
+          port: None,
+          path: "/plain",
+          query: None,
+          version: http1.Http11,
+          headers: [#("host", "example.com")],
+        ),
+        http1.Metadata(
+          framing: connection.NoBody,
+          keep_alive: True,
+          upgrade: None,
+        ),
+        <<>>,
       ),
-      http1.Metadata(
-        content_length: None,
-        chunked: False,
-        keep_alive: True,
-        upgrade: None,
-      ),
-      <<>>,
-    ))
+    )
 }
 
 pub fn websocket_upgrade_requested_test() {

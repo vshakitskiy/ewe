@@ -1,6 +1,7 @@
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
+import ewe/internal/http1
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -8,6 +9,7 @@ import gleam/http/request
 import gleam/http/response
 import gleam/int
 import gleam/io
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
@@ -76,14 +78,19 @@ fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
 /// Retrieves the client's socket address from the connection. Returns error if
 /// the socket information is unavailable.
 pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
-  let peername = transport.peername(connection.transport, connection.socket)
-  use info <- result.map(over: peername)
+  case connection {
+    connection.Http1(transport:, socket:, ..) -> {
+      let peername = transport.peername(transport, socket)
+      use info <- result.map(over: peername)
 
-  case info {
-    socket.TcpSockName(ip_address:, port:) ->
-      unsafe_from_internal_options_ip_address(ip_address)
-      |> TcpSocketAddress(port:)
-    socket.UnixSockName(path:) -> UnixSocketAddress(path:)
+      case info {
+        socket.TcpSockName(ip_address:, port:) ->
+          unsafe_from_internal_options_ip_address(ip_address)
+          |> TcpSocketAddress(port:)
+        socket.UnixSockName(path:) -> UnixSocketAddress(path:)
+      }
+    }
+    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
@@ -370,5 +377,38 @@ pub fn file(
   case file.resolve(path, offset, limit) {
     Ok(file) -> Ok(File(file))
     Error(error) -> Error(unsafe_from_internal_file_error(error))
+  }
+}
+
+pub type BodyError {
+  /// The declared body is bigger than the `limit` passed to `read_body`.
+  BodyTooLarge
+  /// The body couldn't be fully read: the connection dropped, timed out, or
+  /// the chunked framing was malformed.
+  InvalidBody
+}
+
+// BodyError and http1.BodyError are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_from_internal_body_error(error: http1.BodyError) -> BodyError
+
+/// Reads the entire request body into memory, up to `limit` bytes. For a 
+/// chunked request, any trailer fields are appended to the returned request's 
+/// `headers`.
+pub fn read_body(
+  req: request.Request(Connection),
+  limit limit: Int,
+) -> Result(request.Request(BitArray), BodyError) {
+  case req.body {
+    connection.Http1(..) -> {
+      use #(body, trailers) <- result.try(
+        http1.read_body(http1.unsafe_to_http1_connection(req.body), limit)
+        |> result.map_error(unsafe_from_internal_body_error),
+      )
+
+      request.Request(..req, headers: list.append(req.headers, trailers), body:)
+      |> Ok
+    }
+    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
   }
 }

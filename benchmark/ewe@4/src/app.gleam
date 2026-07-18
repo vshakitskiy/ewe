@@ -1,5 +1,4 @@
 import ewe
-import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
@@ -10,11 +9,9 @@ pub fn main() -> Nil {
   logging.configure()
   logging.set_level(logging.Debug)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   let assert Ok(_started) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handle_request)
+    |> ewe.listening(port: 3001)
     |> ewe.start
 
   process.sleep_forever()
@@ -22,16 +19,16 @@ pub fn main() -> Nil {
 
 fn handle_request(
   request: request.Request(ewe.Connection),
-) -> response.Response(ewe.Body) {
+) -> response.Response(ewe.ResponseBody) {
   case request.path {
     "/hello" ->
       response.new(200)
-      |> response.set_body(ewe.Text("Hello, Joe!"))
+      |> response.set_body(ewe.TextData("Hello, Joe!"))
     "/echo" ->
       case ewe.read_body(request, 10_000_000) {
         Ok(req) ->
           response.new(200)
-          |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
+          |> response.set_body(ewe.BitsData(req.body))
         Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
       }
     "/file/small" -> {

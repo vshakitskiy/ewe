@@ -14,6 +14,7 @@ import gleam/result
 import gleam/string
 import glisten
 import glisten/internal/handler
+import glisten/socket
 import glisten/transport
 import logging
 
@@ -49,16 +50,20 @@ pub fn handle_message(
         transport.Ssl -> http.Https
       }
 
+      let body_connection =
+        connection.Http1(
+          transport: connection.transport,
+          socket: connection.socket,
+          self: connection.subject,
+          buffer: remaining,
+          framing: metadata.framing,
+        )
+
       let request =
         request.Request(
           method: head.method,
           headers: head.headers,
-          body: connection.Http1(
-            transport: connection.transport,
-            socket: connection.socket,
-            self: connection.subject,
-            buffer: remaining,
-          ),
+          body: body_connection,
           scheme:,
           host: head.host,
           port: head.port,
@@ -67,6 +72,11 @@ pub fn handle_message(
         )
 
       let response = state.handler(request)
+
+      let #(buffer, body_drained) =
+        resolve_body(unsafe_to_http1_connection(body_connection))
+      let metadata =
+        Metadata(..metadata, keep_alive: metadata.keep_alive && body_drained)
 
       let sent = case encode_response(response, head.method, metadata) {
         Ok(Encoded(bytes:, keep_alive:, file: file_body)) -> {
@@ -110,7 +120,7 @@ pub fn handle_message(
               handler.User(connection.Timeout),
             )
 
-          State(..state, buffer: remaining, idle_timer: option.Some(timer))
+          State(..state, buffer:, idle_timer: option.Some(timer))
           |> Continue
         }
         Ok(False) -> Close
@@ -135,6 +145,251 @@ pub fn handle_message(
 
       Close
     }
+  }
+}
+
+/// Errors from consuming a request body via `read_body`.
+pub type BodyError {
+  /// A `Fixed` body's declared length alone exceeds `limit`, so nothing was
+  /// read; or a `Chunked` body's running total went over `limit` mid-stream,
+  /// so the connection is no longer reusable.
+  BodyTooLarge
+  /// The body couldn't be fully read off the socket: closed, timed out, or
+  /// malformed chunked framing.
+  InvalidBody
+}
+
+pub type Connection {
+  Http1(
+    transport: transport.Transport,
+    socket: socket.Socket,
+    self: process.Subject(handler.Message(connection.Message)),
+    buffer: BitArray,
+    framing: connection.Framing,
+  )
+}
+
+@external(erlang, "gleam_stdlib", "identity")
+pub fn unsafe_to_http1_connection(conn: connection.Connection) -> Connection
+
+const body_read_timeout = 10_000
+
+// Cap for auto draining a body the handler never read, so the connection can
+// still be reused for the next request. Bodies bigger than this force a
+// close instead of an unbounded drain.
+const auto_drain_limit = 1_048_576
+
+/// Reads the entire request body into memory, up to `limit` bytes, along with
+/// any chunked trailer fields. Blocks until the full body has arrived. 
+/// `Fixed` and `NoBody` requests never have trailers.
+pub fn read_body(
+  conn: Connection,
+  limit: Int,
+) -> Result(#(BitArray, List(#(String, String))), BodyError) {
+  let Http1(transport:, socket:, self:, buffer:, framing:) = conn
+
+  case framing, consume_body(transport, socket, buffer, framing, limit) {
+    _framing, Ok(#(body, trailers, leftover)) -> {
+      process.send(self, handler.User(connection.BodyDrained(leftover:)))
+      Ok(#(body, trailers))
+    }
+    connection.Fixed(_length), Error(BodyTooLarge) -> Error(BodyTooLarge)
+    _framing, Error(error) -> {
+      process.send(self, handler.User(connection.BodyAbandoned))
+      Error(error)
+    }
+  }
+}
+
+// Reconciles what the handler did with the request body so the connection can 
+// be safely reused. If the handler called `read_body`, picks up the leftover 
+// bytes it reported via a message to `conn.self`. Otherwise drains the declared 
+// body itself, up to `auto_drain_limit`, so a well behaved client isn't 
+// punished with a dropped connection just because the handler didn't care about 
+// its body.
+fn resolve_body(conn: Connection) -> #(BitArray, Bool) {
+  let Http1(transport:, socket:, self:, buffer:, framing:) = conn
+
+  case process.receive(self, 0) {
+    Ok(handler.User(connection.BodyDrained(leftover))) -> #(leftover, True)
+    Ok(handler.User(connection.BodyAbandoned)) -> #(<<>>, False)
+    _nothing_pending ->
+      case consume_body(transport, socket, buffer, framing, auto_drain_limit) {
+        Ok(#(_discarded, _trailers, leftover)) -> #(leftover, True)
+        Error(_reason) -> #(<<>>, False)
+      }
+  }
+}
+
+// Consumes exactly the declared body from `buffer`, pulling more from the 
+// socket as needed, and splits off whatever comes right after it, along with
+// any chunked trailer fields.
+fn consume_body(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  buffer: BitArray,
+  framing: connection.Framing,
+  limit: Int,
+) -> Result(#(BitArray, List(#(String, String)), BitArray), BodyError) {
+  case framing {
+    connection.NoBody -> Ok(#(<<>>, [], buffer))
+    connection.Fixed(length) if length > limit -> Error(BodyTooLarge)
+    connection.Fixed(length) ->
+      read_fixed(transport, socket, buffer, length) |> to_body_result
+    connection.Chunked ->
+      read_chunked(transport, socket, buffer, limit, bytes_tree.new(), 0)
+      |> to_body_result
+  }
+}
+
+fn to_body_result(
+  result: Result(#(BitArray, List(#(String, String)), BitArray), ParseError),
+) -> Result(#(BitArray, List(#(String, String)), BitArray), BodyError) {
+  case result {
+    Ok(value) -> Ok(value)
+    Error(ChunkTooLarge) -> Error(BodyTooLarge)
+    Error(_other) -> Error(InvalidBody)
+  }
+}
+
+// A `Content-Length` body. Whatever's missing beyond `buffer` is read in a
+// single exact size call, since the socket blocks until exactly that many
+// bytes arrive or the connection drops.
+fn read_fixed(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  buffer: BitArray,
+  length: Int,
+) -> Result(#(BitArray, List(#(String, String)), BitArray), ParseError) {
+  case buffer {
+    <<body:bytes-size(length), leftover:bits>> -> Ok(#(body, [], leftover))
+    _ -> {
+      case
+        transport.receive_timeout(
+          transport,
+          socket,
+          length - bit_array.byte_size(buffer),
+          body_read_timeout,
+        )
+      {
+        Ok(more) -> Ok(#(<<buffer:bits, more:bits>>, [], <<>>))
+        Error(_reason) -> Error(BodyReadFailed)
+      }
+    }
+  }
+}
+
+// A `Transfer-Encoding: chunked` body. Each call advances by one chunk (or 
+// trailers), pulling more from the socket only for whichever piece is 
+// currently short.
+fn read_chunked(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  buffer: BitArray,
+  limit: Int,
+  acc: bytes_tree.BytesTree,
+  total: Int,
+) -> Result(#(BitArray, List(#(String, String)), BitArray), ParseError) {
+  use #(size, remaining) <- result.try(pull_until(
+    transport,
+    socket,
+    buffer,
+    parse_chunk_line,
+  ))
+
+  case size {
+    0 -> {
+      use #(trailers, _state, remaining) <- result.try(
+        pull_until(transport, socket, remaining, fn(buffer) {
+          parse_headers(buffer, [], 0, initial_header_state())
+        }),
+      )
+      Ok(#(bytes_tree.to_bit_array(acc), trailers, remaining))
+    }
+    size -> {
+      let total = total + size
+      case total > limit {
+        True -> Error(ChunkTooLarge)
+        False -> {
+          use #(data, remaining) <- result.try(
+            pull_until(transport, socket, remaining, take_chunk_data(_, size)),
+          )
+          read_chunked(
+            transport,
+            socket,
+            remaining,
+            limit,
+            bytes_tree.append(acc, data),
+            total,
+          )
+        }
+      }
+    }
+  }
+}
+
+// Runs `step` against `buffer`, pulling more bytes from the socket only when
+// `step` itself reports it's short.
+fn pull_until(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  buffer: BitArray,
+  step: fn(BitArray) -> Step(a),
+) -> Result(a, ParseError) {
+  case step(buffer) {
+    Done(value) -> Ok(value)
+    ParseError(error) -> Error(error)
+    More ->
+      case transport.receive_timeout(transport, socket, 0, body_read_timeout) {
+        Ok(more) ->
+          pull_until(transport, socket, <<buffer:bits, more:bits>>, step)
+        Error(_reason) -> Error(BodyReadFailed)
+      }
+  }
+}
+
+fn parse_chunk_line(buffer: BitArray) -> Step(#(Int, BitArray)) {
+  use #(line, remaining) <- try_step(extract_line(
+    buffer,
+    max_chunk_size_line,
+    ChunkSizeLineTooLong,
+    BadChunkSize,
+  ))
+  use size <- try_step(parse_chunk_size(line))
+  Done(#(size, remaining))
+}
+
+// Chunk-size lines may carry `;extensions`. Only the hex size before them 
+// matters here
+fn parse_chunk_size(line: BitArray) -> Step(Int) {
+  case parse_hex_digits(line, 0, False) {
+    Ok(size) -> Done(size)
+    Error(Nil) -> ParseError(BadChunkSize)
+  }
+}
+
+fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
+  case bits {
+    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
+      parse_hex_digits(remaining, acc * 16 + { byte - 48 }, True)
+    <<byte, remaining:bits>> if byte >= 97 && byte <= 102 ->
+      parse_hex_digits(remaining, acc * 16 + { byte - 87 }, True)
+    <<byte, remaining:bits>> if byte >= 65 && byte <= 70 ->
+      parse_hex_digits(remaining, acc * 16 + { byte - 55 }, True)
+    _bits if any -> Ok(acc)
+    _bits -> Error(Nil)
+  }
+}
+
+fn take_chunk_data(buffer: BitArray, size: Int) -> Step(#(BitArray, BitArray)) {
+  case buffer {
+    <<data:bytes-size(size), "\r\n":utf8, remaining:bits>> ->
+      Done(#(data, remaining))
+    _buffer ->
+      case bit_array.byte_size(buffer) < size + 2 {
+        True -> More
+        False -> ParseError(BadChunkFraming)
+      }
   }
 }
 
@@ -368,8 +623,7 @@ pub type Head {
 /// Cheap conclusions drawn from `Head.headers` in one pass.
 pub type Metadata {
   Metadata(
-    content_length: option.Option(Int),
-    chunked: Bool,
+    framing: connection.Framing,
     keep_alive: Bool,
     upgrade: option.Option(String),
   )
@@ -390,6 +644,11 @@ pub type ParseError {
   BadHost
   MissingHost
   AmbiguousFraming
+  ChunkSizeLineTooLong
+  BadChunkSize
+  BadChunkFraming
+  ChunkTooLarge
+  BodyReadFailed
 }
 
 pub fn error_to_string(error: ParseError) -> String {
@@ -412,6 +671,14 @@ pub fn error_to_string(error: ParseError) -> String {
     MissingHost -> "missing required Host header"
     AmbiguousFraming ->
       "conflicting Content-Length and Transfer-Encoding headers"
+    ChunkSizeLineTooLong ->
+      "chunk size line exceeds "
+      <> int.to_string(max_chunk_size_line)
+      <> " bytes"
+    BadChunkSize -> "malformed chunk size"
+    BadChunkFraming -> "malformed chunk data framing"
+    ChunkTooLarge -> "chunked body exceeds size limit"
+    BodyReadFailed -> "failed to read request body from the socket"
   }
 }
 
@@ -425,6 +692,8 @@ const max_request_line = 8192
 const max_header_line = 8192
 
 const max_headers = 100
+
+const max_chunk_size_line = 128
 
 /// Parses as much of a request head as `buffer` contains.
 pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
@@ -743,6 +1012,13 @@ fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
   case state.content_length, state.chunked {
     option.Some(_length), True -> ParseError(AmbiguousFraming)
     content_length, chunked -> {
+      let framing = case content_length, chunked {
+        option.Some(length), False -> connection.Fixed(length)
+        option.None, True -> connection.Chunked
+        option.None, False -> connection.NoBody
+        option.Some(_length), True ->
+          panic as "AmbiguousFraming already rejected above"
+      }
       let keep_alive = case state.connection, version {
         option.Some(keep_alive), _version -> keep_alive
         option.None, Http11 -> True
@@ -752,7 +1028,7 @@ fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
         True -> state.upgrade
         False -> option.None
       }
-      Done(Metadata(content_length:, chunked:, keep_alive:, upgrade:))
+      Done(Metadata(framing:, keep_alive:, upgrade:))
     }
   }
 }

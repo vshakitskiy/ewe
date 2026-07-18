@@ -60,6 +60,16 @@ pub fn loop(
       logging.log(logging.Debug, "Connection idled for too long, closing.")
       glisten.stop()
     }
+    glisten.User(connection.BodyDrained(..))
+    | glisten.User(connection.BodyAbandoned) -> {
+      // http1.handle_message always drains these itself before returning
+      logging.log(
+        logging.Critical,
+        "Web server loop received a message that should not be reached to the handler! That means there is a bug somewhere within the implementation. Please open an issue addressing the alert, thank you! https://github.com/vshakitskiy/ewe/issues/new",
+      )
+
+      glisten.continue(state)
+    }
     glisten.Packet(data) ->
       case state {
         Initialised(handler:, buffer:, idle_timer:) -> {
@@ -94,7 +104,16 @@ pub fn loop(
             }
           }
         }
-        Http1(..) -> todo as "HTTP/1.x connection loop not implemented yet"
+        Http1(state) -> {
+          let next =
+            http1.State(..state, buffer: <<state.buffer:bits, data:bits>>)
+            |> http1.handle_message(connection)
+
+          case next {
+            http1.Continue(state) -> glisten.continue(Http1(state))
+            http1.Close -> glisten.stop()
+          }
+        }
         Http2(..) -> todo as "HTTP/2 connection handling not implemented yet"
       }
   }

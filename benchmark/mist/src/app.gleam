@@ -1,45 +1,51 @@
-import ewe
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/option
+import gleam/string
 import logging
+import mist
 
 pub fn main() -> Nil {
   logging.configure()
   logging.set_level(logging.Debug)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   let assert Ok(_started) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
-    |> ewe.start
+    mist.new(handle_request)
+    |> mist.port(3002)
+    |> mist.start
 
   process.sleep_forever()
 }
 
 fn handle_request(
-  request: request.Request(ewe.Connection),
-) -> response.Response(ewe.Body) {
+  request: request.Request(mist.Connection),
+) -> response.Response(mist.ResponseData) {
   case request.path {
     "/hello" ->
       response.new(200)
-      |> response.set_body(ewe.Text("Hello, Joe!"))
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("Hello, Joe!")))
+    "/whoami" ->
+      response.new(200)
+      |> response.set_body(mist.Bytes(bytes_tree.from_string(
+        "method=" <> method_to_string(request.method),
+      )))
     "/echo" ->
-      case ewe.read_body(request, 10_000_000) {
+      case mist.read_body(request, 10_000_000) {
         Ok(req) ->
           response.new(200)
-          |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
-        Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
+          |> response.set_body(mist.Bytes(bytes_tree.from_bit_array(req.body)))
+        Error(_error) ->
+          response.new(400) |> response.set_body(mist.Bytes(bytes_tree.new()))
       }
     "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
-        ewe.file(
+        mist.send_file(
           "./dev/priv/file_100kb.bin",
-          offset: option.None,
+          offset: 0,
           limit: option.None,
         )
 
@@ -52,11 +58,7 @@ fn handle_request(
     "/file/big" -> {
       // head -c 1G /dev/urandom > file_1gb.bin
       let assert Ok(file) =
-        ewe.file(
-          "./dev/priv/file_1gb.bin",
-          offset: option.None,
-          limit: option.None,
-        )
+        mist.send_file("./dev/priv/file_1gb.bin", offset: 0, limit: option.None)
 
       response.Response(
         status: 200,
@@ -66,6 +68,13 @@ fn handle_request(
     }
     _ ->
       response.new(404)
-      |> response.set_body(ewe.Empty)
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+  }
+}
+
+fn method_to_string(method: http.Method) -> String {
+  case method {
+    http.Other(name) -> "Other(" <> name <> ")"
+    _other -> string.inspect(method)
   }
 }
