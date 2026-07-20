@@ -5,9 +5,22 @@
 - Add support for unix sockets.
 - Add support for in-memory certificate files for the tls.
 - Change some of the function argument lables.
+- Rename `enable_tls` to `with_tls`.
+- Remove `with_name`.
+- Drop the library's own `Request`, `Response` aliases. 
+- `ResponseBody` is now named `Body`.
 - Builder's `new` now requires listener and connection factory names provided in
   order to prevent possible atom table exhaustion.
 - Switch from `erlang:decode_packet` to self implemented parsing solution.
+- In replacement of `stream_body` there is now `read_body_chunk`, no consumer
+  api anymore.
+- Request loop no longer ignore request's body on the socket if it was not 
+  consumed inside user's handler. We now flush remaining body bytes allowing 
+  correct reuse of the socket for the next request. If the size of the bytes is 
+  more than 1mb, we close the connection instead.
+- In replacement of `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop`
+  there is now `stream_response`/`send_chunk`/`finish_chunk`/`finish_response` 
+  and no init/loop callback for response streaming anymore.
 
 ## v4.0.1 - 04.06.2026
 

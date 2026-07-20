@@ -29,9 +29,11 @@ fn handle_request(
       |> response.set_body(mist.Bytes(bytes_tree.from_string("Hello, Joe!")))
     "/whoami" ->
       response.new(200)
-      |> response.set_body(mist.Bytes(bytes_tree.from_string(
-        "method=" <> method_to_string(request.method),
-      )))
+      |> response.set_body(
+        mist.Bytes(bytes_tree.from_string(
+          "method=" <> method_to_string(request.method),
+        )),
+      )
     "/echo" ->
       case mist.read_body(request, 10_000_000) {
         Ok(req) ->

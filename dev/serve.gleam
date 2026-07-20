@@ -34,6 +34,12 @@ fn handle_request(
           |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
         Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
       }
+    "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
+    "/stream" -> {
+      use writer <- ewe.stream_response(response.new(200))
+      let writer = ewe.send_chunk(writer, <<"hello ":utf8>>)
+      ewe.finish_chunk(writer, <<"world":utf8>>)
+    }
     "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
@@ -67,5 +73,20 @@ fn handle_request(
     _ ->
       response.new(404)
       |> response.set_body(ewe.Empty)
+  }
+}
+
+fn echo_chunked(
+  request: request.Request(ewe.Connection),
+  acc: bytes_tree.BytesTree,
+) -> response.Response(ewe.Body) {
+  case
+    echo ewe.read_body_chunk(request, max_chunk_bytes: 4096, limit: 10_000_000)
+  {
+    Ok(ewe.Chunk(data, request)) ->
+      echo_chunked(request, bytes_tree.append(acc, data))
+    Ok(ewe.Done(_request)) ->
+      response.new(200) |> response.set_body(ewe.Bytes(acc))
+    Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
   }
 }

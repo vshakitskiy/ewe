@@ -31,6 +31,7 @@ pub type Body {
   Text(String)
   Empty
   File(connection.File)
+  Streaming(handler: fn(ResponseWriter) -> Nil)
 }
 
 pub type IpAddress {
@@ -410,5 +411,94 @@ pub fn read_body(
       |> Ok
     }
     connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+// http1.Connection and connection.Connection are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_from_http1_connection(conn: http1.Connection) -> Connection
+
+/// The result of one `read_body_chunk` call.
+pub type ReadEvent {
+  /// Up to `max_chunk_bytes` of body data. Feed `request` into the next call.
+  Chunk(data: BitArray, request: request.Request(Connection))
+  /// The body is fully consumed. Any chunked trailer fields have been appended 
+  /// to the returned request's `headers`.
+  Done(request: request.Request(Nil))
+}
+
+/// Pulls up to `max_chunk_bytes` of body per call instead of buffering the
+/// whole body, capped overall at `limit`. Feed the request carried by `Chunk` 
+/// into the next call.
+pub fn read_body_chunk(
+  req: request.Request(Connection),
+  max_chunk_bytes max_chunk_bytes: Int,
+  limit limit: Int,
+) -> Result(ReadEvent, BodyError) {
+  case req.body {
+    connection.Http1(..) -> {
+      let conn = http1.unsafe_to_http1_connection(req.body)
+      case http1.read_body_chunk(conn, max_chunk_bytes:, limit:) {
+        Ok(http1.Chunk(data, connection)) -> {
+          let body = unsafe_from_http1_connection(connection)
+          Ok(Chunk(data, request.set_body(req, body)))
+        }
+        Ok(http1.Done(trailers)) -> {
+          let headers = list.append(req.headers, trailers)
+          Ok(Done(request.Request(..req, headers:, body: Nil)))
+        }
+        Error(error) -> Error(unsafe_from_internal_body_error(error))
+      }
+    }
+    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// A handle for writing a streamed response's body, obtained from
+/// `stream_response`.
+pub type ResponseWriter =
+  connection.ResponseWriter
+
+// http1.ResponseWriter and ResponseWriter are structurally identical.
+@external(erlang, "gleam_stdlib", "identity")
+fn unsafe_from_http1_writer(writer: http1.ResponseWriter) -> ResponseWriter
+
+/// Starts a streamed response. `handler` must end by calling `finish_chunk` or
+/// `finish_response` on it, since that's what closes the stream.
+pub fn stream_response(
+  response: response.Response(a),
+  handler: fn(ResponseWriter) -> Nil,
+) -> response.Response(Body) {
+  response.set_body(response, Streaming(handler))
+}
+
+/// Sends one response body chunk, threading the writer through so it can be
+/// piped. For the last chunk use `finish_chunk` instead, it closes the
+/// stream in the same round trip.
+pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
+  case writer {
+    connection.Http1Writer(..) ->
+      http1.send_chunk(http1.unsafe_to_http1_writer(writer), chunk)
+      |> unsafe_from_http1_writer
+    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// Sends `chunk` as the final response body chunk and closes the stream.
+pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
+  case writer {
+    connection.Http1Writer(..) ->
+      http1.finish_chunk(http1.unsafe_to_http1_writer(writer), chunk)
+    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// Closes the stream with no further data. Use `finish_chunk` instead if
+/// there's one last chunk to send.
+pub fn finish_response(writer: ResponseWriter) -> Nil {
+  case writer {
+    connection.Http1Writer(..) ->
+      http1.finish_response(http1.unsafe_to_http1_writer(writer))
+    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
