@@ -1,6 +1,7 @@
 import ewe
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/option
@@ -23,24 +24,24 @@ pub fn main() -> Nil {
 fn handle_request(
   request: request.Request(ewe.Connection),
 ) -> response.Response(ewe.Body) {
-  case request.path {
-    "/hello" ->
+  case request.method, request.path {
+    http.Get, "/hello" ->
       response.new(200)
       |> response.set_body(ewe.Text("Hello, Joe!"))
-    "/echo" ->
+    http.Post, "/echo" ->
       case ewe.read_body(request, 10_000_000) {
         Ok(req) ->
           response.new(200)
           |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
         Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
       }
-    "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
-    "/stream" -> {
+    http.Post, "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
+    http.Get, "/stream" -> {
       use writer <- ewe.stream_response(response.new(200))
-      let writer = ewe.send_chunk(writer, <<"hello ":utf8>>)
-      ewe.finish_chunk(writer, <<"world":utf8>>)
+      let writer = ewe.send_chunk(writer, <<"hello, ":utf8>>)
+      ewe.finish_chunk(writer, <<"Joe!":utf8>>)
     }
-    "/file/small" -> {
+    http.Get, "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
         ewe.file(
@@ -55,7 +56,7 @@ fn handle_request(
         body: file,
       )
     }
-    "/file/big" -> {
+    http.Get, "/file/big" -> {
       // head -c 1G /dev/urandom > file_1gb.bin
       let assert Ok(file) =
         ewe.file(
@@ -70,7 +71,7 @@ fn handle_request(
         body: file,
       )
     }
-    _ ->
+    _method, _path ->
       response.new(404)
       |> response.set_body(ewe.Empty)
   }

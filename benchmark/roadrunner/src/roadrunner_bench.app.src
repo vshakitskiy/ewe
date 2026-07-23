@@ -1,0 +1,16 @@
+{application, roadrunner_bench,
+ [{description, "roadrunner benchmark server"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {roadrunner_bench_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    roadrunner
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.

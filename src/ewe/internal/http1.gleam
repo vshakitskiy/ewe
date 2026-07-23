@@ -50,11 +50,13 @@ pub fn handle_message(
         transport.Ssl -> http.Https
       }
 
+      let self = process.new_subject()
+
       let body_connection =
         connection.Http1(
           transport: connection.transport,
           socket: connection.socket,
-          self: connection.subject,
+          self:,
           buffer: remaining,
           framing: metadata.framing,
           read: 0,
@@ -75,7 +77,7 @@ pub fn handle_message(
 
       let response = state.handler(request)
 
-      let drained = drain_messages(connection.subject)
+      let drained = drain_messages(self)
 
       let #(buffer, body_drained) =
         resolve_body(unsafe_to_http1_connection(body_connection), drained.body)
@@ -105,13 +107,13 @@ pub fn handle_message(
               connection.Http1Writer(
                 transport: connection.transport,
                 socket: connection.socket,
-                self: connection.subject,
+                self:,
                 chunked:,
                 keep_alive:,
               )
               |> stream_handler
 
-              let stream_drained = drain_messages(connection.subject)
+              let stream_drained = drain_messages(self)
               let stream_keep_alive = case stream_drained.stream {
                 option.Some(connection.StreamFinished(keep_alive:)) ->
                   keep_alive
@@ -135,8 +137,7 @@ pub fn handle_message(
                   }
                   False
                 }
-                option.Some(connection.Timeout)
-                | option.Some(connection.BodyDrained(..))
+                option.Some(connection.BodyDrained(..))
                 | option.Some(connection.BodyAbandoned)
                 | option.Some(connection.BodyProgress(..)) ->
                   panic as "drain_messages routes body messages to the other slot"
@@ -216,7 +217,7 @@ pub type Connection {
   Http1(
     transport: transport.Transport,
     socket: socket.Socket,
-    self: process.Subject(handler.Message(connection.Message)),
+    self: process.Subject(connection.Http1Signal),
     buffer: BitArray,
     framing: connection.Framing,
     read: Int,
@@ -245,12 +246,12 @@ pub fn read_body(
 
   case framing, consume_body(transport, socket, buffer, framing, limit) {
     _framing, Ok(#(body, trailers, leftover)) -> {
-      process.send(self, handler.User(connection.BodyDrained(leftover:)))
+      process.send(self, connection.BodyDrained(leftover:))
       Ok(#(body, trailers))
     }
     connection.Fixed(_length), Error(BodyTooLarge) -> Error(BodyTooLarge)
     _framing, Error(error) -> {
-      process.send(self, handler.User(connection.BodyAbandoned))
+      process.send(self, connection.BodyAbandoned)
       Error(error)
     }
   }
@@ -278,18 +279,18 @@ pub fn read_body_chunk(
 
   case pull_chunk(conn, max_chunk_bytes, limit) {
     Ok(PulledChunk(data, next)) -> {
-      handler.User(connection.BodyProgress(buffer:, read:, chunk_remaining:))
+      connection.BodyProgress(buffer:, read:, chunk_remaining:)
       |> process.send(self, _)
 
       Ok(Chunk(data, next))
     }
     Ok(PulledDone(trailers, leftover)) -> {
-      process.send(self, handler.User(connection.BodyDrained(leftover:)))
+      process.send(self, connection.BodyDrained(leftover:))
 
       Ok(Done(trailers))
     }
     Error(error) -> {
-      process.send(self, handler.User(connection.BodyAbandoned))
+      process.send(self, connection.BodyAbandoned)
 
       Error(error)
     }
@@ -312,48 +313,45 @@ const auto_drain_chunk_bytes = 65_536
 //   connection just because the handler didn't care about its body.
 fn resolve_body(
   conn: Connection,
-  drained: option.Option(connection.Message),
+  drained: option.Option(connection.Http1Signal),
 ) -> #(BitArray, Bool) {
   case drained {
     option.Some(connection.BodyDrained(leftover)) -> #(leftover, True)
     option.Some(connection.BodyAbandoned) -> #(<<>>, False)
     option.Some(connection.BodyProgress(buffer:, read:, chunk_remaining:)) ->
       drain_remaining(Http1(..conn, buffer:, read:, chunk_remaining:))
-    option.Some(connection.Timeout) | option.None -> drain_remaining(conn)
+    option.None -> drain_remaining(conn)
     option.Some(connection.StreamFinished(..)) ->
       panic as "drain_messages routes stream messages to the other slot"
   }
 }
 
-// The latest body read and response stream outcome messages currently queued 
-// for a connection's own subject, drained in one pass so a handler that both 
-// reads a request body and streams a response doesn't lose one outcome to the 
-// other.
+// The latest body read and response stream outcome messages currently queued
+// for a request's own private subject, drained in one pass so a handler that
+// both reads a request body and streams a response doesn't lose one outcome
+// to the other.
 type Drained {
   Drained(
-    body: option.Option(connection.Message),
-    stream: option.Option(connection.Message),
+    body: option.Option(connection.Http1Signal),
+    stream: option.Option(connection.Http1Signal),
   )
 }
 
 // Selectively receives every message already queued for `self`, keeping only
 // the last one of each kind.
-fn drain_messages(
-  self: process.Subject(handler.Message(connection.Message)),
-) -> Drained {
+fn drain_messages(self: process.Subject(connection.Http1Signal)) -> Drained {
   do_drain_messages(self, Drained(body: option.None, stream: option.None))
 }
 
 fn do_drain_messages(
-  self: process.Subject(handler.Message(connection.Message)),
+  self: process.Subject(connection.Http1Signal),
   acc: Drained,
 ) -> Drained {
   case process.receive(self, 0) {
-    Ok(handler.User(connection.StreamFinished(..) as message)) ->
+    Ok(connection.StreamFinished(..) as message) ->
       do_drain_messages(self, Drained(..acc, stream: option.Some(message)))
-    Ok(handler.User(message)) ->
+    Ok(message) ->
       do_drain_messages(self, Drained(..acc, body: option.Some(message)))
-    Ok(handler.Internal(_message)) -> do_drain_messages(self, acc)
     Error(Nil) -> acc
   }
 }
@@ -829,7 +827,7 @@ pub type ResponseWriter {
   ResponseWriter(
     transport: transport.Transport,
     socket: socket.Socket,
-    self: process.Subject(handler.Message(connection.Message)),
+    self: process.Subject(connection.Http1Signal),
     // `True` on HTTP/1.1: frame each chunk with its hex size and a trailing
     // `0\r\n\r\n` terminator. `False` on HTTP/1.0, which has no chunked
     // encoding: write raw bytes and let the body end when the connection
@@ -898,7 +896,7 @@ pub fn finish_response(writer: ResponseWriter) -> Nil {
 fn finish(writer: ResponseWriter) -> Nil {
   process.send(
     writer.self,
-    handler.User(connection.StreamFinished(keep_alive: writer.keep_alive)),
+    connection.StreamFinished(keep_alive: writer.keep_alive),
   )
 }
 

@@ -1,6 +1,7 @@
 import ewe
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/option
@@ -15,6 +16,7 @@ pub fn main() -> Nil {
 
   let assert Ok(_started) =
     ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    |> ewe.listening(on: 3006)
     |> ewe.start
 
   process.sleep_forever()
@@ -23,22 +25,28 @@ pub fn main() -> Nil {
 fn handle_request(
   request: request.Request(ewe.Connection),
 ) -> response.Response(ewe.Body) {
-  case request.path {
-    "/hello" ->
+  case request.method, request.path {
+    http.Get, "/hello" ->
       response.new(200)
       |> response.set_body(ewe.Text("Hello, Joe!"))
-    "/echo" ->
+    http.Post, "/echo" ->
       case ewe.read_body(request, 10_000_000) {
         Ok(req) ->
           response.new(200)
           |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
         Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
       }
-    "/file/small" -> {
+    http.Post, "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
+    http.Get, "/stream" -> {
+      use writer <- ewe.stream_response(response.new(200))
+      let writer = ewe.send_chunk(writer, <<"hello, ":utf8>>)
+      ewe.finish_chunk(writer, <<"Joe!":utf8>>)
+    }
+    http.Get, "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
         ewe.file(
-          "./dev/priv/file_100kb.bin",
+          "../priv/file_100kb.bin",
           offset: option.None,
           limit: option.None,
         )
@@ -49,11 +57,11 @@ fn handle_request(
         body: file,
       )
     }
-    "/file/big" -> {
+    http.Get, "/file/big" -> {
       // head -c 1G /dev/urandom > file_1gb.bin
       let assert Ok(file) =
         ewe.file(
-          "./dev/priv/file_1gb.bin",
+          "../priv/file_1gb.bin",
           offset: option.None,
           limit: option.None,
         )
@@ -64,8 +72,21 @@ fn handle_request(
         body: file,
       )
     }
-    _ ->
+    _method, _path ->
       response.new(404)
       |> response.set_body(ewe.Empty)
+  }
+}
+
+fn echo_chunked(
+  request: request.Request(ewe.Connection),
+  acc: bytes_tree.BytesTree,
+) -> response.Response(ewe.Body) {
+  case ewe.read_body_chunk(request, max_chunk_bytes: 4096, limit: 10_000_000) {
+    Ok(ewe.Chunk(data, request)) ->
+      echo_chunked(request, bytes_tree.append(acc, data))
+    Ok(ewe.Done(_request)) ->
+      response.new(200) |> response.set_body(ewe.Bytes(acc))
+    Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
   }
 }

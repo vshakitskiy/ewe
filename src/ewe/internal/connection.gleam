@@ -1,6 +1,5 @@
 import gleam/bytes_tree
 import gleam/erlang/process
-import glisten/internal/handler
 import glisten/socket
 import glisten/transport
 
@@ -8,7 +7,7 @@ pub type Connection {
   Http1(
     transport: transport.Transport,
     socket: socket.Socket,
-    self: process.Subject(handler.Message(Message)),
+    self: process.Subject(Http1Signal),
     buffer: BitArray,
     framing: Framing,
     // Body bytes delivered to the caller so far, via `read_body_chunk`.
@@ -41,8 +40,14 @@ pub type File {
   FileMetadata(path: String, offset: Int, length: Int)
 }
 
+/// Out-of-band events for a connection's own actor loop.
 pub type Message {
   Timeout
+}
+
+/// Sent by `http1.gleam` to a request's own private subject, drained
+/// synchronously within the same `http1.handle_message` call
+pub type Http1Signal {
   /// Sent by `http1.read_body` and `http1.read_body_chunk` to themselves
   /// once the request body has been fully consumed, carrying whatever bytes
   /// came after it.
@@ -56,7 +61,7 @@ pub type Message {
   /// the connection can still resume draining from here instead of from the
   /// start of the body.
   BodyProgress(buffer: BitArray, read: Int, chunk_remaining: Int)
-  /// Sent by `http1.finish_chunk`/`http1.finish_response` to themselves once
+  /// Sent by `http1.finish_chunk` and `http1.finish_response` to themselves once
   /// a streamed response's terminator has been written.
   StreamFinished(keep_alive: Bool)
 }
@@ -66,7 +71,7 @@ pub type ResponseWriter {
   Http1Writer(
     transport: transport.Transport,
     socket: socket.Socket,
-    self: process.Subject(handler.Message(Message)),
+    self: process.Subject(Http1Signal),
     // `True` on HTTP/1.1. Frame each chunk with its hex size and a trailing
     // `0\r\n\r\n` terminator. 
     //

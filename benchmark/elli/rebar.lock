@@ -1,0 +1,8 @@
+{"1.2.0",
+[{<<"elli">>,{pkg,<<"elli">>,<<"3.3.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"elli">>, <<"089218762A7FF3D20AE81C8E911BD0F73EE4EE0ED85454226D1FC6B4FFF3B4F6">>}]},
+{pkg_hash_ext,[
+ {<<"elli">>, <<"698B13B33D05661DB9FE7EFCBA41B84825A379CCE86E486CF6AFF9285BE0CCF8">>}]}
+].

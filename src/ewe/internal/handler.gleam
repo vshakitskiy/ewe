@@ -5,7 +5,6 @@ import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
 import gleam/option
-import gleam/string
 import glisten
 import glisten/internal/handler
 import logging
@@ -60,19 +59,6 @@ pub fn loop(
     glisten.User(connection.Timeout) -> {
       logging.log(logging.Debug, "Connection idled for too long, closing.")
       glisten.stop()
-    }
-    // TODO: just use other subject brah
-    glisten.User(connection.BodyDrained(..))
-    | glisten.User(connection.BodyAbandoned)
-    | glisten.User(connection.BodyProgress(..))
-    | glisten.User(connection.StreamFinished(..)) -> {
-      logging.log(
-        logging.Critical,
-        "Web server loop received a message that should not be reached to the handler! That means there is a bug somewhere within the implementation. Please open an issue addressing the alert, thank you! https://github.com/vshakitskiy/ewe/issues/new\n\nMessage received: "
-          <> string.inspect(message),
-      )
-
-      glisten.continue(state)
     }
     glisten.Packet(data) ->
       case state {
