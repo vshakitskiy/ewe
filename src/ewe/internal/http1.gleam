@@ -53,7 +53,7 @@ pub fn handle_message(
       let self = process.new_subject()
 
       let body_connection =
-        connection.Http1(
+        connection.Http1Connection(
           transport: connection.transport,
           socket: connection.socket,
           self:,
@@ -67,7 +67,7 @@ pub fn handle_message(
         request.Request(
           method: head.method,
           headers: head.headers,
-          body: body_connection,
+          body: connection.Http1(body_connection),
           scheme:,
           host: head.host,
           port: head.port,
@@ -79,8 +79,7 @@ pub fn handle_message(
 
       let drained = drain_messages(self)
 
-      let #(buffer, body_drained) =
-        resolve_body(unsafe_to_http1_connection(body_connection), drained.body)
+      let #(buffer, body_drained) = resolve_body(body_connection, drained.body)
 
       let metadata =
         Metadata(..metadata, keep_alive: metadata.keep_alive && body_drained)
@@ -104,13 +103,13 @@ pub fn handle_message(
               }
             option.None, option.Some(Stream(handler: stream_handler, chunked:))
             -> {
-              connection.Http1Writer(
+              connection.Http1Writer(connection.Http1ResponseWriter(
                 transport: connection.transport,
                 socket: connection.socket,
                 self:,
                 chunked:,
                 keep_alive:,
-              )
+              ))
               |> stream_handler
 
               let stream_drained = drain_messages(self)
@@ -213,20 +212,8 @@ pub type BodyError {
   InvalidBody
 }
 
-pub type Connection {
-  Http1(
-    transport: transport.Transport,
-    socket: socket.Socket,
-    self: process.Subject(connection.Http1Signal),
-    buffer: BitArray,
-    framing: connection.Framing,
-    read: Int,
-    chunk_remaining: Int,
-  )
-}
-
-@external(erlang, "gleam_stdlib", "identity")
-pub fn unsafe_to_http1_connection(conn: connection.Connection) -> Connection
+pub type Connection =
+  connection.Http1Connection
 
 const body_read_timeout = 10_000
 
@@ -242,7 +229,14 @@ pub fn read_body(
   conn: Connection,
   limit: Int,
 ) -> Result(#(BitArray, List(#(String, String))), BodyError) {
-  let Http1(transport:, socket:, self:, buffer:, framing:, ..) = conn
+  let connection.Http1Connection(
+    transport:,
+    socket:,
+    self:,
+    buffer:,
+    framing:,
+    ..,
+  ) = conn
 
   case framing, consume_body(transport, socket, buffer, framing, limit) {
     _framing, Ok(#(body, trailers, leftover)) -> {
@@ -275,7 +269,8 @@ pub fn read_body_chunk(
   max_chunk_bytes max_chunk_bytes: Int,
   limit limit: Int,
 ) -> Result(ChunkRead, BodyError) {
-  let Http1(self:, buffer:, read:, chunk_remaining:, ..) = conn
+  let connection.Http1Connection(self:, buffer:, read:, chunk_remaining:, ..) =
+    conn
 
   case pull_chunk(conn, max_chunk_bytes, limit) {
     Ok(PulledChunk(data, next)) -> {
@@ -319,7 +314,8 @@ fn resolve_body(
     option.Some(connection.BodyDrained(leftover)) -> #(leftover, True)
     option.Some(connection.BodyAbandoned) -> #(<<>>, False)
     option.Some(connection.BodyProgress(buffer:, read:, chunk_remaining:)) ->
-      drain_remaining(Http1(..conn, buffer:, read:, chunk_remaining:))
+      connection.Http1Connection(..conn, buffer:, read:, chunk_remaining:)
+      |> drain_remaining
     option.None -> drain_remaining(conn)
     option.Some(connection.StreamFinished(..)) ->
       panic as "drain_messages routes stream messages to the other slot"
@@ -359,7 +355,7 @@ fn do_drain_messages(
 // Drains whatever's left of `conn`'s body, up to `auto_drain_limit` more bytes 
 // past however much has already been read.
 fn drain_remaining(conn: Connection) -> #(BitArray, Bool) {
-  let Http1(read:, ..) = conn
+  let connection.Http1Connection(read:, ..) = conn
   do_drain_remaining(conn, read + auto_drain_limit)
 }
 
@@ -492,7 +488,8 @@ fn pull_chunk(
   max_chunk_bytes: Int,
   limit: Int,
 ) -> Result(Pulled, BodyError) {
-  let Http1(buffer:, framing:, read:, chunk_remaining:, ..) = conn
+  let connection.Http1Connection(buffer:, framing:, read:, chunk_remaining:, ..) =
+    conn
 
   case framing {
     connection.NoBody -> Ok(PulledDone([], buffer))
@@ -514,7 +511,7 @@ fn pull_fixed_chunk(
   read: Int,
   max_chunk_bytes: Int,
 ) -> Result(Pulled, ParseError) {
-  let Http1(transport:, socket:, buffer:, ..) = conn
+  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
 
   case length - read {
     0 -> Ok(PulledDone([], buffer))
@@ -526,7 +523,9 @@ fn pull_fixed_chunk(
         buffer,
         want,
       ))
-      Ok(PulledChunk(data, Http1(..conn, buffer: leftover, read: read + want)))
+      let conn =
+        connection.Http1Connection(..conn, buffer: leftover, read: read + want)
+      Ok(PulledChunk(data, conn))
     }
   }
 }
@@ -541,7 +540,7 @@ fn pull_chunked_chunk(
   chunk_remaining: Int,
   max_chunk_bytes: Int,
 ) -> Result(Pulled, ParseError) {
-  let Http1(transport:, socket:, buffer:, ..) = conn
+  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
 
   case chunk_remaining {
     0 -> {
@@ -563,7 +562,8 @@ fn pull_chunked_chunk(
         }
         size if read + size > limit -> Error(ChunkTooLarge)
         size ->
-          take_chunk_slice(Http1(..conn, buffer:), read, size, max_chunk_bytes)
+          connection.Http1Connection(..conn, buffer:)
+          |> take_chunk_slice(read, size, max_chunk_bytes)
       }
     }
     remaining -> take_chunk_slice(conn, read, remaining, max_chunk_bytes)
@@ -576,7 +576,7 @@ fn take_chunk_slice(
   chunk_remaining: Int,
   max_chunk_bytes: Int,
 ) -> Result(Pulled, ParseError) {
-  let Http1(transport:, socket:, buffer:, ..) = conn
+  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
 
   let want = int.min(chunk_remaining, max_chunk_bytes)
   let final_slice = want == chunk_remaining
@@ -586,15 +586,14 @@ fn take_chunk_slice(
     take_chunk_prefix(buffer, want, final_slice)
   })
 
-  Ok(PulledChunk(
-    data,
-    Http1(
+  let conn =
+    connection.Http1Connection(
       ..conn,
       buffer:,
       read: read + want,
       chunk_remaining: chunk_remaining - want,
-    ),
-  ))
+    )
+  Ok(PulledChunk(data, conn))
 }
 
 // Runs `step` against `buffer`, pulling more bytes from the socket only when
@@ -823,27 +822,8 @@ fn encode_stream(
 }
 
 /// How a streamed response writes its body chunks to the wire.
-pub type ResponseWriter {
-  ResponseWriter(
-    transport: transport.Transport,
-    socket: socket.Socket,
-    self: process.Subject(connection.Http1Signal),
-    // `True` on HTTP/1.1: frame each chunk with its hex size and a trailing
-    // `0\r\n\r\n` terminator. `False` on HTTP/1.0, which has no chunked
-    // encoding: write raw bytes and let the body end when the connection
-    // closes.
-    chunked: Bool,
-    // Whether the connection should stay alive once the stream finishes.
-    // Always `False` when `chunked` is `False`.
-    keep_alive: Bool,
-  )
-}
-
-// ResponseWriter and connection.ResponseWriter are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-pub fn unsafe_to_http1_writer(
-  writer: connection.ResponseWriter,
-) -> ResponseWriter
+pub type ResponseWriter =
+  connection.Http1ResponseWriter
 
 fn chunk_frame(chunk: BitArray) -> bytes_tree.BytesTree {
   bytes_tree.new()
@@ -1737,5 +1717,5 @@ fn list_to_bit_array(bytes: List(Int)) -> BitArray
 fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
 
 // Used only for bytes already proven valid UTF-8 elsewhere!!
-@external(erlang, "gleam_stdlib", "identity")
+@external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_string(bits: BitArray) -> String

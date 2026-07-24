@@ -4,7 +4,12 @@ import glisten/socket
 import glisten/transport
 
 pub type Connection {
-  Http1(
+  Http1(Http1Connection)
+  Http2
+}
+
+pub type Http1Connection {
+  Http1Connection(
     transport: transport.Transport,
     socket: socket.Socket,
     self: process.Subject(Http1Signal),
@@ -12,12 +17,11 @@ pub type Connection {
     framing: Framing,
     // Body bytes delivered to the caller so far, via `read_body_chunk`.
     read: Int,
-    // Bytes left in the chunked-encoding chunk currently being delivered;
+    // Bytes left in the chunked-encoding chunk currently being delivered.
     // 0 means the next pull starts at a chunk boundary. Unused for `Fixed`
     // and `NoBody`.
     chunk_remaining: Int,
   )
-  Http2
 }
 
 /// How to find the end of a request body on the wire, derived once from
@@ -45,30 +49,34 @@ pub type Message {
   Timeout
 }
 
-/// Sent by `http1.gleam` to a request's own private subject, drained
-/// synchronously within the same `http1.handle_message` call
+/// Sent to a http1 request's own subject, drained synchronously within the same 
+/// `http1.handle_message` call
 pub type Http1Signal {
-  /// Sent by `http1.read_body` and `http1.read_body_chunk` to themselves
-  /// once the request body has been fully consumed, carrying whatever bytes
-  /// came after it.
+  /// Sent by `http1.read_body` and `http1.read_body_chunk` to themselves once 
+  /// the request body has been fully consumed, carrying whatever bytes came 
+  /// after it.
   BodyDrained(leftover: BitArray)
-  /// Sent by `http1.read_body` and `http1.read_body_chunk` to themselves
-  /// when they gave up on the body part-way through, leaving the connection
-  /// in an unknown position.
+  /// Sent by `http1.read_body` and `http1.read_body_chunk` to themselves when 
+  /// they gave up on the body part way through, leaving the connection in an 
+  /// unknown position.
   BodyAbandoned
-  /// Sent by `http1.read_body_chunk` to itself after every chunk it
-  /// delivers, so that if the caller stops reading before `BodyDrained`,
-  /// the connection can still resume draining from here instead of from the
-  /// start of the body.
+  /// Sent by `http1.read_body_chunk` to itself after every chunk it delivers, 
+  /// so that if the caller stops reading before `BodyDrained`, the connection 
+  /// can still resume draining from here instead of from the start of the body.
   BodyProgress(buffer: BitArray, read: Int, chunk_remaining: Int)
-  /// Sent by `http1.finish_chunk` and `http1.finish_response` to themselves once
-  /// a streamed response's terminator has been written.
+  /// Sent by `http1.finish_chunk` and `http1.finish_response` to themselves 
+  /// once a streamed response's terminator has been written.
   StreamFinished(keep_alive: Bool)
 }
 
 /// How a streamed response writes its body chunks to the wire.
 pub type ResponseWriter {
-  Http1Writer(
+  Http1Writer(Http1ResponseWriter)
+  Http2Writer
+}
+
+pub type Http1ResponseWriter {
+  Http1ResponseWriter(
     transport: transport.Transport,
     socket: socket.Socket,
     self: process.Subject(Http1Signal),
@@ -82,5 +90,4 @@ pub type ResponseWriter {
     // `False` when `chunked` is `False`.
     keep_alive: Bool,
   )
-  Http2Writer
 }

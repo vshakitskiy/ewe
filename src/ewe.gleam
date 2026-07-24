@@ -40,23 +40,30 @@ pub type IpAddress {
 }
 
 pub fn ip_address_to_string(address: IpAddress) -> String {
-  unsafe_to_internal_ip_address(address)
+  to_internal_ip_address(address)
   |> glisten.ip_address_to_string
 }
 
-// IpAddress and glisten.IpAddress are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_to_internal_ip_address(address: IpAddress) -> glisten.IpAddress
+fn to_internal_ip_address(address: IpAddress) -> glisten.IpAddress {
+  case address {
+    IpV4(a, b, c, d) -> glisten.IpV4(a, b, c, d)
+    IpV6(a, b, c, d, e, f, g, h) -> glisten.IpV6(a, b, c, d, e, f, g, h)
+  }
+}
 
-// IpAddress and options.IpAddress are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_internal_options_ip_address(
-  address: options.IpAddress,
-) -> IpAddress
+fn from_internal_options_ip_address(address: options.IpAddress) -> IpAddress {
+  case address {
+    options.IpV4(a, b, c, d) -> IpV4(a, b, c, d)
+    options.IpV6(a, b, c, d, e, f, g, h) -> IpV6(a, b, c, d, e, f, g, h)
+  }
+}
 
-// glisten.IpAddress and IpAddress are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_internal_ip_address(address: glisten.IpAddress) -> IpAddress
+fn from_internal_ip_address(address: glisten.IpAddress) -> IpAddress {
+  case address {
+    glisten.IpV4(a, b, c, d) -> IpV4(a, b, c, d)
+    glisten.IpV6(a, b, c, d, e, f, g, h) -> IpV6(a, b, c, d, e, f, g, h)
+  }
+}
 
 /// The address a socket is bound to, or the address of a connected peer.
 pub type SocketAddress {
@@ -68,10 +75,7 @@ pub type SocketAddress {
 fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
   case address {
     glisten.TcpSocketAddress(port:, ip_address:) ->
-      TcpSocketAddress(
-        ip_address: unsafe_from_internal_ip_address(ip_address),
-        port:,
-      )
+      TcpSocketAddress(ip_address: from_internal_ip_address(ip_address), port:)
     glisten.UnixSocketAddress(path:) -> UnixSocketAddress(path:)
   }
 }
@@ -80,13 +84,13 @@ fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
 /// the socket information is unavailable.
 pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
   case connection {
-    connection.Http1(transport:, socket:, ..) -> {
-      let peername = transport.peername(transport, socket)
+    connection.Http1(connection) -> {
+      let peername = transport.peername(connection.transport, connection.socket)
       use info <- result.map(over: peername)
 
       case info {
         socket.TcpSockName(ip_address:, port:) ->
-          unsafe_from_internal_options_ip_address(ip_address)
+          from_internal_options_ip_address(ip_address)
           |> TcpSocketAddress(port:)
         socket.UnixSockName(path:) -> UnixSocketAddress(path:)
       }
@@ -128,9 +132,14 @@ pub type TlsKeyType {
   PrivateKeyInfo
 }
 
-// TlsKeyType and options.TlsKeyType are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType
+fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
+  case key_type {
+    RsaPrivateKey -> options.RsaPrivateKey
+    EcPrivateKey -> options.EcPrivateKey
+    DsaPrivateKey -> options.DsaPrivateKey
+    PrivateKeyInfo -> options.PrivateKeyInfo
+  }
+}
 
 /// Contains all server configurations, can be adjusted by different builder
 /// functions.
@@ -283,7 +292,7 @@ pub fn quiet(builder: Builder) -> Builder {
 }
 
 // Body and connection.Body are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
+@external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_internal_response(
   response: response.Response(Body),
 ) -> response.Response(connection.Body)
@@ -313,7 +322,7 @@ pub fn start(
       glisten.with_tls_der(
         pool,
         cert:,
-        key_type: unsafe_to_internal_tls_key_type(key_type),
+        key_type: to_internal_tls_key_type(key_type),
         key:,
       )
     None -> pool
@@ -363,9 +372,16 @@ pub type FileError {
   InvalidLimit
 }
 
-// FileError and file.FileError are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_internal_file_error(error: file.FileError) -> FileError
+fn from_internal_file_error(error: file.FileError) -> FileError {
+  case error {
+    file.NotFound -> NotFound
+    file.IsDirectory -> IsDirectory
+    file.AccessDenied -> AccessDenied
+    file.UnknownError -> UnknownError
+    file.InvalidOffset -> InvalidOffset
+    file.InvalidLimit -> InvalidLimit
+  }
+}
 
 /// Prepares a file to be streamed as a response body. `offset` and `limit` in 
 /// bytes let you serve a byte range from the file. leave either as `None` to 
@@ -377,7 +393,7 @@ pub fn file(
 ) -> Result(Body, FileError) {
   case file.resolve(path, offset, limit) {
     Ok(file) -> Ok(File(file))
-    Error(error) -> Error(unsafe_from_internal_file_error(error))
+    Error(error) -> Error(from_internal_file_error(error))
   }
 }
 
@@ -389,9 +405,12 @@ pub type BodyError {
   InvalidBody
 }
 
-// BodyError and http1.BodyError are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_internal_body_error(error: http1.BodyError) -> BodyError
+fn from_internal_http1_body_error(error: http1.BodyError) -> BodyError {
+  case error {
+    http1.BodyTooLarge -> BodyTooLarge
+    http1.InvalidBody -> InvalidBody
+  }
+}
 
 /// Reads the entire request body into memory, up to `limit` bytes. For a 
 /// chunked request, any trailer fields are appended to the returned request's 
@@ -401,10 +420,10 @@ pub fn read_body(
   limit limit: Int,
 ) -> Result(request.Request(BitArray), BodyError) {
   case req.body {
-    connection.Http1(..) -> {
+    connection.Http1(connection) -> {
       use #(body, trailers) <- result.try(
-        http1.read_body(http1.unsafe_to_http1_connection(req.body), limit)
-        |> result.map_error(unsafe_from_internal_body_error),
+        http1.read_body(connection, limit)
+        |> result.map_error(from_internal_http1_body_error),
       )
 
       request.Request(..req, headers: list.append(req.headers, trailers), body:)
@@ -413,10 +432,6 @@ pub fn read_body(
     connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
   }
 }
-
-// http1.Connection and connection.Connection are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_http1_connection(conn: http1.Connection) -> Connection
 
 /// The result of one `read_body_chunk` call.
 pub type ReadEvent {
@@ -436,18 +451,17 @@ pub fn read_body_chunk(
   limit limit: Int,
 ) -> Result(ReadEvent, BodyError) {
   case req.body {
-    connection.Http1(..) -> {
-      let conn = http1.unsafe_to_http1_connection(req.body)
-      case http1.read_body_chunk(conn, max_chunk_bytes:, limit:) {
+    connection.Http1(connection) -> {
+      case http1.read_body_chunk(connection, max_chunk_bytes:, limit:) {
         Ok(http1.Chunk(data, connection)) -> {
-          let body = unsafe_from_http1_connection(connection)
+          let body = connection.Http1(connection)
           Ok(Chunk(data, request.set_body(req, body)))
         }
         Ok(http1.Done(trailers)) -> {
           let headers = list.append(req.headers, trailers)
           Ok(Done(request.Request(..req, headers:, body: Nil)))
         }
-        Error(error) -> Error(unsafe_from_internal_body_error(error))
+        Error(error) -> Error(from_internal_http1_body_error(error))
       }
     }
     connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
@@ -458,10 +472,6 @@ pub fn read_body_chunk(
 /// `stream_response`.
 pub type ResponseWriter =
   connection.ResponseWriter
-
-// http1.ResponseWriter and ResponseWriter are structurally identical.
-@external(erlang, "gleam_stdlib", "identity")
-fn unsafe_from_http1_writer(writer: http1.ResponseWriter) -> ResponseWriter
 
 /// Starts a streamed response. `handler` must end by calling `finish_chunk` or
 /// `finish_response` on it, since that's what closes the stream.
@@ -477,9 +487,8 @@ pub fn stream_response(
 /// stream in the same round trip.
 pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
   case writer {
-    connection.Http1Writer(..) ->
-      http1.send_chunk(http1.unsafe_to_http1_writer(writer), chunk)
-      |> unsafe_from_http1_writer
+    connection.Http1Writer(writer) ->
+      connection.Http1Writer(http1.send_chunk(writer, chunk))
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -487,8 +496,7 @@ pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
 /// Sends `chunk` as the final response body chunk and closes the stream.
 pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
   case writer {
-    connection.Http1Writer(..) ->
-      http1.finish_chunk(http1.unsafe_to_http1_writer(writer), chunk)
+    connection.Http1Writer(writer) -> http1.finish_chunk(writer, chunk)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -497,8 +505,7 @@ pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
 /// there's one last chunk to send.
 pub fn finish_response(writer: ResponseWriter) -> Nil {
   case writer {
-    connection.Http1Writer(..) ->
-      http1.finish_response(http1.unsafe_to_http1_writer(writer))
+    connection.Http1Writer(writer) -> http1.finish_response(writer)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }

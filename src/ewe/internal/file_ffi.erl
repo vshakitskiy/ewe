@@ -13,8 +13,6 @@ stat(Path) ->
     {error, _Reason} -> {error, unknown_error}
   end.
 
-%% the kernel streams the file straight to the socket without passing through
-%% userspace memory.
 sendfile(Fd, Socket, Offset, Bytes) ->
   case file:sendfile(Fd, Socket, Offset, Bytes, []) of
     {ok, _Sent} -> {ok, nil};

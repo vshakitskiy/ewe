@@ -1,6 +1,9 @@
 -module(ewe_ffi).
 
--export([now_datetime/0, set_http_date/1, get_http_date/0]).
+-export([identity/1, now_datetime/0, set_http_date/1, get_http_date/0]).
+
+identity(X) ->
+  X.
 
 now_datetime() ->
   {Date, Time} = calendar:universal_time(),
