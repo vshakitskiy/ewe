@@ -55,48 +55,30 @@ pub fn loop(
   message: glisten.Message(connection.Message),
   connection: glisten.Connection(connection.Message),
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {
-  case message {
-    glisten.User(connection.Timeout) -> {
-      logging.log(logging.Debug, "Connection idled for too long, closing.")
-      glisten.stop()
-    }
-    glisten.Packet(data) ->
-      case state {
-        Initialised(handler:, buffer:, idle_timer:) -> {
-          case idle_timer {
-            option.Some(timer) -> process.cancel_timer(timer)
-            option.None -> process.TimerNotFound
-          }
+  case state, message {
+    Initialised(handler:, buffer:, idle_timer:), glisten.Packet(data) -> {
+      case idle_timer {
+        option.Some(timer) -> process.cancel_timer(timer)
+        option.None -> process.TimerNotFound
+      }
 
-          let buffer = <<buffer:bits, data:bits>>
-          case sniff_preface(buffer) {
-            NeedMoreData -> {
-              let timer =
-                process.send_after(
-                  connection.subject,
-                  idle_timeout,
-                  handler.User(connection.Timeout),
-                )
+      let buffer = <<buffer:bits, data:bits>>
+      case sniff_preface(buffer) {
+        NeedMoreData -> {
+          let timer =
+            process.send_after(
+              connection.subject,
+              idle_timeout,
+              handler.User(connection.Timeout),
+            )
 
-              Initialised(handler:, buffer:, idle_timer: option.Some(timer))
-              |> glisten.continue
-            }
-            Http2Preface(_remaining) -> glisten.continue(Http2)
-            NotHttp2(buffer:) -> {
-              let next =
-                http1.State(handler:, buffer:, idle_timer: option.None)
-                |> http1.handle_message(connection)
-
-              case next {
-                http1.Continue(state) -> glisten.continue(Http1(state))
-                http1.Close -> glisten.stop()
-              }
-            }
-          }
+          Initialised(handler:, buffer:, idle_timer: option.Some(timer))
+          |> glisten.continue
         }
-        Http1(state) -> {
+        Http2Preface(_remaining) -> glisten.continue(Http2)
+        NotHttp2(buffer:) -> {
           let next =
-            http1.State(..state, buffer: <<state.buffer:bits, data:bits>>)
+            http1.State(handler:, buffer:, idle_timer: option.None)
             |> http1.handle_message(connection)
 
           case next {
@@ -104,8 +86,23 @@ pub fn loop(
             http1.Close -> glisten.stop()
           }
         }
-        Http2(..) -> todo as "HTTP/2 connection handling not implemented yet"
       }
+    }
+    Http1(state), glisten.Packet(data) -> {
+      let next =
+        http1.State(..state, buffer: <<state.buffer:bits, data:bits>>)
+        |> http1.handle_message(connection)
+
+      case next {
+        http1.Continue(state) -> glisten.continue(Http1(state))
+        http1.Close -> glisten.stop()
+      }
+    }
+    Http2(..), glisten.Packet(_) -> todo as "HTTP/2 is not implemented yet!"
+    _, glisten.User(connection.Timeout) -> {
+      logging.log(logging.Debug, "Connection idled for too long, closing.")
+      glisten.stop()
+    }
   }
 }
 

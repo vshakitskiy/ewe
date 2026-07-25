@@ -87,22 +87,21 @@ pub fn handle_message(
       let sent = case
         encode_response(response, head.method, head.version, metadata)
       {
-        Ok(Encoded(bytes:, keep_alive:, file: file_body, stream:)) -> {
+        Ok(Encoded(bytes:, keep_alive:, remainder:)) -> {
           use Nil <- result.try(transport.send(
             connection.transport,
             connection.socket,
             bytes,
           ))
 
-          case file_body, stream {
-            option.None, option.None -> Ok(keep_alive)
-            option.Some(data), option.None ->
+          case remainder {
+            NoRemainder -> Ok(keep_alive)
+            RemainderFile(data) ->
               case file.send(connection.transport, connection.socket, data) {
                 Ok(Nil) -> Ok(keep_alive)
                 Error(reason) -> Error(reason)
               }
-            option.None, option.Some(Stream(handler: stream_handler, chunked:))
-            -> {
+            RemainderStream(Stream(handler: stream_handler, chunked:)) -> {
               connection.Http1Writer(connection.Http1ResponseWriter(
                 transport: connection.transport,
                 socket: connection.socket,
@@ -139,13 +138,11 @@ pub fn handle_message(
                 option.Some(connection.BodyDrained(..))
                 | option.Some(connection.BodyAbandoned)
                 | option.Some(connection.BodyProgress(..)) ->
-                  panic as "drain_messages routes body messages to the other slot"
+                  panic as "drain_messages stores body messages in the other field"
               }
 
               Ok(keep_alive && stream_keep_alive)
             }
-            option.Some(_file), option.Some(_stream) ->
-              panic as "encode_response never sets both file and stream"
           }
         }
         Error(UnsafeHeader(name)) -> {
@@ -318,7 +315,7 @@ fn resolve_body(
       |> drain_remaining
     option.None -> drain_remaining(conn)
     option.Some(connection.StreamFinished(..)) ->
-      panic as "drain_messages routes stream messages to the other slot"
+      panic as "drain_messages stores stream messages in the other field"
   }
 }
 
@@ -696,24 +693,39 @@ fn initial_encode_state() -> EncodeState {
   EncodeState(tree: bytes_tree.new(), force_close: False)
 }
 
-/// A `Streaming` body's handler, plus whether its chunks get
+/// A `Streaming` body's handler, plus whether its chunks get 
 /// `Transfer-Encoding: chunked` framing (HTTP/1.1) or written raw
-/// (HTTP/1.0, which has no chunked encoding).
+/// (so HTTP/1.0, which has no chunked encoding).
 pub type Stream {
   Stream(handler: fn(connection.ResponseWriter) -> Nil, chunked: Bool)
 }
 
+/// What's left to send after `Encoded.bytes`, if anything. Neither variant is
+/// loaded into `bytes`, so the caller still has to handle it separately.
+pub type Remainder {
+  NoRemainder
+  RemainderFile(connection.File)
+  RemainderStream(Stream)
+}
+
 /// The result of encoding a response. `bytes` is ready for a single
-/// `transport.send`. `file` and `stream`, when present, still need handling
-/// separately since neither is loaded into `bytes`; `encode_response` never
-/// sets both.
+/// `transport.send`; `remainder` is whatever still needs sending after that.
 pub type Encoded {
-  Encoded(
-    bytes: bytes_tree.BytesTree,
-    keep_alive: Bool,
-    file: option.Option(connection.File),
-    stream: option.Option(Stream),
-  )
+  Encoded(bytes: bytes_tree.BytesTree, keep_alive: Bool, remainder: Remainder)
+}
+
+// Assembles the status line, `Date`, and `Connection` headers shared by
+// every response head. Callers append their own framing header, if any, and
+// the blank-line terminator.
+fn build_head(
+  state: EncodeState,
+  status: Int,
+  keep_alive: Bool,
+) -> bytes_tree.BytesTree {
+  state.tree
+  |> append_date()
+  |> append_connection(keep_alive)
+  |> bytes_tree.prepend(status_line(status))
 }
 
 /// Builds the response as a `BytesTree`. `Bytes`, `Text` and `Empty` bodies
@@ -735,34 +747,27 @@ pub fn encode_response(
     _other_body -> {
       let length = body_length(response.body)
       let head =
-        state.tree
-        |> append_date()
-        |> append_connection(keep_alive)
-        |> bytes_tree.prepend(status_line(response.status))
+        build_head(state, response.status, keep_alive)
         |> bytes_tree.append_string("content-length: " <> int.to_string(length))
         |> bytes_tree.append(<<"\r\n\r\n":utf8>>)
 
       case method, response.body {
-        http.Head, _body ->
-          Ok(Encoded(head, keep_alive, option.None, option.None))
+        http.Head, _body -> Ok(Encoded(head, keep_alive, NoRemainder))
         _method, connection.File(data) ->
-          Ok(Encoded(head, keep_alive, option.Some(data), option.None))
+          Ok(Encoded(head, keep_alive, RemainderFile(data)))
         _method, connection.Bytes(tree) ->
           Ok(Encoded(
             bytes_tree.append_tree(head, tree),
             keep_alive,
-            option.None,
-            option.None,
+            NoRemainder,
           ))
         _method, connection.Text(text) ->
           Ok(Encoded(
             bytes_tree.append_string(head, text),
             keep_alive,
-            option.None,
-            option.None,
+            NoRemainder,
           ))
-        _method, connection.Empty ->
-          Ok(Encoded(head, keep_alive, option.None, option.None))
+        _method, connection.Empty -> Ok(Encoded(head, keep_alive, NoRemainder))
         _method, connection.Streaming(..) ->
           panic as "the Streaming body is handled above"
       }
@@ -786,36 +791,24 @@ fn encode_stream(
   case version {
     Http11 -> {
       let head =
-        state.tree
-        |> append_date()
-        |> append_connection(keep_alive)
-        |> bytes_tree.prepend(status_line(response.status))
+        build_head(state, response.status, keep_alive)
         |> bytes_tree.append_string("transfer-encoding: chunked")
         |> bytes_tree.append(<<"\r\n\r\n":utf8>>)
 
       case method {
-        http.Head -> Encoded(head, keep_alive, option.None, option.None)
+        http.Head -> Encoded(head, keep_alive, NoRemainder)
         _method ->
-          Encoded(
-            head,
-            keep_alive,
-            option.None,
-            option.Some(Stream(handler, True)),
-          )
+          Encoded(head, keep_alive, RemainderStream(Stream(handler, True)))
       }
     }
     Http10 -> {
       let head =
-        state.tree
-        |> append_date()
-        |> append_connection(False)
-        |> bytes_tree.prepend(status_line(response.status))
+        build_head(state, response.status, False)
         |> bytes_tree.append(<<"\r\n":utf8>>)
 
       case method {
-        http.Head -> Encoded(head, False, option.None, option.None)
-        _method ->
-          Encoded(head, False, option.None, option.Some(Stream(handler, False)))
+        http.Head -> Encoded(head, False, NoRemainder)
+        _method -> Encoded(head, False, RemainderStream(Stream(handler, False)))
       }
     }
   }
