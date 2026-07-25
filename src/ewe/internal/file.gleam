@@ -15,8 +15,6 @@ pub type FileError {
   InvalidLimit
 }
 
-/// Stats `path` and validates `offset` and `limit` against its size, producing
-/// wire-agnostic metadata.
 pub fn resolve(
   path: String,
   offset: option.Option(Int),
@@ -39,9 +37,6 @@ pub fn resolve(
   }
 }
 
-/// Streams a resolved file straight to the wire. TLS payloads must pass 
-/// through userspace to be encrypted, so they're read and sent in fixed-size 
-/// chunks instead.
 pub fn send(
   transport: transport.Transport,
   socket: socket.Socket,

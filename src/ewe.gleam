@@ -31,7 +31,7 @@ pub type Body {
   Text(String)
   Empty
   File(connection.File)
-  Streaming(handler: fn(ResponseWriter) -> Nil)
+  Streaming(connection.Streaming)
 }
 
 pub type IpAddress {
@@ -479,7 +479,7 @@ pub fn stream_response(
   response: response.Response(a),
   handler: fn(ResponseWriter) -> Nil,
 ) -> response.Response(Body) {
-  response.set_body(response, Streaming(handler))
+  response.set_body(response, Streaming(connection.StreamingMetadata(handler)))
 }
 
 /// Sends one response body chunk, threading the writer through so it can be

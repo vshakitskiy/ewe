@@ -32,6 +32,12 @@ pub const idle_timeout = 10_000
 pub type Next {
   Continue(State)
   Close
+  CloseAbnormal(reason: String)
+}
+
+type Sent {
+  Sent(keep_alive: Bool)
+  SentAbnormal(reason: String)
 }
 
 pub fn handle_message(
@@ -95,10 +101,10 @@ pub fn handle_message(
           ))
 
           case remainder {
-            NoRemainder -> Ok(keep_alive)
+            NoRemainder -> Ok(Sent(keep_alive))
             RemainderFile(data) ->
               case file.send(connection.transport, connection.socket, data) {
-                Ok(Nil) -> Ok(keep_alive)
+                Ok(Nil) -> Ok(Sent(keep_alive))
                 Error(reason) -> Error(reason)
               }
             RemainderStream(Stream(handler: stream_handler, chunked:)) -> {
@@ -116,11 +122,6 @@ pub fn handle_message(
                 option.Some(connection.StreamFinished(keep_alive:)) ->
                   keep_alive
                 option.None -> {
-                  // The handler never called finish_chunk or finish_response.
-                  // Every chunk sent so far already closed its own framing,
-                  // so writing the terminator now still leaves the wire in
-                  // a valid state... But the connection can't be trusted
-                  // enough to reuse, so it closes regardless.
                   case chunked {
                     True -> {
                       let _ =
@@ -141,7 +142,19 @@ pub fn handle_message(
                   panic as "drain_messages stores body messages in the other field"
               }
 
-              Ok(keep_alive && stream_keep_alive)
+              Ok(Sent(keep_alive && stream_keep_alive))
+            }
+            RemainderSse(handler: sse_handler) -> {
+              let sse_connection =
+                connection.Http1Sse(connection.Http1SseConnection(
+                  transport: connection.transport,
+                  socket: connection.socket,
+                ))
+
+              case sse_handler(sse_connection) {
+                connection.Stopped -> Ok(Sent(False))
+                connection.StoppedAbnormal(reason:) -> Ok(SentAbnormal(reason))
+              }
             }
           }
         }
@@ -157,12 +170,12 @@ pub fn handle_message(
             internal_server_error(),
           ))
 
-          Ok(False)
+          Ok(Sent(False))
         }
       }
 
       case sent {
-        Ok(True) -> {
+        Ok(Sent(True)) -> {
           let timer =
             process.send_after(
               connection.subject,
@@ -173,7 +186,8 @@ pub fn handle_message(
           State(..state, buffer:, idle_timer: option.Some(timer))
           |> Continue
         }
-        Ok(False) -> Close
+        Ok(Sent(False)) -> Close
+        Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
         Error(_reason) -> Close
       }
     }
@@ -198,14 +212,8 @@ pub fn handle_message(
   }
 }
 
-/// Errors from consuming a request body via `read_body`.
 pub type BodyError {
-  /// A `Fixed` body's declared length alone exceeds `limit`, so nothing was
-  /// read; or a `Chunked` body's running total went over `limit` mid-stream,
-  /// so the connection is no longer reusable.
   BodyTooLarge
-  /// The body couldn't be fully read off the socket: closed, timed out, or
-  /// malformed chunked framing.
   InvalidBody
 }
 
@@ -214,14 +222,8 @@ pub type Connection =
 
 const body_read_timeout = 10_000
 
-// Cap for auto draining a body the handler never read, so the connection can
-// still be reused for the next request. Bodies bigger than this force a
-// close instead of an unbounded drain.
 const auto_drain_limit = 1_048_576
 
-/// Reads the entire request body into memory, up to `limit` bytes, along with
-/// any chunked trailer fields. Blocks until the full body has arrived. 
-/// `Fixed` and `NoBody` requests never have trailers.
 pub fn read_body(
   conn: Connection,
   limit: Int,
@@ -248,19 +250,11 @@ pub fn read_body(
   }
 }
 
-/// The result of one `read_body_chunk` call.
 pub type ChunkRead {
-  /// `max_chunk_bytes` of body data. Feed `connection` into the next call.
   Chunk(data: BitArray, connection: Connection)
-  /// The body is fully consumed. Carries any chunked trailer fields. `Fixed` 
-  /// and `NoBody` requests never have trailers.
   Done(trailers: List(#(String, String)))
 }
 
-/// Pulls up to `max_chunk_bytes` of body per call instead of buffering the 
-/// whole body, capped overall at `limit`. Feed the connection carried by 
-/// `Chunk` into the next call. Ends with `Done` once the body, and any chunked 
-/// trailers, are fully consumed.
 pub fn read_body_chunk(
   conn: Connection,
   max_chunk_bytes max_chunk_bytes: Int,
@@ -289,20 +283,8 @@ pub fn read_body_chunk(
   }
 }
 
-// Cap on how much is pulled off the wire per step while blind draining an 
-// abandoned body. Unrelated to any caller supplied `max_chunk_bytes`.
 const auto_drain_chunk_bytes = 65_536
 
-// Reconciles what the handler did with the request body so the connection can
-// be safely reused. Replays whatever `read_body`/`read_body_chunk` last
-// reported about themselves via a message to `conn.self`, drained by
-// `drain_messages` into `drained.body`:
-// - `BodyDrained`: the body was fully consumed, use its leftover directly.
-// - `BodyAbandoned`: the read failed mid-body, the connection can't be reused.
-// - `BodyProgress` or nothing at all: the handler stopped reading or never
-//   started, so drain whatever's left from that point, up to `auto_drain_limit`
-//   more bytes, so a well behaved client isn't punished with a dropped
-//   connection just because the handler didn't care about its body.
 fn resolve_body(
   conn: Connection,
   drained: option.Option(connection.Http1Signal),
@@ -319,10 +301,6 @@ fn resolve_body(
   }
 }
 
-// The latest body read and response stream outcome messages currently queued
-// for a request's own private subject, drained in one pass so a handler that
-// both reads a request body and streams a response doesn't lose one outcome
-// to the other.
 type Drained {
   Drained(
     body: option.Option(connection.Http1Signal),
@@ -330,8 +308,6 @@ type Drained {
   )
 }
 
-// Selectively receives every message already queued for `self`, keeping only
-// the last one of each kind.
 fn drain_messages(self: process.Subject(connection.Http1Signal)) -> Drained {
   do_drain_messages(self, Drained(body: option.None, stream: option.None))
 }
@@ -349,8 +325,6 @@ fn do_drain_messages(
   }
 }
 
-// Drains whatever's left of `conn`'s body, up to `auto_drain_limit` more bytes 
-// past however much has already been read.
 fn drain_remaining(conn: Connection) -> #(BitArray, Bool) {
   let connection.Http1Connection(read:, ..) = conn
   do_drain_remaining(conn, read + auto_drain_limit)
@@ -364,9 +338,6 @@ fn do_drain_remaining(conn: Connection, limit: Int) -> #(BitArray, Bool) {
   }
 }
 
-// Consumes exactly the declared body from `buffer`, pulling more from the 
-// socket as needed, and splits off whatever comes right after it, along with
-// any chunked trailer fields.
 fn consume_body(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -393,9 +364,6 @@ fn to_body_result(result: Result(a, ParseError)) -> Result(a, BodyError) {
   }
 }
 
-// A `Content-Length` body. Whatever's missing beyond `buffer` is read in a
-// single exact size call, since the socket blocks until exactly that many
-// bytes arrive or the connection drops.
 fn read_fixed(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -420,9 +388,6 @@ fn read_fixed(
   }
 }
 
-// A `Transfer-Encoding: chunked` body. Each call advances by one chunk or 
-// trailers, pulling more from the socket only for whichever piece is currently 
-// short.
 fn read_chunked(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -471,15 +436,11 @@ fn read_chunked(
   }
 }
 
-// The result of pulling one step of a streamed body.
 type Pulled {
   PulledChunk(data: BitArray, connection: Connection)
   PulledDone(trailers: List(#(String, String)), leftover: BitArray)
 }
 
-// Pulls at most `max_chunk_bytes` of body off `conn`, capped overall at `limit`. 
-// Mirrors `consume_body`, but advances by one bounded slice instead of reading 
-// the whole declared body.
 fn pull_chunk(
   conn: Connection,
   max_chunk_bytes: Int,
@@ -499,9 +460,6 @@ fn pull_chunk(
   }
 }
 
-// A `Content-Length` body. Takes `min(remaining, max_chunk_bytes)`, since 
-// there's no wire framing inside the payload itself to bound a single pull to 
-// less than that.
 fn pull_fixed_chunk(
   conn: Connection,
   length: Int,
@@ -527,9 +485,6 @@ fn pull_fixed_chunk(
   }
 }
 
-// A `Transfer-Encoding: chunked` body. At a chunk boundary, parses the next
-// chunk-size line or the trailer section. Otherwise resumes taking a bounded 
-// slice out of the chunk already in progress.
 fn pull_chunked_chunk(
   conn: Connection,
   limit: Int,
@@ -593,8 +548,6 @@ fn take_chunk_slice(
   Ok(PulledChunk(data, conn))
 }
 
-// Runs `step` against `buffer`, pulling more bytes from the socket only when
-// `step` itself reports it's short.
 fn pull_until(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -624,8 +577,6 @@ fn parse_chunk_line(buffer: BitArray) -> Step(#(Int, BitArray)) {
   StepDone(#(size, remaining))
 }
 
-// Chunk-size lines may carry `;extensions`. Only the hex size before them 
-// matters here
 fn parse_chunk_size(line: BitArray) -> Step(Int) {
   case parse_hex_digits(line, 0, False) {
     Ok(size) -> StepDone(size)
@@ -646,10 +597,6 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
   }
 }
 
-// Takes `want` bytes off the front of a chunk's data. `final_slice` marks 
-// whether `want` reaches the end of the chunk, in which case the trailing CRLF 
-// is expected right after and consumed too. Otherwise `want` is just a prefix 
-// of a bigger chunk still being streamed across calls.
 fn take_chunk_prefix(
   buffer: BitArray,
   want: Int,
@@ -675,16 +622,10 @@ fn take_chunk_prefix(
   }
 }
 
-/// Errors that can occur while turning a handler's `response.Response` into 
-/// wire bytes.
 pub type EncodeError {
-  /// A header name or value contained a CR, LF, or NUL byte, which would let 
-  /// it inject a new header or terminate the header block early.
   UnsafeHeader(name: String)
 }
 
-// Threaded through the pass over `response.headers` with the tree built so far 
-// and whether the handler's own `connection` header asked to close.
 type EncodeState {
   EncodeState(tree: bytes_tree.BytesTree, force_close: Bool)
 }
@@ -693,45 +634,39 @@ fn initial_encode_state() -> EncodeState {
   EncodeState(tree: bytes_tree.new(), force_close: False)
 }
 
-/// A `Streaming` body's handler, plus whether its chunks get 
-/// `Transfer-Encoding: chunked` framing (HTTP/1.1) or written raw
-/// (so HTTP/1.0, which has no chunked encoding).
 pub type Stream {
   Stream(handler: fn(connection.ResponseWriter) -> Nil, chunked: Bool)
 }
 
-/// What's left to send after `Encoded.bytes`, if anything. Neither variant is
-/// loaded into `bytes`, so the caller still has to handle it separately.
 pub type Remainder {
   NoRemainder
   RemainderFile(connection.File)
   RemainderStream(Stream)
+  RemainderSse(handler: fn(connection.SseConnection) -> connection.Outcome)
 }
 
-/// The result of encoding a response. `bytes` is ready for a single
-/// `transport.send`; `remainder` is whatever still needs sending after that.
 pub type Encoded {
   Encoded(bytes: bytes_tree.BytesTree, keep_alive: Bool, remainder: Remainder)
 }
 
-// Assembles the status line, `Date`, and `Connection` headers shared by
-// every response head. Callers append their own framing header, if any, and
-// the blank-line terminator.
 fn build_head(
   state: EncodeState,
   status: Int,
   keep_alive: Bool,
 ) -> bytes_tree.BytesTree {
-  state.tree
-  |> append_date()
+  append_date(state.tree)
   |> append_connection(keep_alive)
   |> bytes_tree.prepend(status_line(status))
 }
 
-/// Builds the response as a `BytesTree`. `Bytes`, `Text` and `Empty` bodies
-/// are folded straight into it, so the whole response goes out in a single
-/// `transport.send`. A `Streaming` body's handler isn't run here -- like
-/// `File`, the caller runs it separately, only after sending `bytes`.
+fn close_delimited_head(
+  state: EncodeState,
+  status: Int,
+) -> bytes_tree.BytesTree {
+  build_head(state, status, False)
+  |> bytes_tree.append(<<"\r\n":utf8>>)
+}
+
 pub fn encode_response(
   response: response.Response(connection.Body),
   method: http.Method,
@@ -742,8 +677,10 @@ pub fn encode_response(
   let keep_alive = metadata.keep_alive && !state.force_close
 
   case response.body {
-    connection.Streaming(handler) ->
+    connection.Streaming(connection.StreamingMetadata(handler)) ->
       Ok(encode_stream(state, response, keep_alive, version, method, handler))
+    connection.Sse(connection.SseMetadata(handler)) ->
+      Ok(encode_sse(state, response, method, handler))
     _other_body -> {
       let length = body_length(response.body)
       let head =
@@ -770,16 +707,12 @@ pub fn encode_response(
         _method, connection.Empty -> Ok(Encoded(head, keep_alive, NoRemainder))
         _method, connection.Streaming(..) ->
           panic as "the Streaming body is handled above"
+        _method, connection.Sse(..) -> panic as "the Sse body is handled above"
       }
     }
   }
 }
 
-// Builds the head for a `Streaming` body: `Transfer-Encoding: chunked` on
-// HTTP/1.1, or a close-delimited body with no chunk framing on HTTP/1.0,
-// which has no chunked encoding. `HEAD` never gets a body, mirroring how
-// `encode_response` skips one for every other body type, so `handler` is
-// simply never run.
 fn encode_stream(
   state: EncodeState,
   response: response.Response(connection.Body),
@@ -802,9 +735,7 @@ fn encode_stream(
       }
     }
     Http10 -> {
-      let head =
-        build_head(state, response.status, False)
-        |> bytes_tree.append(<<"\r\n":utf8>>)
+      let head = close_delimited_head(state, response.status)
 
       case method {
         http.Head -> Encoded(head, False, NoRemainder)
@@ -814,7 +745,20 @@ fn encode_stream(
   }
 }
 
-/// How a streamed response writes its body chunks to the wire.
+fn encode_sse(
+  state: EncodeState,
+  response: response.Response(connection.Body),
+  method: http.Method,
+  handler: fn(connection.SseConnection) -> connection.Outcome,
+) -> Encoded {
+  let head = close_delimited_head(state, response.status)
+
+  case method {
+    http.Head -> Encoded(head, False, NoRemainder)
+    _method -> Encoded(head, False, RemainderSse(handler))
+  }
+}
+
 pub type ResponseWriter =
   connection.Http1ResponseWriter
 
@@ -826,9 +770,6 @@ fn chunk_frame(chunk: BitArray) -> bytes_tree.BytesTree {
   |> bytes_tree.append(<<"\r\n":utf8>>)
 }
 
-/// Sends one response body chunk. Framed as one `Transfer-Encoding: chunked`
-/// piece on HTTP/1.1, written raw otherwise. For the last chunk, use
-/// `finish_chunk` instead: it closes the stream in the same round trip.
 pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
   let bytes = case writer.chunked {
     True -> chunk_frame(chunk)
@@ -838,7 +779,6 @@ pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
   writer
 }
 
-/// Sends `chunk` as the final response body chunk and closes the stream.
 pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
   let bytes = case writer.chunked {
     True -> bytes_tree.append(chunk_frame(chunk), <<"0\r\n\r\n":utf8>>)
@@ -848,8 +788,6 @@ pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
   finish(writer)
 }
 
-/// Closes the stream with no further data. Use `finish_chunk` instead if
-/// there's one last chunk to send.
 pub fn finish_response(writer: ResponseWriter) -> Nil {
   case writer.chunked {
     True -> {
@@ -873,7 +811,6 @@ fn finish(writer: ResponseWriter) -> Nil {
   )
 }
 
-// Builds the header block.
 fn encode_headers(
   headers: List(#(String, String)),
 ) -> Result(EncodeState, EncodeError) {
@@ -906,8 +843,6 @@ fn encode_headers(
   }
 }
 
-// Fills in `Date` from the shared clock (RFC 9110 §6.6.1). The clock actor 
-// refreshes the cached value once a second.
 fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
   bytes_tree.append_string(tree, "date: ")
   |> bytes_tree.append(clock.get())
@@ -928,9 +863,6 @@ fn append_connection(
   |> bytes_tree.append(<<"\r\n":utf8>>)
 }
 
-// Precomputed `HTTP/1.1 NNN Reason\r\n` literals for every standard status 
-// code. Codes with no registered meaning in this range fall through to the 
-// general form with an empty reason phrase.
 fn status_line(status: Int) -> BitArray {
   case status {
     100 -> <<"HTTP/1.1 100 Continue\r\n":utf8>>
@@ -1006,6 +938,7 @@ fn body_length(body: connection.Body) -> Int {
     connection.Empty -> 0
     connection.File(data) -> data.length
     connection.Streaming(..) -> panic as "the Streaming body is handled above"
+    connection.Sse(..) -> panic as "the Sse body is handled above"
   }
 }
 
@@ -1025,9 +958,6 @@ pub type Version {
   Http11
 }
 
-/// The parsed request line and headers. Does not include the body. Carries
-/// everything `request.Request` needs besides `scheme` and `body`, which
-/// only the caller can supply.
 pub type Head {
   Head(
     method: http.Method,
@@ -1040,7 +970,6 @@ pub type Head {
   )
 }
 
-/// Cheap conclusions drawn from `Head.headers` in one pass.
 pub type Metadata {
   Metadata(
     framing: connection.Framing,
@@ -1115,7 +1044,6 @@ const max_headers = 100
 
 const max_chunk_size_line = 128
 
-/// Parses as much of a request head as `buffer` contains.
 pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
   let step = {
     use #(method, target, version, remaining) <- try_step(parse_request_line(
@@ -1235,7 +1163,6 @@ fn parse_target_version(bits: BitArray) -> Step(#(BitArray, Version)) {
   }
 }
 
-// path[?query]. Used for every method except CONNECT.
 fn split_target(target: BitArray) -> Step(#(String, option.Option(String))) {
   case find_question(target) {
     Error(Nil) -> {
@@ -1268,8 +1195,6 @@ fn decode_component(bits: BitArray, on_error: ParseError) -> Step(String) {
   }
 }
 
-// A path must be an absolute path except the "*" asterisk-form, which is only
-// valid for OPTIONS (RFC 9112 §3.2).
 fn validate_path(method: http.Method, path: String) -> Step(String) {
   case path, method {
     "*", http.Options -> StepDone(path)
@@ -1278,8 +1203,6 @@ fn validate_path(method: http.Method, path: String) -> Step(String) {
   }
 }
 
-// CONNECT's target is authority-form, every other method uses origin-form and
-// gets its host from the Host header.
 fn resolve_target(
   method: http.Method,
   target: BitArray,
@@ -1288,8 +1211,6 @@ fn resolve_target(
 ) -> Step(#(String, option.Option(Int), String, option.Option(String))) {
   case method {
     http.Connect ->
-      // `target` is unvalidated wire bytes, so the host must go through real 
-      // UTF-8 validation here.
       case split_host_port(target) {
         Ok(#(host, option.Some(_port) as port)) ->
           case bit_array_to_string(host) {
@@ -1308,8 +1229,6 @@ fn resolve_target(
   }
 }
 
-// The `Host` header is required for HTTP/1.1 (RFC 9112 §3.2), optional for
-// HTTP/1.0.
 fn resolve_host(
   version: Version,
   header_host: option.Option(#(String, option.Option(Int))),
@@ -1321,10 +1240,6 @@ fn resolve_host(
   }
 }
 
-// Splits a `host[:port]` authority, respecting IPv6 literals in brackets.
-// Returns the host as raw bytes, callers decide how to turn it into a
-// `String`, since one of them already knows the bytes are valid UTF-8 and 
-// the other doesn't.
 fn split_host_port(
   value: BitArray,
 ) -> Result(#(BitArray, option.Option(Int)), Nil) {
@@ -1400,7 +1315,6 @@ fn parse_port_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
   }
 }
 
-// Threaded through `parse_headers`. 
 type HeaderState {
   HeaderState(
     content_length: option.Option(Int),
@@ -1423,11 +1337,6 @@ fn initial_header_state() -> HeaderState {
   )
 }
 
-// HTTP/1.1 connections default to persistent, HTTP/1.0 ones default to
-// closing (RFC 9112 §9.3); an explicit `Connection` header overrides
-// either default. A message framed by both `Content-Length` and
-// `Transfer-Encoding` is rejected outright, since the two disagree on
-// where the body ends. (RFC 9112 §6.1).
 fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
   case state.content_length, state.chunked {
     option.Some(_length), True -> ParseError(AmbiguousFraming)
@@ -1501,8 +1410,6 @@ fn parse_header_line(
   }
 }
 
-// Updates `content_length`, `chunked`, `connection`, `connection_upgrade`,
-// `upgrade`, and `host` from a single already decoded header.
 fn classify(
   name: String,
   value: String,
@@ -1541,7 +1448,6 @@ fn classify(
       StepDone(HeaderState(..state, connection:, connection_upgrade:))
     }
     "upgrade" -> {
-      // ASCII-lowered bytes of a validated `String` are valid UTF-8.
       let lowered =
         value
         |> bit_array.from_string
@@ -1553,9 +1459,6 @@ fn classify(
       case state.host {
         option.Some(_host) -> ParseError(DuplicateHost)
         option.None ->
-          // `value` is already a validated `String`. The split only slices
-          // at ASCII delimiters, so the host bytes are still valid UTF-8
-          // and don't need re-validating.
           case split_host_port(bit_array.from_string(value)) {
             Ok(#(host, port)) -> {
               let host = option.Some(#(unsafe_to_string(host), port))
@@ -1568,7 +1471,6 @@ fn classify(
   }
 }
 
-// Finds the next LF, then splits off the line without CRLF and the remaining.
 fn extract_line(
   buffer: BitArray,
   max_len: Int,
@@ -1591,7 +1493,6 @@ fn extract_line(
   }
 }
 
-// Returns input untouched if already lowercase, avoiding an allocation.
 fn lowercase_ascii(bits: BitArray) -> BitArray {
   case has_uppercase(bits) {
     False -> bits
@@ -1608,7 +1509,6 @@ fn has_uppercase(bits: BitArray) -> Bool {
   }
 }
 
-// Builds a byte list, lowercasing letters. Flattened by `list_to_bit_array`.
 fn lowercase_walk(bits: BitArray) -> List(Int) {
   case bits {
     <<>> -> []
@@ -1643,7 +1543,6 @@ fn lowercase_walk(bits: BitArray) -> List(Int) {
   }
 }
 
-// ASCII-only OWS trim.
 fn trim_ows(bits: BitArray) -> BitArray {
   bits
   |> trim_leading_ows
@@ -1670,7 +1569,6 @@ fn trim_trailing_ows(bits: BitArray) -> BitArray {
   }
 }
 
-// Exact-token match against a comma-separated header value.
 fn has_token(value: BitArray, token: BitArray) -> Bool {
   case value == token {
     True -> True
@@ -1704,11 +1602,8 @@ fn split_comma(bits: BitArray) -> List(BitArray)
 @external(erlang, "http1_ffi", "list_to_bit_array")
 fn list_to_bit_array(bytes: List(Int)) -> BitArray
 
-// Validates UTF-8 via native BIFs, I assume should be faster than
-// `bit_array.to_string`.
 @external(erlang, "http1_ffi", "bit_array_to_string")
 fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
 
-// Used only for bytes already proven valid UTF-8 elsewhere!!
 @external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_string(bits: BitArray) -> String
