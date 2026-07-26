@@ -16,11 +16,40 @@ pub type FileError {
 }
 
 pub fn resolve(
+  conn: connection.Connection,
   path: String,
   offset: option.Option(Int),
   limit: option.Option(Int),
 ) -> Result(connection.File, FileError) {
-  use size <- result.try(stat(path))
+  case conn {
+    // The handler already runs in the process that writes the socket, so it can
+    // hold the descriptor itself. 
+    connection.Http1(_conn) -> {
+      use handle <- result.try(open(path))
+
+      case size(handle) |> result.try(range(_, offset, limit)) {
+        Ok(#(offset, length)) ->
+          Ok(connection.OpenFile(handle:, offset:, length:))
+        Error(error) -> {
+          close(handle)
+          Error(error)
+        }
+      }
+    }
+    connection.Http2 -> {
+      use size <- result.try(stat(path))
+      use #(offset, length) <- result.map(range(size, offset, limit))
+
+      connection.PendingFile(path:, offset:, length:)
+    }
+  }
+}
+
+fn range(
+  size: Int,
+  offset: option.Option(Int),
+  limit: option.Option(Int),
+) -> Result(#(Int, Int), FileError) {
   let offset = option.unwrap(offset, 0)
 
   case offset >= 0 && offset <= size {
@@ -29,17 +58,30 @@ pub fn resolve(
       let available = size - offset
 
       case limit {
-        option.None ->
-          Ok(connection.FileMetadata(path:, offset:, length: available))
+        option.None -> Ok(#(offset, available))
         option.Some(limit) if limit < 0 -> Error(InvalidLimit)
-        option.Some(limit) ->
-          Ok(connection.FileMetadata(
-            path:,
-            offset:,
-            length: int.min(limit, available),
-          ))
+        option.Some(limit) -> Ok(#(offset, int.min(limit, available)))
       }
     }
+  }
+}
+
+/// Hands back a descriptor. 
+pub fn release(file: connection.File) -> Nil {
+  case file {
+    connection.OpenFile(handle:, ..) -> close(handle)
+    connection.PendingFile(..) -> Nil
+  }
+}
+
+pub fn release_body(body: connection.Body) -> Nil {
+  case body {
+    connection.File(file) -> release(file)
+    connection.Bytes(..)
+    | connection.Text(..)
+    | connection.Empty
+    | connection.Streaming(..)
+    | connection.Sse(..) -> Nil
   }
 }
 
@@ -48,18 +90,32 @@ pub fn send(
   socket: socket.Socket,
   file: connection.File,
 ) -> Result(Nil, socket.SocketReason) {
-  case file.length {
-    0 -> Ok(Nil)
-    length -> {
-      use fd <- result.try(open(file.path))
-      let result = case transport {
-        transport.Tcp -> do_sendfile(fd, socket, file.offset, length)
-        transport.Ssl -> send_chunks(transport, socket, fd, file.offset, length)
-      }
-      close(fd)
-      result
-    }
+  case file {
+    connection.OpenFile(handle:, offset:, length:) ->
+      send_handle(transport, socket, handle, offset, length)
+    connection.PendingFile(..) -> todo as "HTTP/2 is not implemented yet!"
   }
+}
+
+/// Owns the descriptor from here on, so it is closed however the write ends.
+fn send_handle(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  handle: connection.FileDescriptor,
+  offset: Int,
+  length: Int,
+) -> Result(Nil, socket.SocketReason) {
+  let sent = case length {
+    0 -> Ok(Nil)
+    _length ->
+      case transport {
+        transport.Tcp -> do_sendfile(handle, socket, offset, length)
+        transport.Ssl -> send_chunks(transport, socket, handle, offset, length)
+      }
+  }
+
+  close(handle)
+  sent
 }
 
 const chunk_size = 65_536
@@ -67,7 +123,7 @@ const chunk_size = 65_536
 fn send_chunks(
   transport: transport.Transport,
   socket: socket.Socket,
-  fd: FileDescriptor,
+  handle: connection.FileDescriptor,
   offset: Int,
   remaining: Int,
 ) -> Result(Nil, socket.SocketReason) {
@@ -75,40 +131,47 @@ fn send_chunks(
     0 -> Ok(Nil)
     _remaining -> {
       let amount = int.min(remaining, chunk_size)
-      use data <- result.try(pread(fd, offset, amount))
+      use data <- result.try(pread(handle, offset, amount))
       use Nil <- result.try(transport.send(
         transport,
         socket,
         bytes_tree.from_bit_array(data),
       ))
 
-      send_chunks(transport, socket, fd, offset + amount, remaining - amount)
+      send_chunks(
+        transport,
+        socket,
+        handle,
+        offset + amount,
+        remaining - amount,
+      )
     }
   }
 }
-
-pub type FileDescriptor
 
 @external(erlang, "file_ffi", "stat")
 fn stat(path: String) -> Result(Int, FileError)
 
 @external(erlang, "file_ffi", "sendfile")
 fn do_sendfile(
-  fd: FileDescriptor,
+  handle: connection.FileDescriptor,
   socket: socket.Socket,
   offset: Int,
   bytes: Int,
 ) -> Result(Nil, socket.SocketReason)
 
 @external(erlang, "file_ffi", "open")
-fn open(path: String) -> Result(FileDescriptor, socket.SocketReason)
+fn open(path: String) -> Result(connection.FileDescriptor, FileError)
+
+@external(erlang, "file_ffi", "size")
+fn size(handle: connection.FileDescriptor) -> Result(Int, FileError)
 
 @external(erlang, "file_ffi", "pread")
 fn pread(
-  fd: FileDescriptor,
+  handle: connection.FileDescriptor,
   offset: Int,
   length: Int,
 ) -> Result(BitArray, socket.SocketReason)
 
 @external(erlang, "file_ffi", "close")
-fn close(fd: FileDescriptor) -> Nil
+fn close(handle: connection.FileDescriptor) -> Nil

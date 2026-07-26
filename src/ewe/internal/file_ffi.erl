@@ -2,7 +2,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([stat/1, sendfile/4, open/1, pread/3, close/1]).
+-export([stat/1, sendfile/4, open/1, size/1, pread/3, close/1]).
 
 stat(Path) ->
   case file:read_file_info(Path, [raw, {time, posix}]) of
@@ -20,7 +20,21 @@ sendfile(Fd, Socket, Offset, Bytes) ->
   end.
 
 open(Path) ->
-  file:open(Path, [raw, binary, read]).
+  case file:open(Path, [raw, binary, read]) of
+    {ok, Fd} -> {ok, Fd};
+    {error, enoent} -> {error, not_found};
+    {error, eisdir} -> {error, is_directory};
+    {error, eacces} -> {error, access_denied};
+    {error, _Reason} -> {error, unknown_error}
+  end.
+
+%% Sizes the open handle, so the bytes framed are the ones about to be sent
+%% rather than whatever the path pointed at a moment ago.
+size(Fd) ->
+  case file:position(Fd, eof) of
+    {ok, Size} -> {ok, Size};
+    {error, _Reason} -> {error, unknown_error}
+  end.
 
 pread(Fd, Offset, Length) ->
   case file:pread(Fd, Offset, Length) of

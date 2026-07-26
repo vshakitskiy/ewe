@@ -392,15 +392,20 @@ fn from_internal_file_error(error: file.FileError) -> FileError {
   }
 }
 
-/// Prepares a file to be streamed as a response body. `offset` and `limit` in 
-/// bytes let you serve a byte range from the file. leave either as `None` to 
+/// Prepares a file to be streamed as a response body. `offset` and `limit` in
+/// bytes let you serve a byte range from the file. leave either as `None` to
 /// serve from the start or through the end.
+///
+/// On HTTP/1 this opens the file, and the returned body holds it open until the
+/// response is written. Put it on a response you go on to return. A body that
+/// is built and then discarded keeps its file open until it is collected.
 pub fn file(
+  connection: Connection,
   path: String,
   offset offset: Option(Int),
   limit limit: Option(Int),
 ) -> Result(Body, FileError) {
-  case file.resolve(path, offset, limit) {
+  case file.resolve(connection, path, offset, limit) {
     Ok(file) -> Ok(File(file))
     Error(error) -> Error(from_internal_file_error(error))
   }

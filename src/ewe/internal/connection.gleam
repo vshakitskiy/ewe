@@ -27,9 +27,17 @@ pub type Streaming {
   StreamingMetadata(handler: fn(ResponseWriter) -> Nil)
 }
 
+/// A raw descriptor belongs to the process that opened it, so whether the
+/// handler can carry one depends on the protocol: an HTTP/1 handler runs in the
+/// process that writes the socket, an HTTP/2 stream handler does not.
 pub type File {
-  FileMetadata(path: String, offset: Int, length: Int)
+  /// Already open, and closed by whoever writes or drops the response.
+  OpenFile(handle: FileDescriptor, offset: Int, length: Int)
+  /// Sized but not yet open; the connection process opens it at send time.
+  PendingFile(path: String, offset: Int, length: Int)
 }
+
+pub type FileDescriptor
 
 pub type ResponseWriter {
   Http1Writer(http1.ResponseWriter)

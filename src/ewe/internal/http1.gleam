@@ -77,6 +77,7 @@ pub fn handle_message(
             logging.Error,
             "Handler produced an unsafe response header: " <> name,
           )
+          file.release_body(response.body)
 
           transport.send(
             connection.transport,
@@ -170,11 +171,19 @@ fn send_response(
       ))
       Ok(to_sent(keep_alive))
     }
-    encoder.RemainderFile(data) -> {
-      use Nil <- result.try(transport.send(transport, socket, head))
-      use Nil <- result.try(file.send(transport, socket, data))
-      Ok(to_sent(keep_alive))
-    }
+    // `file.send` owns the descriptor once it is reached, so only a head that
+    // never made it to the socket leaves one to hand back.
+    encoder.RemainderFile(data) ->
+      case transport.send(transport, socket, head) {
+        Error(reason) -> {
+          file.release(data)
+          Error(reason)
+        }
+        Ok(Nil) -> {
+          use Nil <- result.try(file.send(transport, socket, data))
+          Ok(to_sent(keep_alive))
+        }
+      }
     encoder.RemainderStream(handler: stream_handler, framing:) -> {
       use Nil <- result.try(transport.send(transport, socket, head))
 

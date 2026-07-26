@@ -1,5 +1,6 @@
 import ewe/internal/clock
 import ewe/internal/connection
+import ewe/internal/file
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
 import gleam/bit_array
@@ -86,9 +87,22 @@ pub fn encode_response(
 
   // A HEAD response keeps the framing headers it would have had, minus the body.
   Ok(case method {
-    http.Head -> Encoded(..encoded, remainder: NoRemainder)
+    http.Head -> drop_body(encoded)
     _method -> encoded
   })
+}
+
+/// Anything the body was holding is let go here.
+fn drop_body(encoded: Encoded) -> Encoded {
+  case encoded.remainder {
+    RemainderFile(data) -> file.release(data)
+    NoRemainder
+    | RemainderInline(..)
+    | RemainderStream(..)
+    | RemainderSse(..) -> Nil
+  }
+
+  Encoded(..encoded, remainder: NoRemainder)
 }
 
 fn sized(

@@ -45,6 +45,7 @@ fn handle_request(
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
         ewe.file(
+          request.body,
           "./dev/priv/file_100kb.bin",
           offset: option.None,
           limit: option.None,
@@ -60,6 +61,7 @@ fn handle_request(
       // head -c 1G /dev/urandom > file_1gb.bin
       let assert Ok(file) =
         ewe.file(
+          request.body,
           "./dev/priv/file_1gb.bin",
           offset: option.None,
           limit: option.None,
