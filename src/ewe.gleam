@@ -3,6 +3,8 @@ import ewe/internal/file
 import ewe/internal/handler as handler_
 import ewe/internal/http1/body as http1_body
 import ewe/internal/http1/encoder
+import ewe/internal/http1/sse as http1_sse
+import ewe/internal/sse
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -33,6 +35,7 @@ pub type Body {
   Empty
   File(connection.File)
   Streaming(connection.Streaming)
+  Sse(connection.Sse)
 }
 
 pub type IpAddress {
@@ -292,19 +295,24 @@ pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
 
-// Body and connection.Body are structurally identical.
-@external(erlang, "ewe_ffi", "identity")
-fn unsafe_to_internal_response(
-  response: response.Response(Body),
-) -> response.Response(connection.Body)
+fn to_internal_body(body: Body) -> connection.Body {
+  case body {
+    Bytes(tree) -> connection.Bytes(tree)
+    Text(text) -> connection.Text(text)
+    Empty -> connection.Empty
+    File(file) -> connection.File(file)
+    Streaming(streaming) -> connection.Streaming(streaming)
+    Sse(sse) -> connection.Sse(sse)
+  }
+}
 
 /// Starts the server with the provided configuration.
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
   let handler = fn(request) {
-    builder.handler(request)
-    |> unsafe_to_internal_response
+    let response = builder.handler(request)
+    response.set_body(response, to_internal_body(response.body))
   }
 
   let pool =
@@ -509,4 +517,108 @@ pub fn finish_response(writer: ResponseWriter) -> Nil {
     connection.Http1Writer(writer) -> encoder.finish_response(writer)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
+}
+
+/// A handle for writing to an open Server-Sent Events stream.
+pub type SseConnection =
+  connection.SseConnection
+
+/// Server-Sent Events message. Build it with `event` or `comment`, then set 
+/// the remaining fields with `event_name`, `event_id` and `event_retry`.
+pub type SseEvent =
+  sse.Event
+
+/// What an SSE stream does after the handler has dealt with the message. Build
+/// it with `sse_continue`, `sse_stop` or `sse_stop_abnormal`.
+pub opaque type SseNext(user_state) {
+  SseContinue(user_state)
+  SseStop
+  SseStopAbnormal(reason: String)
+}
+
+/// Carries on with the stream, handling further messages with `user_state`.
+pub fn sse_continue(user_state: user_state) -> SseNext(user_state) {
+  SseContinue(user_state)
+}
+
+/// Ends the stream.
+pub fn sse_stop() -> SseNext(user_state) {
+  SseStop
+}
+
+/// Ends the stream, reporting `reason` as the cause.
+pub fn sse_stop_abnormal(reason: String) -> SseNext(user_state) {
+  SseStopAbnormal(reason)
+}
+
+/// Creates an event carrying `data`. Data spanning several lines is sent as
+/// the repeated `data:` fields the client rejoins.
+pub fn event(data: String) -> SseEvent {
+  sse.Event(..sse.new(), data: Some(data))
+}
+
+/// Creates a comment, which clients ignore. Sending one periodically is the
+/// conventional way to stop an idle stream being closed by a proxy.
+pub fn comment(text: String) -> SseEvent {
+  sse.Event(..sse.new(), comment: Some(text))
+}
+
+/// Sets the name of the event.
+pub fn event_name(event: SseEvent, name: String) -> SseEvent {
+  sse.Event(..event, name: Some(name))
+}
+
+/// Sets the ID of the event.
+pub fn event_id(event: SseEvent, id: String) -> SseEvent {
+  sse.Event(..event, id: Some(id))
+}
+
+/// Sets how long, in milliseconds, the client waits before reconnecting.
+pub fn event_retry(event: SseEvent, retry: Int) -> SseEvent {
+  sse.Event(..event, retry: Some(retry))
+}
+
+/// Sends event to the client.
+pub fn send_event(
+  conn: SseConnection,
+  event: SseEvent,
+) -> Result(Nil, socket.SocketReason) {
+  case conn {
+    connection.Http1Sse(conn) -> http1_sse.send(conn, event)
+    connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// Turns the response into a Server-Sent Events stream, which runs until the
+/// handler stops it or the client goes away. The HTTP/1.1 connection is 
+/// reusable afterwards as long as the handler ended the stream itself and the 
+/// client sent nothing during it.
+///
+/// `on_init` is called once, with a subject the rest of your program uses to
+/// push messages at the client, and returns the starting state. `handler` is
+/// called for each message sent to that subject. `on_close` is called once 
+/// however the stream ended.
+pub fn sse(
+  response: response.Response(a),
+  on_init on_init: fn(process.Subject(user_message)) -> user_state,
+  handler handler: fn(SseConnection, user_state, user_message) ->
+    SseNext(user_state),
+  on_close on_close: fn(SseConnection, user_state) -> Nil,
+) -> response.Response(Body) {
+  let step = fn(conn, state, message) {
+    case handler(conn, state, message) {
+      SseContinue(state) -> sse.Proceed(state)
+      SseStop -> sse.Halt(connection.Stopped)
+      SseStopAbnormal(reason) -> sse.Halt(connection.StoppedAbnormal(reason))
+    }
+  }
+
+  let stream = fn(conn) {
+    case conn {
+      connection.Http1Sse(conn) -> http1_sse.run(conn, on_init, step, on_close)
+      connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
+    }
+  }
+
+  response.set_body(response, Sse(connection.SseMetadata(stream)))
 }

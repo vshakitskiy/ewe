@@ -8,11 +8,12 @@
 # Requires benchmark/.wrk2/wrk2, so run ./wrk2-setup.sh once first.
 #
 # Usage:
-#   ./bench.sh [--servers "ewe@5,mist"] [--pcts "50 75 90 95"] [--conns 50] 
-#              [--duration 20s] [--warmup 5s] [--threads 4] 
+#   ./bench.sh [--servers "ewe@5,mist"] [--endpoints "sse"] [--pcts "50 75 90 95"] 
+#              [--conns 50] [--duration 20s] [--warmup 5s] [--threads 4] 
 #              [--probe-rate 500000] [--probe-duration 5s]
 #
 #   --servers         comma separated subset of server names (default: all)
+#   --endpoints       comma separated subset of endpoint names (default: all)
 #   --pcts            space separated percentages of saturation to test (default: "50 75 90 95")
 #   --conns           connections held open per run (default: 50)
 #   --duration        wrk2 measured run duration (default: 20s)
@@ -43,8 +44,11 @@ ENDPOINTS=(
   "echo|/echo|post_echo.lua"
   "echo_chunked|/echo/chunked|post_echo_chunked.lua"
   "stream|/stream|"
+  "sse|/sse|"
   "file_small|/file/small|"
 )
+
+SSE_EVENTS=32
 
 # server|endpoint|reason combos to skip before probing. Two distinct reasons:
 # - not_implemented: the server doesn't implement the feature the endpoint is 
@@ -56,6 +60,7 @@ SKIP=(
   "elli|echo_chunked|not_implemented"
   "httpd|echo_chunked|not_implemented"
   "elli|stream|unstable"
+  "elli|sse|unstable"
   "mist|stream|unstable"
   "ewe@4|stream|unstable"
   "ewe@4|file_small|unstable"
@@ -76,6 +81,15 @@ server_selected() {
   local name="$1"
   [ -z "${ONLY_SERVERS:-}" ] && return 0
   case ",$ONLY_SERVERS," in
+    *",$name,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+endpoint_selected() {
+  local name="$1"
+  [ -z "${ONLY_ENDPOINTS:-}" ] && return 0
+  case ",$ONLY_ENDPOINTS," in
     *",$name,"*) return 0 ;;
     *) return 1 ;;
   esac
@@ -165,10 +179,12 @@ THREADS=4
 PROBE_RATE=500000
 PROBE_DURATION="5s"
 ONLY_SERVERS=""
+ONLY_ENDPOINTS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --servers) ONLY_SERVERS="$2"; shift 2 ;;
+    --endpoints) ONLY_ENDPOINTS="$2"; shift 2 ;;
     --pcts) PCTS="$2"; shift 2 ;;
     --conns) CONNS="$2"; shift 2 ;;
     --duration) DURATION="$2"; shift 2 ;;
@@ -308,6 +324,7 @@ for entry in "${SERVERS[@]}"; do
 
   for endpoint_entry in "${ENDPOINTS[@]}"; do
     IFS='|' read -r ename epath escript <<< "$endpoint_entry"
+    endpoint_selected "$ename" || continue
 
     if skip_endpoint "$name" "$ename"; then
       echo
@@ -322,7 +339,11 @@ for entry in "${SERVERS[@]}"; do
 
     saturation=$(probe_saturation "$port" "$epath" "$escript")
     echo
-    echo "  $ename  (saturation ~$saturation req/s)"
+    if [ "$ename" = "sse" ]; then
+      echo "  $ename  (saturation ~$saturation streams/s = ~$(( saturation * SSE_EVENTS )) events/s)"
+    else
+      echo "  $ename  (saturation ~$saturation req/s)"
+    fi
     table_header
 
     for pct in $PCTS; do

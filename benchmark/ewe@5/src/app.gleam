@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/int
 import gleam/option
 import logging
 
@@ -42,6 +43,7 @@ fn handle_request(
       let writer = ewe.send_chunk(writer, <<"hello, ":utf8>>)
       ewe.finish_chunk(writer, <<"Joe!":utf8>>)
     }
+    http.Get, "/sse" -> sse_burst()
     http.Get, "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
@@ -89,4 +91,41 @@ fn echo_chunked(
       response.new(200) |> response.set_body(ewe.Bytes(acc))
     Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
   }
+}
+
+const sse_events = 32
+
+type Tick {
+  Tick(Int)
+}
+
+fn sse_burst() -> response.Response(ewe.Body) {
+  ewe.sse(
+    response.new(200),
+    on_init: fn(subject) {
+      process.send(subject, Tick(1))
+      subject
+    },
+    handler: fn(conn, subject, message) {
+      let Tick(n) = message
+
+      case ewe.send_event(conn, tick_event(n)) {
+        Error(_reason) -> ewe.sse_stop_abnormal("failed to send event")
+        Ok(Nil) if n >= sse_events -> ewe.sse_stop()
+        Ok(Nil) -> {
+          process.send(subject, Tick(n + 1))
+          ewe.sse_continue(subject)
+        }
+      }
+    },
+    on_close: fn(_conn, _state) { Nil },
+  )
+}
+
+fn tick_event(n: Int) -> ewe.SseEvent {
+  let n = int.to_string(n)
+
+  ewe.event("{\"n\":" <> n <> ",\"at\":\"benchmark\"}")
+  |> ewe.event_name("tick")
+  |> ewe.event_id(n)
 }

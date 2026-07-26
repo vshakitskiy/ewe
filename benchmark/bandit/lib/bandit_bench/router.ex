@@ -1,6 +1,8 @@
 defmodule BanditBench.Router do
   use Plug.Router
 
+  @sse_events 32
+
   plug(:match)
   plug(:dispatch)
 
@@ -25,6 +27,14 @@ defmodule BanditBench.Router do
     conn
   end
 
+  get "/sse" do
+    conn
+    |> put_resp_header("content-type", "text/event-stream")
+    |> put_resp_header("cache-control", "no-cache")
+    |> send_chunked(200)
+    |> sse_burst()
+  end
+
   get "/file/small" do
     conn
     |> put_resp_header("content-type", "application/octet-stream")
@@ -39,6 +49,32 @@ defmodule BanditBench.Router do
 
   match _ do
     send_resp(conn, 404, "")
+  end
+
+  defp sse_burst(conn) do
+    send(self(), {:sse_tick, 1})
+    sse_loop(conn)
+  end
+
+  defp sse_loop(conn) do
+    receive do
+      {:sse_tick, n} when n > @sse_events ->
+        conn
+
+      {:sse_tick, n} ->
+        case chunk(conn, sse_event(n)) do
+          {:ok, conn} ->
+            send(self(), {:sse_tick, n + 1})
+            sse_loop(conn)
+
+          {:error, _reason} ->
+            conn
+        end
+    end
+  end
+
+  defp sse_event(n) do
+    "event: tick\nid: #{n}\ndata: {\"n\":#{n},\"at\":\"benchmark\"}\n\n"
   end
 
   defp echo_chunked({:more, partial, conn}, acc) do

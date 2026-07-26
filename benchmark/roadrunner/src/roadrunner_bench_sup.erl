@@ -19,6 +19,7 @@ init([]) ->
       {~"/echo", roadrunner_bench_callback, undefined},
       {~"/echo/chunked", roadrunner_bench_callback, undefined},
       {~"/stream", roadrunner_bench_callback, undefined},
+      {~"/sse", roadrunner_bench_callback, undefined},
       {~"/file/small", roadrunner_bench_callback, undefined},
       {~"/file/big", roadrunner_bench_callback, undefined}
     ]

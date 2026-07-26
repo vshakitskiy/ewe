@@ -5,6 +5,7 @@ import gleam/erlang/process.{type Subject}
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/int
 import gleam/option
 import gleam/string
 import logging
@@ -37,6 +38,7 @@ fn handle_request(
       }
     http.Post, "/echo/chunked" -> echo_chunked(request)
     http.Get, "/stream" -> stream_hello(request)
+    http.Get, "/sse" -> sse_burst(request)
     http.Get, "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
@@ -133,4 +135,43 @@ fn stream_hello(
     },
     on_close: fn(_conn, _state) { Nil },
   )
+}
+
+const sse_events = 32
+
+type Tick {
+  Tick(Int)
+}
+
+fn sse_burst(
+  request: request.Request(ewe.Connection),
+) -> response.Response(ewe.ResponseBody) {
+  ewe.sse(
+    request,
+    on_init: fn(subject) {
+      process.send(subject, Tick(1))
+      subject
+    },
+    handler: fn(conn, subject, message) {
+      let Tick(n) = message
+
+      case ewe.send_event(conn, tick_event(n)) {
+        Error(_reason) -> ewe.sse_stop_abnormal("failed to send event")
+        Ok(Nil) if n >= sse_events -> ewe.sse_stop()
+        Ok(Nil) -> {
+          process.send(subject, Tick(n + 1))
+          ewe.sse_continue(subject)
+        }
+      }
+    },
+    on_close: fn(_conn, _state) { Nil },
+  )
+}
+
+fn tick_event(n: Int) -> ewe.SSEEvent {
+  let n = int.to_string(n)
+
+  ewe.event("{\"n\":" <> n <> ",\"at\":\"benchmark\"}")
+  |> ewe.event_name("tick")
+  |> ewe.event_id(n)
 }

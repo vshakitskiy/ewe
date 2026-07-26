@@ -31,7 +31,10 @@ pub type Remainder {
     handler: fn(connection.ResponseWriter) -> Nil,
     framing: http1.StreamFraming,
   )
-  RemainderSse(handler: fn(connection.SseConnection) -> connection.Outcome)
+  RemainderSse(
+    handler: fn(connection.SseConnection) -> connection.Outcome,
+    framing: http1.StreamFraming,
+  )
 }
 
 pub type Encoded {
@@ -48,7 +51,10 @@ pub fn encode_response(
   version: parser.Version,
   keep_alive: http1.KeepAlive,
 ) -> Result(Encoded, EncodeError) {
-  use state <- result.try(encode_headers(response.headers))
+  use state <- result.try(encode_headers(
+    response.headers,
+    reserved(response.body),
+  ))
   let keep_alive = http1.and_keep_alive(keep_alive, state.keep_alive)
   let status = response.status
 
@@ -75,7 +81,7 @@ pub fn encode_response(
     connection.Streaming(connection.StreamingMetadata(handler)) ->
       encode_stream(state, status, keep_alive, version, handler)
     connection.Sse(connection.SseMetadata(handler)) ->
-      close_delimited(state, status, RemainderSse(handler))
+      encode_sse(state, status, keep_alive, version, handler)
   }
 
   // A HEAD response keeps the framing headers it would have had, minus the body.
@@ -127,6 +133,43 @@ fn encode_stream(
   }
 }
 
+/// On HTTP/1.1 the stream is framed as chunked, which proxies handle far better
+/// than one delimited only by the close, and which leaves the socket sitting at
+/// a known point afterwards. The connection is advertised as reusable on that
+/// basis; whether it is handed back is settled once the stream ends. HTTP/1.0
+/// has no chunked encoding, so there the close is the framing and the
+/// connection cannot survive it.
+///
+/// The content type is fixed by the format and the no-cache is what keeps
+/// intermediaries from buffering the stream, so both are written from constants
+/// here rather than built into the handler's header list.
+fn encode_sse(
+  state: EncodeState,
+  status: Int,
+  keep_alive: http1.KeepAlive,
+  version: parser.Version,
+  handler: fn(connection.SseConnection) -> connection.Outcome,
+) -> Encoded {
+  case version {
+    parser.Http11 ->
+      Encoded(
+        build_head(state, status, keep_alive, <<
+          "content-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n":utf8,
+        >>),
+        keep_alive,
+        RemainderSse(handler:, framing: http1.ChunkedStream),
+      )
+    parser.Http10 ->
+      Encoded(
+        build_head(state, status, http1.CloseAfterResponse, <<
+          "content-type: text/event-stream\r\ncache-control: no-cache\r\n":utf8,
+        >>),
+        http1.CloseAfterResponse,
+        RemainderSse(handler:, framing: http1.CloseDelimitedStream),
+      )
+  }
+}
+
 fn close_delimited(
   state: EncodeState,
   status: Int,
@@ -157,19 +200,24 @@ pub type ResponseWriter =
 
 const last_chunk = <<"0\r\n\r\n":utf8>>
 
-fn chunk_frame(chunk: BitArray) -> bytes_tree.BytesTree {
-  bytes_tree.new()
-  |> bytes_tree.append_string(int.to_base16(bit_array.byte_size(chunk)))
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-  |> bytes_tree.append(chunk)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
+/// Wraps one piece of a streamed body in whatever delimits it on the wire.
+pub fn frame(
+  chunk: bytes_tree.BytesTree,
+  framing: http1.StreamFraming,
+) -> bytes_tree.BytesTree {
+  case framing {
+    http1.ChunkedStream ->
+      bytes_tree.new()
+      |> bytes_tree.append_string(int.to_base16(bytes_tree.byte_size(chunk)))
+      |> bytes_tree.append(<<"\r\n":utf8>>)
+      |> bytes_tree.append_tree(chunk)
+      |> bytes_tree.append(<<"\r\n":utf8>>)
+    http1.CloseDelimitedStream -> chunk
+  }
 }
 
 pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
-  let bytes = case writer.framing {
-    http1.ChunkedStream -> chunk_frame(chunk)
-    http1.CloseDelimitedStream -> bytes_tree.from_bit_array(chunk)
-  }
+  let bytes = frame(bytes_tree.from_bit_array(chunk), writer.framing)
   let _ = transport.send(writer.transport, writer.socket, bytes)
   writer
 }
@@ -177,7 +225,11 @@ pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
 pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
   // The terminator rides along with the last chunk to save a write.
   let bytes = case writer.framing {
-    http1.ChunkedStream -> bytes_tree.append(chunk_frame(chunk), last_chunk)
+    http1.ChunkedStream ->
+      bytes_tree.append(
+        frame(bytes_tree.from_bit_array(chunk), writer.framing),
+        last_chunk,
+      )
     http1.CloseDelimitedStream -> bytes_tree.from_bit_array(chunk)
   }
   let _ = transport.send(writer.transport, writer.socket, bytes)
@@ -207,13 +259,35 @@ fn finish(writer: ResponseWriter) -> Nil {
   |> process.send(writer.self, _)
 }
 
+/// Which headers the encoder writes itself for a body, and so drops from the
+/// handler's list rather than emitting twice.
+type Reserved {
+  Framing
+  FramingAndSse
+}
+
+fn reserved(body: connection.Body) -> Reserved {
+  case body {
+    connection.Sse(..) -> FramingAndSse
+    connection.Bytes(..)
+    | connection.Text(..)
+    | connection.Empty
+    | connection.File(..)
+    | connection.Streaming(..) -> Framing
+  }
+}
+
 fn encode_headers(
   headers: List(#(String, String)),
+  reserved: Reserved,
 ) -> Result(EncodeState, EncodeError) {
   let initial = EncodeState(bytes_tree.new(), http1.KeepAlive)
   use state, #(name, value) <- list.try_fold(headers, initial)
+
+  // TODO: just trust the handler?
   case name {
     "content-length" | "transfer-encoding" | "date" -> Ok(state)
+    "content-type" | "cache-control" if reserved == FramingAndSse -> Ok(state)
     "connection" ->
       case parser.find_unsafe_header_byte(value) {
         Error(Nil) -> {
@@ -226,7 +300,7 @@ fn encode_headers(
         }
         Ok(_position) -> Error(UnsafeHeader(name))
       }
-    _name ->
+    _other ->
       case
         parser.find_unsafe_header_byte(name),
         parser.find_unsafe_header_byte(value)
@@ -323,7 +397,7 @@ fn status_line(status: Int) -> BitArray {
     502 -> <<"HTTP/1.1 502 Bad Gateway\r\n":utf8>>
     503 -> <<"HTTP/1.1 503 Service Unavailable\r\n":utf8>>
     504 -> <<"HTTP/1.1 504 Gateway Timeout\r\n":utf8>>
-    505 -> <<"HTTP/1.1 505 HTTP parser.Version Not Supported\r\n":utf8>>
+    505 -> <<"HTTP/1.1 505 HTTP Version Not Supported\r\n":utf8>>
     506 -> <<"HTTP/1.1 506 Variant Also Negotiates\r\n":utf8>>
     507 -> <<"HTTP/1.1 507 Insufficient Storage\r\n":utf8>>
     508 -> <<"HTTP/1.1 508 Loop Detected\r\n":utf8>>

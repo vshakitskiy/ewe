@@ -72,5 +72,10 @@ pub type StreamFraming {
 }
 
 pub type SseConnection {
-  SseConnection(transport: transport.Transport, socket: socket.Socket)
+  SseConnection(
+    transport: transport.Transport,
+    socket: socket.Socket,
+    self: process.Subject(Signal),
+    framing: StreamFraming,
+  )
 }

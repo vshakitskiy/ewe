@@ -13,3 +13,4 @@ autobahn/server
 /benchmark/priv/file_100kb.bin
 /benchmark/results
 /benchmark/.wrk2
+NOTE.md

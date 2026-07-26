@@ -103,8 +103,7 @@ pub fn handle_message(
     Error(error) -> {
       logging.log(
         logging.Error,
-        "Failed to parser.parse HTTP/1.x request: "
-          <> parser.error_to_string(error),
+        "Failed to parse HTTP/1.x request: " <> parser.error_to_string(error),
       )
 
       Close
@@ -184,13 +183,31 @@ fn send_response(
         }
       }
     }
-    encoder.RemainderSse(handler: sse_handler) -> {
+    encoder.RemainderSse(handler: sse_handler, framing:) -> {
       use Nil <- result.try(transport.send(transport, socket, head))
 
-      connection.Http1Sse(http1.SseConnection(transport:, socket:))
-      |> sse_handler
-      |> to_sse_sent
-      |> Ok
+      let outcome =
+        http1.SseConnection(transport:, socket:, self:, framing:)
+        |> connection.Http1Sse
+        |> sse_handler
+
+      let _ = encoder.end_stream(transport, socket, framing)
+
+      // The stream reports whether it left the socket at a point another
+      // request could start from.
+      let drained = drain_messages(self)
+      let stream_keep_alive = case drained.stream {
+        option.Some(http1.StreamFinished(keep_alive:)) -> keep_alive
+        option.None -> http1.CloseAfterResponse
+      }
+
+      case outcome {
+        connection.StoppedAbnormal(reason) -> Ok(SentAbnormal(reason))
+        connection.Stopped ->
+          http1.and_keep_alive(keep_alive, stream_keep_alive)
+          |> to_sent
+          |> Ok
+      }
     }
   }
 }
@@ -199,13 +216,6 @@ fn to_sent(keep_alive: http1.KeepAlive) -> Sent {
   case keep_alive {
     http1.KeepAlive -> SentKeepAlive
     http1.CloseAfterResponse -> SentClose
-  }
-}
-
-fn to_sse_sent(outcome: connection.Outcome) -> Sent {
-  case outcome {
-    connection.Stopped -> SentClose
-    connection.StoppedAbnormal(reason:) -> SentAbnormal(reason)
   }
 }
 

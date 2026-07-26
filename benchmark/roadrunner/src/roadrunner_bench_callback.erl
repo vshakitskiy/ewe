@@ -6,6 +6,8 @@
 
 -include_lib("kernel/include/file.hrl").
 
+-define(SSE_EVENTS, 32).
+
 handle(Req) ->
   route(roadrunner_req:method(Req), roadrunner_req:path(Req), Req).
 
@@ -27,6 +29,14 @@ route(~"GET", ~"/stream", Req) ->
   end},
   {Resp, Req};
 
+route(~"GET", ~"/sse", Req) ->
+  Headers = [
+    {~"content-type", ~"text/event-stream"},
+    {~"cache-control", ~"no-cache"}
+  ],
+  Resp = {stream, 200, Headers, fun(Send) -> start_sse(Send) end},
+  {Resp, Req};
+
 route(~"GET", ~"/file/small", Req) ->
   send_file(Req, "../priv/file_100kb.bin");
 route(~"GET", ~"/file/big", Req) ->
@@ -34,6 +44,25 @@ route(~"GET", ~"/file/big", Req) ->
 
 route(_Method, _Path, Req) ->
   {roadrunner_resp:not_found(), Req}.
+
+start_sse(Send) ->
+  self() ! {sse_tick, 1},
+  send_sse(Send).
+
+send_sse(Send) ->
+  receive
+    {sse_tick, N} when N >= ?SSE_EVENTS ->
+      Send(sse_event(N), fin);
+    {sse_tick, N} ->
+      Send(sse_event(N), nofin),
+      self() ! {sse_tick, N + 1},
+      send_sse(Send)
+  end.
+
+sse_event(N) ->
+  Id = integer_to_binary(N),
+  Data = <<"{\"n\":", Id/binary, ",\"at\":\"benchmark\"}">>,
+  iolist_to_binary(roadrunner_sse:event(~"tick", Data, Id)).
 
 read_all_chunks(Req, Acc) ->
   case roadrunner_req:read_body_chunked(Req) of

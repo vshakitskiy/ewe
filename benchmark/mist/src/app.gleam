@@ -4,7 +4,10 @@ import gleam/erlang/process.{type Subject}
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/int
 import gleam/option
+import gleam/otp/actor
+import gleam/string_tree
 import logging
 import mist
 
@@ -37,14 +40,11 @@ fn handle_request(
       }
     http.Post, "/echo/chunked" -> echo_chunked(request)
     http.Get, "/stream" -> stream_hello(request)
+    http.Get, "/sse" -> sse_burst(request)
     http.Get, "/file/small" -> {
       // head -c 100K /dev/urandom > file_100kb.bin
       let assert Ok(file) =
-        mist.send_file(
-          "../priv/file_100kb.bin",
-          offset: 0,
-          limit: option.None,
-        )
+        mist.send_file("../priv/file_100kb.bin", offset: 0, limit: option.None)
 
       response.Response(
         status: 200,
@@ -55,11 +55,7 @@ fn handle_request(
     http.Get, "/file/big" -> {
       // head -c 1G /dev/urandom > file_1gb.bin
       let assert Ok(file) =
-        mist.send_file(
-          "../priv/file_1gb.bin",
-          offset: 0,
-          limit: option.None,
-        )
+        mist.send_file("../priv/file_1gb.bin", offset: 0, limit: option.None)
 
       response.Response(
         status: 200,
@@ -128,4 +124,48 @@ fn stream_hello(
       }
     },
   )
+}
+
+/// Events emitted per `/sse` stream. Fixed across every benchmarked server so
+/// that streams/sec times this is a comparable events/sec.
+const sse_events = 32
+
+type Tick {
+  Tick(Int)
+}
+
+/// Emits `sse_events` events back to back with no pacing, then ends the
+/// stream. A paced stream would measure the timer rather than the server.
+fn sse_burst(
+  request: request.Request(mist.Connection),
+) -> response.Response(mist.ResponseData) {
+  mist.server_sent_events(
+    request:,
+    initial_response: response.new(200),
+    init: fn(subject: Subject(Tick)) {
+      process.send(subject, Tick(1))
+      subject
+    },
+    loop: fn(subject, message, connection) {
+      let Tick(n) = message
+
+      case mist.send_event(connection, tick_event(n)) {
+        Error(Nil) -> actor.stop()
+        Ok(Nil) if n >= sse_events -> actor.stop()
+        Ok(Nil) -> {
+          process.send(subject, Tick(n + 1))
+          actor.continue(subject)
+        }
+      }
+    },
+  )
+}
+
+fn tick_event(n: Int) -> mist.SSEEvent {
+  let n = int.to_string(n)
+
+  string_tree.from_string("{\"n\":" <> n <> ",\"at\":\"benchmark\"}")
+  |> mist.event
+  |> mist.event_name("tick")
+  |> mist.event_id(n)
 }

@@ -11,7 +11,8 @@
     find_unsafe_header_byte/1,
     split_comma/1,
     list_to_bit_array/1,
-    bit_array_to_string/1
+    bit_array_to_string/1,
+    socket_error_reason/1
 ]).
 
 %% Compiles and caches match patterns once at module load.
@@ -48,6 +49,10 @@ split_comma(Bin) ->
 %% Flattens a list of bytes into a binary in one pass.
 list_to_bit_array(Bytes) ->
   erlang:list_to_binary(Bytes).
+
+%% Reason carried by a `{tcp_error, Socket, Reason}` message.
+socket_error_reason({_Tag, _Socket, Reason}) ->
+  Reason.
 
 %% Validates UTF-8 via native BIFs and returns the bytes unchanged.
 bit_array_to_string(Bin) ->
