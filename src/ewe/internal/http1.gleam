@@ -1,19 +1,17 @@
-import ewe/internal/clock
 import ewe/internal/connection
 import ewe/internal/file
-import gleam/bit_array
+import ewe/internal/http1/body
+import ewe/internal/http1/connection as http1
+import ewe/internal/http1/encoder
+import ewe/internal/http1/parser
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
-import gleam/int
-import gleam/list
 import gleam/option
 import gleam/result
-import gleam/string
 import glisten
-import glisten/internal/handler
 import glisten/socket
 import glisten/transport
 import logging
@@ -27,8 +25,6 @@ pub type State {
   )
 }
 
-pub const idle_timeout = 10_000
-
 pub type Next {
   Continue(State)
   Close
@@ -36,7 +32,8 @@ pub type Next {
 }
 
 type Sent {
-  Sent(keep_alive: Bool)
+  SentKeepAlive
+  SentClose
   SentAbnormal(reason: String)
 }
 
@@ -44,22 +41,14 @@ pub fn handle_message(
   state: State,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  case state.idle_timer {
-    option.Some(timer) -> process.cancel_timer(timer)
-    option.None -> process.TimerNotFound
-  }
+  connection.cancel_idle_timer(state.idle_timer)
 
-  case parse(state.buffer) {
-    Ok(Complete(head, metadata, remaining)) -> {
-      let scheme = case connection.transport {
-        transport.Tcp -> http.Http
-        transport.Ssl -> http.Https
-      }
-
+  case parser.parse(state.buffer) {
+    Ok(parser.Complete(head, metadata, remaining)) -> {
       let self = process.new_subject()
 
       let body_connection =
-        connection.Http1Connection(
+        http1.Connection(
           transport: connection.transport,
           socket: connection.socket,
           self:,
@@ -69,142 +58,53 @@ pub fn handle_message(
           chunk_remaining: 0,
         )
 
-      let request =
-        request.Request(
-          method: head.method,
-          headers: head.headers,
-          body: connection.Http1(body_connection),
-          scheme:,
-          host: head.host,
-          port: head.port,
-          path: head.path,
-          query: head.query,
-        )
-
-      let response = state.handler(request)
+      let response =
+        state.handler(to_request(head, connection, body_connection))
 
       let drained = drain_messages(self)
-
-      let #(buffer, body_drained) = resolve_body(body_connection, drained.body)
-
-      let metadata =
-        Metadata(..metadata, keep_alive: metadata.keep_alive && body_drained)
+      let ResolvedBody(buffer, body_keep_alive) =
+        resolve_body(body_connection, drained.body)
+      let keep_alive =
+        http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
       let sent = case
-        encode_response(response, head.method, head.version, metadata)
+        encoder.encode_response(response, head.method, head.version, keep_alive)
       {
-        Ok(Encoded(bytes:, keep_alive:, remainder:)) -> {
-          use Nil <- result.try(transport.send(
-            connection.transport,
-            connection.socket,
-            bytes,
-          ))
-
-          case remainder {
-            NoRemainder -> Ok(Sent(keep_alive))
-            RemainderFile(data) ->
-              case file.send(connection.transport, connection.socket, data) {
-                Ok(Nil) -> Ok(Sent(keep_alive))
-                Error(reason) -> Error(reason)
-              }
-            RemainderStream(Stream(handler: stream_handler, chunked:)) -> {
-              connection.Http1Writer(connection.Http1ResponseWriter(
-                transport: connection.transport,
-                socket: connection.socket,
-                self:,
-                chunked:,
-                keep_alive:,
-              ))
-              |> stream_handler
-
-              let stream_drained = drain_messages(self)
-              let stream_keep_alive = case stream_drained.stream {
-                option.Some(connection.StreamFinished(keep_alive:)) ->
-                  keep_alive
-                option.None -> {
-                  case chunked {
-                    True -> {
-                      let _ =
-                        transport.send(
-                          connection.transport,
-                          connection.socket,
-                          bytes_tree.from_bit_array(<<"0\r\n\r\n":utf8>>),
-                        )
-                      Nil
-                    }
-                    False -> Nil
-                  }
-                  False
-                }
-                option.Some(connection.BodyDrained(..))
-                | option.Some(connection.BodyAbandoned)
-                | option.Some(connection.BodyProgress(..)) ->
-                  panic as "drain_messages stores body messages in the other field"
-              }
-
-              Ok(Sent(keep_alive && stream_keep_alive))
-            }
-            RemainderSse(handler: sse_handler) -> {
-              let sse_connection =
-                connection.Http1Sse(connection.Http1SseConnection(
-                  transport: connection.transport,
-                  socket: connection.socket,
-                ))
-
-              case sse_handler(sse_connection) {
-                connection.Stopped -> Ok(Sent(False))
-                connection.StoppedAbnormal(reason:) -> Ok(SentAbnormal(reason))
-              }
-            }
-          }
-        }
-        Error(UnsafeHeader(name)) -> {
+        Ok(encoded) ->
+          send_response(encoded, connection.transport, connection.socket, self)
+        Error(encoder.UnsafeHeader(name)) -> {
           logging.log(
             logging.Error,
             "Handler produced an unsafe response header: " <> name,
           )
 
-          use Nil <- result.try(transport.send(
+          transport.send(
             connection.transport,
             connection.socket,
-            internal_server_error(),
-          ))
-
-          Ok(Sent(False))
+            encoder.internal_server_error(),
+          )
+          |> result.replace(SentClose)
         }
       }
 
       case sent {
-        Ok(Sent(True)) -> {
-          let timer =
-            process.send_after(
-              connection.subject,
-              idle_timeout,
-              handler.User(connection.Timeout),
-            )
-
-          State(..state, buffer:, idle_timer: option.Some(timer))
-          |> Continue
+        Ok(SentKeepAlive) -> {
+          let idle_timer = connection.start_idle_timer(connection)
+          Continue(State(..state, buffer:, idle_timer:))
         }
-        Ok(Sent(False)) -> Close
+        Ok(SentClose) -> Close
         Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
         Error(_reason) -> Close
       }
     }
-    Ok(Incomplete) -> {
-      let timer =
-        process.send_after(
-          connection.subject,
-          idle_timeout,
-          handler.User(connection.Timeout),
-        )
-
-      Continue(State(..state, idle_timer: option.Some(timer)))
-    }
+    Ok(parser.Incomplete) ->
+      State(..state, idle_timer: connection.start_idle_timer(connection))
+      |> Continue
     Error(error) -> {
       logging.log(
         logging.Error,
-        "Failed to parse HTTP/1.x request: " <> error_to_string(error),
+        "Failed to parser.parse HTTP/1.x request: "
+          <> parser.error_to_string(error),
       )
 
       Close
@@ -212,1398 +112,164 @@ pub fn handle_message(
   }
 }
 
-pub type BodyError {
-  BodyTooLarge
-  InvalidBody
+fn to_request(
+  head: parser.Head,
+  connection: glisten.Connection(connection.Message),
+  body: http1.Connection,
+) -> request.Request(connection.Connection) {
+  let scheme = case connection.transport {
+    transport.Tcp -> http.Http
+    transport.Ssl -> http.Https
+  }
+
+  request.Request(
+    method: head.method,
+    headers: head.headers,
+    body: connection.Http1(body),
+    scheme:,
+    host: head.host,
+    port: head.port,
+    path: head.path,
+    query: head.query,
+  )
 }
 
-pub type Connection =
-  connection.Http1Connection
+fn send_response(
+  encoded: encoder.Encoded,
+  transport: transport.Transport,
+  socket: socket.Socket,
+  self: process.Subject(http1.Signal),
+) -> Result(Sent, socket.SocketReason) {
+  let encoder.Encoded(head:, keep_alive:, remainder:) = encoded
 
-const body_read_timeout = 10_000
+  case remainder {
+    encoder.NoRemainder -> {
+      use Nil <- result.try(transport.send(transport, socket, head))
+      Ok(to_sent(keep_alive))
+    }
+    encoder.RemainderInline(body) -> {
+      use Nil <- result.try(transport.send(
+        transport,
+        socket,
+        bytes_tree.append_tree(head, body),
+      ))
+      Ok(to_sent(keep_alive))
+    }
+    encoder.RemainderFile(data) -> {
+      use Nil <- result.try(transport.send(transport, socket, head))
+      use Nil <- result.try(file.send(transport, socket, data))
+      Ok(to_sent(keep_alive))
+    }
+    encoder.RemainderStream(handler: stream_handler, framing:) -> {
+      use Nil <- result.try(transport.send(transport, socket, head))
+
+      connection.Http1Writer(http1.ResponseWriter(
+        transport:,
+        socket:,
+        self:,
+        framing:,
+        keep_alive:,
+      ))
+      |> stream_handler
+
+      let drained = drain_messages(self)
+      case drained.stream {
+        option.Some(http1.StreamFinished(keep_alive:)) ->
+          Ok(to_sent(keep_alive))
+        // A handler that returns without finishing left the body unterminated,
+        // so close it out here and drop a connection we can no longer reuse.
+        option.None -> {
+          let _ = encoder.end_stream(transport, socket, framing)
+          Ok(SentClose)
+        }
+      }
+    }
+    encoder.RemainderSse(handler: sse_handler) -> {
+      use Nil <- result.try(transport.send(transport, socket, head))
+
+      connection.Http1Sse(http1.SseConnection(transport:, socket:))
+      |> sse_handler
+      |> to_sse_sent
+      |> Ok
+    }
+  }
+}
+
+fn to_sent(keep_alive: http1.KeepAlive) -> Sent {
+  case keep_alive {
+    http1.KeepAlive -> SentKeepAlive
+    http1.CloseAfterResponse -> SentClose
+  }
+}
+
+fn to_sse_sent(outcome: connection.Outcome) -> Sent {
+  case outcome {
+    connection.Stopped -> SentClose
+    connection.StoppedAbnormal(reason:) -> SentAbnormal(reason)
+  }
+}
 
 const auto_drain_limit = 1_048_576
 
-pub fn read_body(
-  conn: Connection,
-  limit: Int,
-) -> Result(#(BitArray, List(#(String, String))), BodyError) {
-  let connection.Http1Connection(
-    transport:,
-    socket:,
-    self:,
-    buffer:,
-    framing:,
-    ..,
-  ) = conn
-
-  case framing, consume_body(transport, socket, buffer, framing, limit) {
-    _framing, Ok(#(body, trailers, leftover)) -> {
-      process.send(self, connection.BodyDrained(leftover:))
-      Ok(#(body, trailers))
-    }
-    connection.Fixed(_length), Error(BodyTooLarge) -> Error(BodyTooLarge)
-    _framing, Error(error) -> {
-      process.send(self, connection.BodyAbandoned)
-      Error(error)
-    }
-  }
-}
-
-pub type ChunkRead {
-  Chunk(data: BitArray, connection: Connection)
-  Done(trailers: List(#(String, String)))
-}
-
-pub fn read_body_chunk(
-  conn: Connection,
-  max_chunk_bytes max_chunk_bytes: Int,
-  limit limit: Int,
-) -> Result(ChunkRead, BodyError) {
-  let connection.Http1Connection(self:, buffer:, read:, chunk_remaining:, ..) =
-    conn
-
-  case pull_chunk(conn, max_chunk_bytes, limit) {
-    Ok(PulledChunk(data, next)) -> {
-      connection.BodyProgress(buffer:, read:, chunk_remaining:)
-      |> process.send(self, _)
-
-      Ok(Chunk(data, next))
-    }
-    Ok(PulledDone(trailers, leftover)) -> {
-      process.send(self, connection.BodyDrained(leftover:))
-
-      Ok(Done(trailers))
-    }
-    Error(error) -> {
-      process.send(self, connection.BodyAbandoned)
-
-      Error(error)
-    }
-  }
-}
-
 const auto_drain_chunk_bytes = 65_536
 
+/// What the request body left behind: the bytes after it, which begin the next
+/// pipelined request, and whether it was consumed cleanly enough to reuse the
+/// connection at all.
+type ResolvedBody {
+  ResolvedBody(leftover: BitArray, keep_alive: http1.KeepAlive)
+}
+
 fn resolve_body(
-  conn: Connection,
-  drained: option.Option(connection.Http1Signal),
-) -> #(BitArray, Bool) {
+  conn: http1.Connection,
+  drained: option.Option(http1.BodySignal),
+) -> ResolvedBody {
   case drained {
-    option.Some(connection.BodyDrained(leftover)) -> #(leftover, True)
-    option.Some(connection.BodyAbandoned) -> #(<<>>, False)
-    option.Some(connection.BodyProgress(buffer:, read:, chunk_remaining:)) ->
-      connection.Http1Connection(..conn, buffer:, read:, chunk_remaining:)
+    option.Some(http1.BodyDrained(leftover)) ->
+      ResolvedBody(leftover, http1.KeepAlive)
+    option.Some(http1.BodyAbandoned) ->
+      ResolvedBody(<<>>, http1.CloseAfterResponse)
+    option.Some(http1.BodyProgress(buffer:, read:, chunk_remaining:)) ->
+      http1.Connection(..conn, buffer:, read:, chunk_remaining:)
       |> drain_remaining
     option.None -> drain_remaining(conn)
-    option.Some(connection.StreamFinished(..)) ->
-      panic as "drain_messages stores stream messages in the other field"
   }
 }
 
 type Drained {
   Drained(
-    body: option.Option(connection.Http1Signal),
-    stream: option.Option(connection.Http1Signal),
+    body: option.Option(http1.BodySignal),
+    stream: option.Option(http1.StreamSignal),
   )
 }
 
-fn drain_messages(self: process.Subject(connection.Http1Signal)) -> Drained {
+fn drain_messages(self: process.Subject(http1.Signal)) -> Drained {
   do_drain_messages(self, Drained(body: option.None, stream: option.None))
 }
 
 fn do_drain_messages(
-  self: process.Subject(connection.Http1Signal),
+  self: process.Subject(http1.Signal),
   acc: Drained,
 ) -> Drained {
   case process.receive(self, 0) {
-    Ok(connection.StreamFinished(..) as message) ->
-      do_drain_messages(self, Drained(..acc, stream: option.Some(message)))
-    Ok(message) ->
-      do_drain_messages(self, Drained(..acc, body: option.Some(message)))
+    Ok(http1.BodySignal(signal)) ->
+      do_drain_messages(self, Drained(..acc, body: option.Some(signal)))
+    Ok(http1.StreamSignal(signal)) ->
+      do_drain_messages(self, Drained(..acc, stream: option.Some(signal)))
     Error(Nil) -> acc
   }
 }
 
-fn drain_remaining(conn: Connection) -> #(BitArray, Bool) {
-  let connection.Http1Connection(read:, ..) = conn
+fn drain_remaining(conn: http1.Connection) -> ResolvedBody {
+  let http1.Connection(read:, ..) = conn
   do_drain_remaining(conn, read + auto_drain_limit)
 }
 
-fn do_drain_remaining(conn: Connection, limit: Int) -> #(BitArray, Bool) {
-  case pull_chunk(conn, auto_drain_chunk_bytes, limit) {
-    Ok(PulledChunk(_data, next)) -> do_drain_remaining(next, limit)
-    Ok(PulledDone(_trailers, leftover)) -> #(leftover, True)
-    Error(_reason) -> #(<<>>, False)
+fn do_drain_remaining(conn: http1.Connection, limit: Int) -> ResolvedBody {
+  case body.pull_chunk(conn, auto_drain_chunk_bytes, limit) {
+    Ok(body.PulledChunk(_data, next)) -> do_drain_remaining(next, limit)
+    Ok(body.PulledDone(_trailers, leftover)) ->
+      ResolvedBody(leftover, http1.KeepAlive)
+    Error(_reason) -> ResolvedBody(<<>>, http1.CloseAfterResponse)
   }
 }
-
-fn consume_body(
-  transport: transport.Transport,
-  socket: socket.Socket,
-  buffer: BitArray,
-  framing: connection.Framing,
-  limit: Int,
-) -> Result(#(BitArray, List(#(String, String)), BitArray), BodyError) {
-  case framing {
-    connection.NoBody -> Ok(#(<<>>, [], buffer))
-    connection.Fixed(length) if length > limit -> Error(BodyTooLarge)
-    connection.Fixed(length) ->
-      read_fixed(transport, socket, buffer, length) |> to_body_result
-    connection.Chunked ->
-      read_chunked(transport, socket, buffer, limit, bytes_tree.new(), 0)
-      |> to_body_result
-  }
-}
-
-fn to_body_result(result: Result(a, ParseError)) -> Result(a, BodyError) {
-  case result {
-    Ok(value) -> Ok(value)
-    Error(ChunkTooLarge) -> Error(BodyTooLarge)
-    Error(_other) -> Error(InvalidBody)
-  }
-}
-
-fn read_fixed(
-  transport: transport.Transport,
-  socket: socket.Socket,
-  buffer: BitArray,
-  length: Int,
-) -> Result(#(BitArray, List(#(String, String)), BitArray), ParseError) {
-  case buffer {
-    <<body:bytes-size(length), leftover:bits>> -> Ok(#(body, [], leftover))
-    _ -> {
-      case
-        transport.receive_timeout(
-          transport,
-          socket,
-          length - bit_array.byte_size(buffer),
-          body_read_timeout,
-        )
-      {
-        Ok(more) -> Ok(#(<<buffer:bits, more:bits>>, [], <<>>))
-        Error(_reason) -> Error(BodyReadFailed)
-      }
-    }
-  }
-}
-
-fn read_chunked(
-  transport: transport.Transport,
-  socket: socket.Socket,
-  buffer: BitArray,
-  limit: Int,
-  acc: bytes_tree.BytesTree,
-  total: Int,
-) -> Result(#(BitArray, List(#(String, String)), BitArray), ParseError) {
-  use #(size, remaining) <- result.try(pull_until(
-    transport,
-    socket,
-    buffer,
-    parse_chunk_line,
-  ))
-
-  case size {
-    0 -> {
-      use #(trailers, _state, remaining) <- result.try({
-        use buffer <- pull_until(transport, socket, remaining)
-        parse_headers(buffer, [], 0, initial_header_state())
-      })
-
-      Ok(#(bytes_tree.to_bit_array(acc), trailers, remaining))
-    }
-    size -> {
-      let total = total + size
-      case total > limit {
-        True -> Error(ChunkTooLarge)
-        False -> {
-          use #(data, remaining) <- result.try({
-            use buffer <- pull_until(transport, socket, remaining)
-            take_chunk_prefix(buffer, size, True)
-          })
-
-          read_chunked(
-            transport,
-            socket,
-            remaining,
-            limit,
-            bytes_tree.append(acc, data),
-            total,
-          )
-        }
-      }
-    }
-  }
-}
-
-type Pulled {
-  PulledChunk(data: BitArray, connection: Connection)
-  PulledDone(trailers: List(#(String, String)), leftover: BitArray)
-}
-
-fn pull_chunk(
-  conn: Connection,
-  max_chunk_bytes: Int,
-  limit: Int,
-) -> Result(Pulled, BodyError) {
-  let connection.Http1Connection(buffer:, framing:, read:, chunk_remaining:, ..) =
-    conn
-
-  case framing {
-    connection.NoBody -> Ok(PulledDone([], buffer))
-    connection.Fixed(length) if length > limit -> Error(BodyTooLarge)
-    connection.Fixed(length) ->
-      pull_fixed_chunk(conn, length, read, max_chunk_bytes) |> to_body_result
-    connection.Chunked ->
-      pull_chunked_chunk(conn, limit, read, chunk_remaining, max_chunk_bytes)
-      |> to_body_result
-  }
-}
-
-fn pull_fixed_chunk(
-  conn: Connection,
-  length: Int,
-  read: Int,
-  max_chunk_bytes: Int,
-) -> Result(Pulled, ParseError) {
-  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
-
-  case length - read {
-    0 -> Ok(PulledDone([], buffer))
-    remaining -> {
-      let want = int.min(remaining, max_chunk_bytes)
-      use #(data, _trailers, leftover) <- result.try(read_fixed(
-        transport,
-        socket,
-        buffer,
-        want,
-      ))
-      let conn =
-        connection.Http1Connection(..conn, buffer: leftover, read: read + want)
-      Ok(PulledChunk(data, conn))
-    }
-  }
-}
-
-fn pull_chunked_chunk(
-  conn: Connection,
-  limit: Int,
-  read: Int,
-  chunk_remaining: Int,
-  max_chunk_bytes: Int,
-) -> Result(Pulled, ParseError) {
-  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
-
-  case chunk_remaining {
-    0 -> {
-      use #(size, buffer) <- result.try(pull_until(
-        transport,
-        socket,
-        buffer,
-        parse_chunk_line,
-      ))
-
-      case size {
-        0 -> {
-          use #(trailers, _state, buffer) <- result.try({
-            use buffer <- pull_until(transport, socket, buffer)
-            parse_headers(buffer, [], 0, initial_header_state())
-          })
-
-          Ok(PulledDone(trailers, buffer))
-        }
-        size if read + size > limit -> Error(ChunkTooLarge)
-        size ->
-          connection.Http1Connection(..conn, buffer:)
-          |> take_chunk_slice(read, size, max_chunk_bytes)
-      }
-    }
-    remaining -> take_chunk_slice(conn, read, remaining, max_chunk_bytes)
-  }
-}
-
-fn take_chunk_slice(
-  conn: Connection,
-  read: Int,
-  chunk_remaining: Int,
-  max_chunk_bytes: Int,
-) -> Result(Pulled, ParseError) {
-  let connection.Http1Connection(transport:, socket:, buffer:, ..) = conn
-
-  let want = int.min(chunk_remaining, max_chunk_bytes)
-  let final_slice = want == chunk_remaining
-
-  use #(data, buffer) <- result.try({
-    use buffer <- pull_until(transport, socket, buffer)
-    take_chunk_prefix(buffer, want, final_slice)
-  })
-
-  let conn =
-    connection.Http1Connection(
-      ..conn,
-      buffer:,
-      read: read + want,
-      chunk_remaining: chunk_remaining - want,
-    )
-  Ok(PulledChunk(data, conn))
-}
-
-fn pull_until(
-  transport: transport.Transport,
-  socket: socket.Socket,
-  buffer: BitArray,
-  step: fn(BitArray) -> Step(a),
-) -> Result(a, ParseError) {
-  case step(buffer) {
-    StepDone(value) -> Ok(value)
-    ParseError(error) -> Error(error)
-    More ->
-      case transport.receive_timeout(transport, socket, 0, body_read_timeout) {
-        Ok(more) ->
-          pull_until(transport, socket, <<buffer:bits, more:bits>>, step)
-        Error(_reason) -> Error(BodyReadFailed)
-      }
-  }
-}
-
-fn parse_chunk_line(buffer: BitArray) -> Step(#(Int, BitArray)) {
-  use #(line, remaining) <- try_step(extract_line(
-    buffer,
-    max_chunk_size_line,
-    ChunkSizeLineTooLong,
-    BadChunkSize,
-  ))
-  use size <- try_step(parse_chunk_size(line))
-  StepDone(#(size, remaining))
-}
-
-fn parse_chunk_size(line: BitArray) -> Step(Int) {
-  case parse_hex_digits(line, 0, False) {
-    Ok(size) -> StepDone(size)
-    Error(Nil) -> ParseError(BadChunkSize)
-  }
-}
-
-fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
-  case bits {
-    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
-      parse_hex_digits(remaining, acc * 16 + { byte - 48 }, True)
-    <<byte, remaining:bits>> if byte >= 97 && byte <= 102 ->
-      parse_hex_digits(remaining, acc * 16 + { byte - 87 }, True)
-    <<byte, remaining:bits>> if byte >= 65 && byte <= 70 ->
-      parse_hex_digits(remaining, acc * 16 + { byte - 55 }, True)
-    _bits if any -> Ok(acc)
-    _bits -> Error(Nil)
-  }
-}
-
-fn take_chunk_prefix(
-  buffer: BitArray,
-  want: Int,
-  final_slice: Bool,
-) -> Step(#(BitArray, BitArray)) {
-  case final_slice {
-    True ->
-      case buffer {
-        <<data:bytes-size(want), "\r\n":utf8, remaining:bits>> ->
-          StepDone(#(data, remaining))
-        _buffer ->
-          case bit_array.byte_size(buffer) < want + 2 {
-            True -> More
-            False -> ParseError(BadChunkFraming)
-          }
-      }
-    False ->
-      case buffer {
-        <<data:bytes-size(want), remaining:bits>> ->
-          StepDone(#(data, remaining))
-        _buffer -> More
-      }
-  }
-}
-
-pub type EncodeError {
-  UnsafeHeader(name: String)
-}
-
-type EncodeState {
-  EncodeState(tree: bytes_tree.BytesTree, force_close: Bool)
-}
-
-fn initial_encode_state() -> EncodeState {
-  EncodeState(tree: bytes_tree.new(), force_close: False)
-}
-
-pub type Stream {
-  Stream(handler: fn(connection.ResponseWriter) -> Nil, chunked: Bool)
-}
-
-pub type Remainder {
-  NoRemainder
-  RemainderFile(connection.File)
-  RemainderStream(Stream)
-  RemainderSse(handler: fn(connection.SseConnection) -> connection.Outcome)
-}
-
-pub type Encoded {
-  Encoded(bytes: bytes_tree.BytesTree, keep_alive: Bool, remainder: Remainder)
-}
-
-fn build_head(
-  state: EncodeState,
-  status: Int,
-  keep_alive: Bool,
-) -> bytes_tree.BytesTree {
-  append_date(state.tree)
-  |> append_connection(keep_alive)
-  |> bytes_tree.prepend(status_line(status))
-}
-
-fn close_delimited_head(
-  state: EncodeState,
-  status: Int,
-) -> bytes_tree.BytesTree {
-  build_head(state, status, False)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-}
-
-pub fn encode_response(
-  response: response.Response(connection.Body),
-  method: http.Method,
-  version: Version,
-  metadata: Metadata,
-) -> Result(Encoded, EncodeError) {
-  use state <- result.try(encode_headers(response.headers))
-  let keep_alive = metadata.keep_alive && !state.force_close
-
-  case response.body {
-    connection.Streaming(connection.StreamingMetadata(handler)) ->
-      Ok(encode_stream(state, response, keep_alive, version, method, handler))
-    connection.Sse(connection.SseMetadata(handler)) ->
-      Ok(encode_sse(state, response, method, handler))
-    _other_body -> {
-      let length = body_length(response.body)
-      let head =
-        build_head(state, response.status, keep_alive)
-        |> bytes_tree.append_string("content-length: " <> int.to_string(length))
-        |> bytes_tree.append(<<"\r\n\r\n":utf8>>)
-
-      case method, response.body {
-        http.Head, _body -> Ok(Encoded(head, keep_alive, NoRemainder))
-        _method, connection.File(data) ->
-          Ok(Encoded(head, keep_alive, RemainderFile(data)))
-        _method, connection.Bytes(tree) ->
-          Ok(Encoded(
-            bytes_tree.append_tree(head, tree),
-            keep_alive,
-            NoRemainder,
-          ))
-        _method, connection.Text(text) ->
-          Ok(Encoded(
-            bytes_tree.append_string(head, text),
-            keep_alive,
-            NoRemainder,
-          ))
-        _method, connection.Empty -> Ok(Encoded(head, keep_alive, NoRemainder))
-        _method, connection.Streaming(..) ->
-          panic as "the Streaming body is handled above"
-        _method, connection.Sse(..) -> panic as "the Sse body is handled above"
-      }
-    }
-  }
-}
-
-fn encode_stream(
-  state: EncodeState,
-  response: response.Response(connection.Body),
-  keep_alive: Bool,
-  version: Version,
-  method: http.Method,
-  handler: fn(connection.ResponseWriter) -> Nil,
-) -> Encoded {
-  case version {
-    Http11 -> {
-      let head =
-        build_head(state, response.status, keep_alive)
-        |> bytes_tree.append_string("transfer-encoding: chunked")
-        |> bytes_tree.append(<<"\r\n\r\n":utf8>>)
-
-      case method {
-        http.Head -> Encoded(head, keep_alive, NoRemainder)
-        _method ->
-          Encoded(head, keep_alive, RemainderStream(Stream(handler, True)))
-      }
-    }
-    Http10 -> {
-      let head = close_delimited_head(state, response.status)
-
-      case method {
-        http.Head -> Encoded(head, False, NoRemainder)
-        _method -> Encoded(head, False, RemainderStream(Stream(handler, False)))
-      }
-    }
-  }
-}
-
-fn encode_sse(
-  state: EncodeState,
-  response: response.Response(connection.Body),
-  method: http.Method,
-  handler: fn(connection.SseConnection) -> connection.Outcome,
-) -> Encoded {
-  let head = close_delimited_head(state, response.status)
-
-  case method {
-    http.Head -> Encoded(head, False, NoRemainder)
-    _method -> Encoded(head, False, RemainderSse(handler))
-  }
-}
-
-pub type ResponseWriter =
-  connection.Http1ResponseWriter
-
-fn chunk_frame(chunk: BitArray) -> bytes_tree.BytesTree {
-  bytes_tree.new()
-  |> bytes_tree.append_string(int.to_base16(bit_array.byte_size(chunk)))
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-  |> bytes_tree.append(chunk)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-}
-
-pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
-  let bytes = case writer.chunked {
-    True -> chunk_frame(chunk)
-    False -> bytes_tree.from_bit_array(chunk)
-  }
-  let _ = transport.send(writer.transport, writer.socket, bytes)
-  writer
-}
-
-pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
-  let bytes = case writer.chunked {
-    True -> bytes_tree.append(chunk_frame(chunk), <<"0\r\n\r\n":utf8>>)
-    False -> bytes_tree.from_bit_array(chunk)
-  }
-  let _ = transport.send(writer.transport, writer.socket, bytes)
-  finish(writer)
-}
-
-pub fn finish_response(writer: ResponseWriter) -> Nil {
-  case writer.chunked {
-    True -> {
-      let _ =
-        transport.send(
-          writer.transport,
-          writer.socket,
-          bytes_tree.from_bit_array(<<"0\r\n\r\n":utf8>>),
-        )
-      Nil
-    }
-    False -> Nil
-  }
-  finish(writer)
-}
-
-fn finish(writer: ResponseWriter) -> Nil {
-  process.send(
-    writer.self,
-    connection.StreamFinished(keep_alive: writer.keep_alive),
-  )
-}
-
-fn encode_headers(
-  headers: List(#(String, String)),
-) -> Result(EncodeState, EncodeError) {
-  use state, #(name, value) <- list.try_fold(headers, initial_encode_state())
-  case name {
-    "content-length" | "transfer-encoding" | "date" -> Ok(state)
-    "connection" ->
-      case find_unsafe_header_byte(value) {
-        Error(Nil) -> {
-          let lowered = value |> bit_array.from_string |> lowercase_ascii
-          let force_close =
-            state.force_close || has_token(lowered, <<"close":utf8>>)
-          Ok(EncodeState(..state, force_close:))
-        }
-        Ok(_position) -> Error(UnsafeHeader(name))
-      }
-    _name ->
-      case find_unsafe_header_byte(name), find_unsafe_header_byte(value) {
-        Error(Nil), Error(Nil) -> {
-          let tree =
-            bytes_tree.append_string(state.tree, name)
-            |> bytes_tree.append(<<": ":utf8>>)
-            |> bytes_tree.append_string(value)
-            |> bytes_tree.append(<<"\r\n":utf8>>)
-
-          Ok(EncodeState(..state, tree:))
-        }
-        _other, _other -> Error(UnsafeHeader(name))
-      }
-  }
-}
-
-fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
-  bytes_tree.append_string(tree, "date: ")
-  |> bytes_tree.append(clock.get())
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-}
-
-fn append_connection(
-  tree: bytes_tree.BytesTree,
-  keep_alive: Bool,
-) -> bytes_tree.BytesTree {
-  let value = case keep_alive {
-    True -> <<"keep-alive":utf8>>
-    False -> <<"close":utf8>>
-  }
-
-  bytes_tree.append(tree, <<"connection: ":utf8>>)
-  |> bytes_tree.append(value)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
-}
-
-fn status_line(status: Int) -> BitArray {
-  case status {
-    100 -> <<"HTTP/1.1 100 Continue\r\n":utf8>>
-    101 -> <<"HTTP/1.1 101 Switching Protocols\r\n":utf8>>
-    102 -> <<"HTTP/1.1 102 Processing\r\n":utf8>>
-    103 -> <<"HTTP/1.1 103 Early Hints\r\n":utf8>>
-    200 -> <<"HTTP/1.1 200 OK\r\n":utf8>>
-    201 -> <<"HTTP/1.1 201 Created\r\n":utf8>>
-    202 -> <<"HTTP/1.1 202 Accepted\r\n":utf8>>
-    203 -> <<"HTTP/1.1 203 Non-Authoritative Information\r\n":utf8>>
-    204 -> <<"HTTP/1.1 204 No Content\r\n":utf8>>
-    205 -> <<"HTTP/1.1 205 Reset Content\r\n":utf8>>
-    206 -> <<"HTTP/1.1 206 Partial Content\r\n":utf8>>
-    207 -> <<"HTTP/1.1 207 Multi-Status\r\n":utf8>>
-    208 -> <<"HTTP/1.1 208 Already Reported\r\n":utf8>>
-    226 -> <<"HTTP/1.1 226 IM Used\r\n":utf8>>
-    300 -> <<"HTTP/1.1 300 Multiple Choices\r\n":utf8>>
-    301 -> <<"HTTP/1.1 301 Moved Permanently\r\n":utf8>>
-    302 -> <<"HTTP/1.1 302 Found\r\n":utf8>>
-    303 -> <<"HTTP/1.1 303 See Other\r\n":utf8>>
-    304 -> <<"HTTP/1.1 304 Not Modified\r\n":utf8>>
-    305 -> <<"HTTP/1.1 305 Use Proxy\r\n":utf8>>
-    307 -> <<"HTTP/1.1 307 Temporary Redirect\r\n":utf8>>
-    308 -> <<"HTTP/1.1 308 Permanent Redirect\r\n":utf8>>
-    400 -> <<"HTTP/1.1 400 Bad Request\r\n":utf8>>
-    401 -> <<"HTTP/1.1 401 Unauthorized\r\n":utf8>>
-    402 -> <<"HTTP/1.1 402 Payment Required\r\n":utf8>>
-    403 -> <<"HTTP/1.1 403 Forbidden\r\n":utf8>>
-    404 -> <<"HTTP/1.1 404 Not Found\r\n":utf8>>
-    405 -> <<"HTTP/1.1 405 Method Not Allowed\r\n":utf8>>
-    406 -> <<"HTTP/1.1 406 Not Acceptable\r\n":utf8>>
-    407 -> <<"HTTP/1.1 407 Proxy Authentication Required\r\n":utf8>>
-    408 -> <<"HTTP/1.1 408 Request Timeout\r\n":utf8>>
-    409 -> <<"HTTP/1.1 409 Conflict\r\n":utf8>>
-    410 -> <<"HTTP/1.1 410 Gone\r\n":utf8>>
-    411 -> <<"HTTP/1.1 411 Length Required\r\n":utf8>>
-    412 -> <<"HTTP/1.1 412 Precondition Failed\r\n":utf8>>
-    413 -> <<"HTTP/1.1 413 Content Too Large\r\n":utf8>>
-    414 -> <<"HTTP/1.1 414 URI Too Long\r\n":utf8>>
-    415 -> <<"HTTP/1.1 415 Unsupported Media Type\r\n":utf8>>
-    416 -> <<"HTTP/1.1 416 Range Not Satisfiable\r\n":utf8>>
-    417 -> <<"HTTP/1.1 417 Expectation Failed\r\n":utf8>>
-    418 -> <<"HTTP/1.1 418 I'm a Teapot\r\n":utf8>>
-    421 -> <<"HTTP/1.1 421 Misdirected Request\r\n":utf8>>
-    422 -> <<"HTTP/1.1 422 Unprocessable Content\r\n":utf8>>
-    423 -> <<"HTTP/1.1 423 Locked\r\n":utf8>>
-    424 -> <<"HTTP/1.1 424 Failed Dependency\r\n":utf8>>
-    425 -> <<"HTTP/1.1 425 Too Early\r\n":utf8>>
-    426 -> <<"HTTP/1.1 426 Upgrade Required\r\n":utf8>>
-    428 -> <<"HTTP/1.1 428 Precondition Required\r\n":utf8>>
-    429 -> <<"HTTP/1.1 429 Too Many Requests\r\n":utf8>>
-    431 -> <<"HTTP/1.1 431 Request Header Fields Too Large\r\n":utf8>>
-    451 -> <<"HTTP/1.1 451 Unavailable For Legal Reasons\r\n":utf8>>
-    500 -> <<"HTTP/1.1 500 Internal Server Error\r\n":utf8>>
-    501 -> <<"HTTP/1.1 501 Not Implemented\r\n":utf8>>
-    502 -> <<"HTTP/1.1 502 Bad Gateway\r\n":utf8>>
-    503 -> <<"HTTP/1.1 503 Service Unavailable\r\n":utf8>>
-    504 -> <<"HTTP/1.1 504 Gateway Timeout\r\n":utf8>>
-    505 -> <<"HTTP/1.1 505 HTTP Version Not Supported\r\n":utf8>>
-    506 -> <<"HTTP/1.1 506 Variant Also Negotiates\r\n":utf8>>
-    507 -> <<"HTTP/1.1 507 Insufficient Storage\r\n":utf8>>
-    508 -> <<"HTTP/1.1 508 Loop Detected\r\n":utf8>>
-    510 -> <<"HTTP/1.1 510 Not Extended\r\n":utf8>>
-    511 -> <<"HTTP/1.1 511 Network Authentication Required\r\n":utf8>>
-    _other -> <<"HTTP/1.1 ":utf8, int.to_string(status):utf8, " \r\n":utf8>>
-  }
-}
-
-fn body_length(body: connection.Body) -> Int {
-  case body {
-    connection.Bytes(tree) -> bytes_tree.byte_size(tree)
-    connection.Text(text) -> string.byte_size(text)
-    connection.Empty -> 0
-    connection.File(data) -> data.length
-    connection.Streaming(..) -> panic as "the Streaming body is handled above"
-    connection.Sse(..) -> panic as "the Sse body is handled above"
-  }
-}
-
-fn internal_server_error() -> bytes_tree.BytesTree {
-  bytes_tree.new()
-  |> bytes_tree.append(<<
-    "HTTP/1.1 500 Internal Server Error\r\ndate: ":utf8,
-  >>)
-  |> bytes_tree.append(clock.get())
-  |> bytes_tree.append(<<
-    "\r\nconnection: close\r\ncontent-length: 0\r\n\r\n":utf8,
-  >>)
-}
-
-pub type Version {
-  Http10
-  Http11
-}
-
-pub type Head {
-  Head(
-    method: http.Method,
-    host: String,
-    port: option.Option(Int),
-    path: String,
-    query: option.Option(String),
-    version: Version,
-    headers: List(#(String, String)),
-  )
-}
-
-pub type Metadata {
-  Metadata(
-    framing: connection.Framing,
-    keep_alive: Bool,
-    upgrade: option.Option(String),
-  )
-}
-
-pub type ParseError {
-  RequestLineTooLong
-  BadRequestLine
-  BadMethod
-  BadTarget
-  BadVersion
-  HeaderLineTooLong
-  BadHeader
-  TooManyHeaders
-  DuplicateContentLength
-  BadContentLength
-  DuplicateHost
-  BadHost
-  MissingHost
-  AmbiguousFraming
-  ChunkSizeLineTooLong
-  BadChunkSize
-  BadChunkFraming
-  ChunkTooLarge
-  BodyReadFailed
-}
-
-pub fn error_to_string(error: ParseError) -> String {
-  case error {
-    RequestLineTooLong ->
-      "request line exceeds " <> int.to_string(max_request_line) <> " bytes"
-    BadRequestLine -> "malformed request line"
-    BadMethod -> "invalid request method"
-    BadTarget -> "invalid request target"
-    BadVersion -> "unsupported or malformed HTTP version"
-    HeaderLineTooLong ->
-      "header line exceeds " <> int.to_string(max_header_line) <> " bytes"
-    BadHeader -> "malformed header line"
-    TooManyHeaders ->
-      "too many headers (max " <> int.to_string(max_headers) <> ")"
-    DuplicateContentLength -> "duplicate Content-Length header"
-    BadContentLength -> "invalid Content-Length value"
-    DuplicateHost -> "duplicate Host header"
-    BadHost -> "invalid Host header"
-    MissingHost -> "missing required Host header"
-    AmbiguousFraming ->
-      "conflicting Content-Length and Transfer-Encoding headers"
-    ChunkSizeLineTooLong ->
-      "chunk size line exceeds "
-      <> int.to_string(max_chunk_size_line)
-      <> " bytes"
-    BadChunkSize -> "malformed chunk size"
-    BadChunkFraming -> "malformed chunk data framing"
-    ChunkTooLarge -> "chunked body exceeds size limit"
-    BodyReadFailed -> "failed to read request body from the socket"
-  }
-}
-
-pub type Parsed {
-  Complete(head: Head, metadata: Metadata, remaining: BitArray)
-  Incomplete
-}
-
-const max_request_line = 8192
-
-const max_header_line = 8192
-
-const max_headers = 100
-
-const max_chunk_size_line = 128
-
-pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
-  let step = {
-    use #(method, target, version, remaining) <- try_step(parse_request_line(
-      buffer,
-    ))
-
-    use #(headers, state, remaining) <- try_step(parse_headers(
-      remaining,
-      [],
-      0,
-      initial_header_state(),
-    ))
-
-    use #(host, port, path, query) <- try_step(resolve_target(
-      method,
-      target,
-      version,
-      state.host,
-    ))
-
-    use metadata <- try_step(resolve_metadata(state, version))
-
-    StepDone(Complete(
-      Head(method:, host:, port:, path:, query:, version:, headers:),
-      metadata,
-      remaining,
-    ))
-  }
-
-  case step {
-    StepDone(parsed) -> Ok(parsed)
-    More -> Ok(Incomplete)
-    ParseError(error) -> Error(error)
-  }
-}
-
-type Step(a) {
-  StepDone(a)
-  More
-  ParseError(ParseError)
-}
-
-fn try_step(step: Step(a), next: fn(a) -> Step(b)) -> Step(b) {
-  case step {
-    StepDone(value) -> next(value)
-    More -> More
-    ParseError(error) -> ParseError(error)
-  }
-}
-
-fn parse_request_line(
-  buffer: BitArray,
-) -> Step(#(http.Method, BitArray, Version, BitArray)) {
-  use #(line, remaining) <- try_step(extract_line(
-    buffer,
-    max_request_line,
-    RequestLineTooLong,
-    BadRequestLine,
-  ))
-
-  use #(method, target_and_version) <- try_step(parse_method(line))
-
-  use #(target, version) <- try_step(parse_target_version(target_and_version))
-
-  StepDone(#(method, target, version, remaining))
-}
-
-fn parse_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
-  case line {
-    <<"GET ":utf8, remaining:bits>> -> StepDone(#(http.Get, remaining))
-    <<"POST ":utf8, remaining:bits>> -> StepDone(#(http.Post, remaining))
-    <<"PUT ":utf8, remaining:bits>> -> StepDone(#(http.Put, remaining))
-    <<"DELETE ":utf8, remaining:bits>> -> StepDone(#(http.Delete, remaining))
-    <<"HEAD ":utf8, remaining:bits>> -> StepDone(#(http.Head, remaining))
-    <<"OPTIONS ":utf8, remaining:bits>> -> StepDone(#(http.Options, remaining))
-    <<"PATCH ":utf8, remaining:bits>> -> StepDone(#(http.Patch, remaining))
-    <<"TRACE ":utf8, remaining:bits>> -> StepDone(#(http.Trace, remaining))
-    <<"CONNECT ":utf8, remaining:bits>> -> StepDone(#(http.Connect, remaining))
-    _other -> parse_other_method(line)
-  }
-}
-
-fn parse_other_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
-  case find_space(line) {
-    Error(Nil) -> ParseError(BadRequestLine)
-    Ok(position) ->
-      case line {
-        <<name:bytes-size(position), " ":utf8, remaining:bits>> ->
-          case bit_array_to_string(name) {
-            Error(Nil) -> ParseError(BadMethod)
-            Ok(name) ->
-              case http.parse_method(name) {
-                Ok(method) -> StepDone(#(method, remaining))
-                Error(Nil) -> ParseError(BadMethod)
-              }
-          }
-        _line -> ParseError(BadRequestLine)
-      }
-  }
-}
-
-fn parse_target_version(bits: BitArray) -> Step(#(BitArray, Version)) {
-  let size = bit_array.byte_size(bits)
-
-  case size < 10 {
-    True -> ParseError(BadRequestLine)
-    False -> {
-      let target_size = size - 9
-      case bits {
-        <<target:bytes-size(target_size), " HTTP/1.1":utf8>> ->
-          StepDone(#(target, Http11))
-        <<target:bytes-size(target_size), " HTTP/1.0":utf8>> ->
-          StepDone(#(target, Http10))
-        _bits -> ParseError(BadVersion)
-      }
-    }
-  }
-}
-
-fn split_target(target: BitArray) -> Step(#(String, option.Option(String))) {
-  case find_question(target) {
-    Error(Nil) -> {
-      use path <- try_step(decode_component(target, BadTarget))
-      StepDone(#(path, option.None))
-    }
-    Ok(position) -> {
-      let size = bit_array.byte_size(target)
-
-      case target {
-        <<
-          path:bytes-size(position),
-          "?":utf8,
-          query:bytes-size(size - position - 1),
-        >> -> {
-          use path <- try_step(decode_component(path, BadTarget))
-          use query <- try_step(decode_component(query, BadTarget))
-          StepDone(#(path, option.Some(query)))
-        }
-        _target -> ParseError(BadTarget)
-      }
-    }
-  }
-}
-
-fn decode_component(bits: BitArray, on_error: ParseError) -> Step(String) {
-  case bit_array_to_string(bits) {
-    Ok(value) -> StepDone(value)
-    Error(Nil) -> ParseError(on_error)
-  }
-}
-
-fn validate_path(method: http.Method, path: String) -> Step(String) {
-  case path, method {
-    "*", http.Options -> StepDone(path)
-    "/" <> _remaining, _method -> StepDone(path)
-    _path, _method -> ParseError(BadTarget)
-  }
-}
-
-fn resolve_target(
-  method: http.Method,
-  target: BitArray,
-  version: Version,
-  header_host: option.Option(#(String, option.Option(Int))),
-) -> Step(#(String, option.Option(Int), String, option.Option(String))) {
-  case method {
-    http.Connect ->
-      case split_host_port(target) {
-        Ok(#(host, option.Some(_port) as port)) ->
-          case bit_array_to_string(host) {
-            Ok(host) -> StepDone(#(host, port, "", option.None))
-            Error(Nil) -> ParseError(BadTarget)
-          }
-        Ok(#(_host, option.None)) -> ParseError(BadTarget)
-        Error(Nil) -> ParseError(BadTarget)
-      }
-    _method -> {
-      use #(path, query) <- try_step(split_target(target))
-      use path <- try_step(validate_path(method, path))
-      use #(host, port) <- try_step(resolve_host(version, header_host))
-      StepDone(#(host, port, path, query))
-    }
-  }
-}
-
-fn resolve_host(
-  version: Version,
-  header_host: option.Option(#(String, option.Option(Int))),
-) -> Step(#(String, option.Option(Int))) {
-  case header_host, version {
-    option.Some(host_port), _version -> StepDone(host_port)
-    option.None, Http10 -> StepDone(#("", option.None))
-    option.None, Http11 -> ParseError(MissingHost)
-  }
-}
-
-fn split_host_port(
-  value: BitArray,
-) -> Result(#(BitArray, option.Option(Int)), Nil) {
-  case value {
-    <<"[":utf8, _remaining:bits>> -> split_bracketed_host(value)
-    _value ->
-      case find_colon(value) {
-        Error(Nil) -> Ok(#(value, option.None))
-        Ok(position) -> {
-          let size = bit_array.byte_size(value)
-          case value {
-            <<
-              host:bytes-size(position),
-              ":":utf8,
-              port:bytes-size(size - position - 1),
-            >> ->
-              case parse_port(port) {
-                Ok(port) -> Ok(#(host, option.Some(port)))
-                Error(Nil) -> Error(Nil)
-              }
-            _value -> Error(Nil)
-          }
-        }
-      }
-  }
-}
-
-fn split_bracketed_host(
-  value: BitArray,
-) -> Result(#(BitArray, option.Option(Int)), Nil) {
-  case find_close_bracket(value) {
-    Error(Nil) -> Error(Nil)
-    Ok(position) -> {
-      let size = bit_array.byte_size(value)
-
-      case value {
-        <<
-          host:bytes-size(position + 1),
-          remaining:bytes-size(size - position - 1),
-        >> ->
-          case remaining {
-            <<>> -> Ok(#(host, option.None))
-            <<":":utf8, port:bits>> ->
-              case parse_port(port) {
-                Ok(port) -> Ok(#(host, option.Some(port)))
-                Error(Nil) -> Error(Nil)
-              }
-            _remaining -> Error(Nil)
-          }
-        _value -> Error(Nil)
-      }
-    }
-  }
-}
-
-fn parse_port(bits: BitArray) -> Result(Int, Nil) {
-  case bits {
-    <<>> -> Error(Nil)
-    _bits -> parse_port_digits(bits, 0)
-  }
-}
-
-fn parse_port_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
-  case bits {
-    <<>> ->
-      case acc <= 65_535 {
-        True -> Ok(acc)
-        False -> Error(Nil)
-      }
-    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
-      parse_port_digits(remaining, acc * 10 + { byte - 48 })
-    _bits -> Error(Nil)
-  }
-}
-
-type HeaderState {
-  HeaderState(
-    content_length: option.Option(Int),
-    chunked: Bool,
-    connection: option.Option(Bool),
-    connection_upgrade: Bool,
-    upgrade: option.Option(String),
-    host: option.Option(#(String, option.Option(Int))),
-  )
-}
-
-fn initial_header_state() -> HeaderState {
-  HeaderState(
-    content_length: option.None,
-    chunked: False,
-    connection: option.None,
-    connection_upgrade: False,
-    upgrade: option.None,
-    host: option.None,
-  )
-}
-
-fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
-  case state.content_length, state.chunked {
-    option.Some(_length), True -> ParseError(AmbiguousFraming)
-    content_length, chunked -> {
-      let framing = case content_length, chunked {
-        option.Some(length), False -> connection.Fixed(length)
-        option.None, True -> connection.Chunked
-        option.None, False -> connection.NoBody
-        option.Some(_length), True ->
-          panic as "AmbiguousFraming already rejected above"
-      }
-      let keep_alive = case state.connection, version {
-        option.Some(keep_alive), _version -> keep_alive
-        option.None, Http11 -> True
-        option.None, Http10 -> False
-      }
-      let upgrade = case state.connection_upgrade {
-        True -> state.upgrade
-        False -> option.None
-      }
-      StepDone(Metadata(framing:, keep_alive:, upgrade:))
-    }
-  }
-}
-
-fn parse_headers(
-  buffer: BitArray,
-  acc: List(#(String, String)),
-  count: Int,
-  state: HeaderState,
-) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
-  use #(line, remaining) <- try_step(extract_line(
-    buffer,
-    max_header_line,
-    HeaderLineTooLong,
-    BadHeader,
-  ))
-
-  case line {
-    <<>> -> StepDone(#(list.reverse(acc), state, remaining))
-    _line if count >= max_headers -> ParseError(TooManyHeaders)
-    _line -> {
-      use #(header, state) <- try_step(parse_header_line(line, state))
-      parse_headers(remaining, [header, ..acc], count + 1, state)
-    }
-  }
-}
-
-fn parse_header_line(
-  line: BitArray,
-  state: HeaderState,
-) -> Step(#(#(String, String), HeaderState)) {
-  case find_colon(line) {
-    Error(Nil) -> ParseError(BadHeader)
-    Ok(0) -> ParseError(BadHeader)
-    Ok(position) ->
-      case line {
-        <<name:bytes-size(position), ":":utf8, value:bits>> -> {
-          let name = lowercase_ascii(name)
-          let value = trim_ows(value)
-          case bit_array_to_string(name), bit_array_to_string(value) {
-            Ok(name), Ok(value) -> {
-              use state <- try_step(classify(name, value, state))
-              StepDone(#(#(name, value), state))
-            }
-            _other, _other -> ParseError(BadHeader)
-          }
-        }
-        _bad -> ParseError(BadHeader)
-      }
-  }
-}
-
-fn classify(
-  name: String,
-  value: String,
-  state: HeaderState,
-) -> Step(HeaderState) {
-  case name {
-    "content-length" ->
-      case state.content_length {
-        option.Some(_length) -> ParseError(DuplicateContentLength)
-        option.None ->
-          case int.parse(value) {
-            Ok(length) if length >= 0 ->
-              StepDone(
-                HeaderState(..state, content_length: option.Some(length)),
-              )
-            _bad -> ParseError(BadContentLength)
-          }
-      }
-    "transfer-encoding" -> {
-      let lowered = value |> bit_array.from_string |> lowercase_ascii
-      let chunked = state.chunked || has_token(lowered, <<"chunked":utf8>>)
-      StepDone(HeaderState(..state, chunked:))
-    }
-    "connection" -> {
-      let lowered = value |> bit_array.from_string |> lowercase_ascii
-      let connection = case has_token(lowered, <<"close":utf8>>) {
-        True -> option.Some(False)
-        False ->
-          case has_token(lowered, <<"keep-alive":utf8>>) {
-            True -> option.Some(True)
-            False -> state.connection
-          }
-      }
-      let connection_upgrade =
-        state.connection_upgrade || has_token(lowered, <<"upgrade":utf8>>)
-      StepDone(HeaderState(..state, connection:, connection_upgrade:))
-    }
-    "upgrade" -> {
-      let lowered =
-        value
-        |> bit_array.from_string
-        |> lowercase_ascii
-        |> unsafe_to_string
-      StepDone(HeaderState(..state, upgrade: option.Some(lowered)))
-    }
-    "host" ->
-      case state.host {
-        option.Some(_host) -> ParseError(DuplicateHost)
-        option.None ->
-          case split_host_port(bit_array.from_string(value)) {
-            Ok(#(host, port)) -> {
-              let host = option.Some(#(unsafe_to_string(host), port))
-              StepDone(HeaderState(..state, host:))
-            }
-            Error(Nil) -> ParseError(BadHost)
-          }
-      }
-    _other -> StepDone(state)
-  }
-}
-
-fn extract_line(
-  buffer: BitArray,
-  max_len: Int,
-  too_long: ParseError,
-  malformed: ParseError,
-) -> Step(#(BitArray, BitArray)) {
-  case find_lf(buffer) {
-    Error(Nil) ->
-      case bit_array.byte_size(buffer) > max_len {
-        True -> ParseError(too_long)
-        False -> More
-      }
-    Ok(0) -> ParseError(malformed)
-    Ok(position) ->
-      case buffer {
-        <<line:bytes-size(position - 1), "\r\n":utf8, remaining:bits>> ->
-          StepDone(#(line, remaining))
-        _bad -> ParseError(malformed)
-      }
-  }
-}
-
-fn lowercase_ascii(bits: BitArray) -> BitArray {
-  case has_uppercase(bits) {
-    False -> bits
-    True -> lowercase_walk(bits) |> list_to_bit_array
-  }
-}
-
-fn has_uppercase(bits: BitArray) -> Bool {
-  case bits {
-    <<>> -> False
-    <<byte, _remaining:bits>> if byte >= 65 && byte <= 90 -> True
-    <<_byte, remaining:bits>> -> has_uppercase(remaining)
-    _other -> False
-  }
-}
-
-fn lowercase_walk(bits: BitArray) -> List(Int) {
-  case bits {
-    <<>> -> []
-    <<"A", remaining:bits>> -> [0x61, ..lowercase_walk(remaining)]
-    <<"B", remaining:bits>> -> [0x62, ..lowercase_walk(remaining)]
-    <<"C", remaining:bits>> -> [0x63, ..lowercase_walk(remaining)]
-    <<"D", remaining:bits>> -> [0x64, ..lowercase_walk(remaining)]
-    <<"E", remaining:bits>> -> [0x65, ..lowercase_walk(remaining)]
-    <<"F", remaining:bits>> -> [0x66, ..lowercase_walk(remaining)]
-    <<"G", remaining:bits>> -> [0x67, ..lowercase_walk(remaining)]
-    <<"H", remaining:bits>> -> [0x68, ..lowercase_walk(remaining)]
-    <<"I", remaining:bits>> -> [0x69, ..lowercase_walk(remaining)]
-    <<"J", remaining:bits>> -> [0x6A, ..lowercase_walk(remaining)]
-    <<"K", remaining:bits>> -> [0x6B, ..lowercase_walk(remaining)]
-    <<"L", remaining:bits>> -> [0x6C, ..lowercase_walk(remaining)]
-    <<"M", remaining:bits>> -> [0x6D, ..lowercase_walk(remaining)]
-    <<"N", remaining:bits>> -> [0x6E, ..lowercase_walk(remaining)]
-    <<"O", remaining:bits>> -> [0x6F, ..lowercase_walk(remaining)]
-    <<"P", remaining:bits>> -> [0x70, ..lowercase_walk(remaining)]
-    <<"Q", remaining:bits>> -> [0x71, ..lowercase_walk(remaining)]
-    <<"R", remaining:bits>> -> [0x72, ..lowercase_walk(remaining)]
-    <<"S", remaining:bits>> -> [0x73, ..lowercase_walk(remaining)]
-    <<"T", remaining:bits>> -> [0x74, ..lowercase_walk(remaining)]
-    <<"U", remaining:bits>> -> [0x75, ..lowercase_walk(remaining)]
-    <<"V", remaining:bits>> -> [0x76, ..lowercase_walk(remaining)]
-    <<"W", remaining:bits>> -> [0x77, ..lowercase_walk(remaining)]
-    <<"X", remaining:bits>> -> [0x78, ..lowercase_walk(remaining)]
-    <<"Y", remaining:bits>> -> [0x79, ..lowercase_walk(remaining)]
-    <<"Z", remaining:bits>> -> [0x7A, ..lowercase_walk(remaining)]
-    <<byte, remaining:bits>> -> [byte, ..lowercase_walk(remaining)]
-    _other -> []
-  }
-}
-
-fn trim_ows(bits: BitArray) -> BitArray {
-  bits
-  |> trim_leading_ows
-  |> trim_trailing_ows
-}
-
-fn trim_leading_ows(bits: BitArray) -> BitArray {
-  case bits {
-    <<" ", remaining:bits>> -> trim_leading_ows(remaining)
-    <<"\t", remaining:bits>> -> trim_leading_ows(remaining)
-    _bits -> bits
-  }
-}
-
-fn trim_trailing_ows(bits: BitArray) -> BitArray {
-  case bit_array.byte_size(bits) {
-    0 -> bits
-    size ->
-      case bits {
-        <<init:bytes-size(size - 1), " ":utf8>> -> trim_trailing_ows(init)
-        <<init:bytes-size(size - 1), "\t":utf8>> -> trim_trailing_ows(init)
-        _bits -> bits
-      }
-  }
-}
-
-fn has_token(value: BitArray, token: BitArray) -> Bool {
-  case value == token {
-    True -> True
-    False ->
-      split_comma(value)
-      |> list.any(fn(part) { trim_ows(part) == token })
-  }
-}
-
-@external(erlang, "http1_ffi", "find_lf")
-fn find_lf(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "find_colon")
-fn find_colon(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "find_space")
-fn find_space(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "find_question")
-fn find_question(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "find_close_bracket")
-fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "find_unsafe_header_byte")
-fn find_unsafe_header_byte(bits: String) -> Result(Int, Nil)
-
-@external(erlang, "http1_ffi", "split_comma")
-fn split_comma(bits: BitArray) -> List(BitArray)
-
-@external(erlang, "http1_ffi", "list_to_bit_array")
-fn list_to_bit_array(bytes: List(Int)) -> BitArray
-
-@external(erlang, "http1_ffi", "bit_array_to_string")
-fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
-
-@external(erlang, "ewe_ffi", "identity")
-fn unsafe_to_string(bits: BitArray) -> String

@@ -1,7 +1,8 @@
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
-import ewe/internal/http1
+import ewe/internal/http1/body as http1_body
+import ewe/internal/http1/encoder
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -405,10 +406,10 @@ pub type BodyError {
   InvalidBody
 }
 
-fn from_internal_http1_body_error(error: http1.BodyError) -> BodyError {
+fn from_internal_http1_body_error(error: http1_body.BodyError) -> BodyError {
   case error {
-    http1.BodyTooLarge -> BodyTooLarge
-    http1.InvalidBody -> InvalidBody
+    http1_body.BodyTooLarge -> BodyTooLarge
+    http1_body.InvalidBody -> InvalidBody
   }
 }
 
@@ -422,7 +423,7 @@ pub fn read_body(
   case req.body {
     connection.Http1(connection) -> {
       use #(body, trailers) <- result.try(
-        http1.read_body(connection, limit)
+        http1_body.read_body(connection, limit)
         |> result.map_error(from_internal_http1_body_error),
       )
 
@@ -452,12 +453,12 @@ pub fn read_body_chunk(
 ) -> Result(ReadEvent, BodyError) {
   case req.body {
     connection.Http1(connection) -> {
-      case http1.read_body_chunk(connection, max_chunk_bytes:, limit:) {
-        Ok(http1.Chunk(data, connection)) -> {
+      case http1_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
+        Ok(http1_body.Chunk(data, connection)) -> {
           let body = connection.Http1(connection)
           Ok(Chunk(data, request.set_body(req, body)))
         }
-        Ok(http1.Done(trailers)) -> {
+        Ok(http1_body.Done(trailers)) -> {
           let headers = list.append(req.headers, trailers)
           Ok(Done(request.Request(..req, headers:, body: Nil)))
         }
@@ -488,7 +489,7 @@ pub fn stream_response(
 pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
   case writer {
     connection.Http1Writer(writer) ->
-      connection.Http1Writer(http1.send_chunk(writer, chunk))
+      connection.Http1Writer(encoder.send_chunk(writer, chunk))
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -496,7 +497,7 @@ pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
 /// Sends `chunk` as the final response body chunk and closes the stream.
 pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
   case writer {
-    connection.Http1Writer(writer) -> http1.finish_chunk(writer, chunk)
+    connection.Http1Writer(writer) -> encoder.finish_chunk(writer, chunk)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -505,7 +506,7 @@ pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
 /// there's one last chunk to send.
 pub fn finish_response(writer: ResponseWriter) -> Nil {
   case writer {
-    connection.Http1Writer(writer) -> http1.finish_response(writer)
+    connection.Http1Writer(writer) -> encoder.finish_response(writer)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }

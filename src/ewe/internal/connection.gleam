@@ -1,29 +1,13 @@
+import ewe/internal/http1/connection as http1
 import gleam/bytes_tree
 import gleam/erlang/process
-import glisten/socket
-import glisten/transport
+import gleam/option
+import glisten
+import glisten/internal/handler
 
 pub type Connection {
-  Http1(Http1Connection)
+  Http1(http1.Connection)
   Http2
-}
-
-pub type Http1Connection {
-  Http1Connection(
-    transport: transport.Transport,
-    socket: socket.Socket,
-    self: process.Subject(Http1Signal),
-    buffer: BitArray,
-    framing: Framing,
-    read: Int,
-    chunk_remaining: Int,
-  )
-}
-
-pub type Framing {
-  Fixed(length: Int)
-  Chunked
-  NoBody
 }
 
 pub type Body {
@@ -47,30 +31,14 @@ pub type File {
   FileMetadata(path: String, offset: Int, length: Int)
 }
 
-pub type Message {
-  Timeout
-}
-
-pub type Http1Signal {
-  BodyDrained(leftover: BitArray)
-  BodyAbandoned
-  BodyProgress(buffer: BitArray, read: Int, chunk_remaining: Int)
-  StreamFinished(keep_alive: Bool)
-}
-
 pub type ResponseWriter {
-  Http1Writer(Http1ResponseWriter)
+  Http1Writer(http1.ResponseWriter)
   Http2Writer
 }
 
-pub type Http1ResponseWriter {
-  Http1ResponseWriter(
-    transport: transport.Transport,
-    socket: socket.Socket,
-    self: process.Subject(Http1Signal),
-    chunked: Bool,
-    keep_alive: Bool,
-  )
+pub type SseConnection {
+  Http1Sse(http1.SseConnection)
+  Http2Sse
 }
 
 pub type Outcome {
@@ -78,11 +46,25 @@ pub type Outcome {
   StoppedAbnormal(reason: String)
 }
 
-pub type SseConnection {
-  Http1Sse(Http1SseConnection)
-  Http2Sse
+pub type Message {
+  Timeout
 }
 
-pub type Http1SseConnection {
-  Http1SseConnection(transport: transport.Transport, socket: socket.Socket)
+pub const idle_timeout = 10_000
+
+pub fn start_idle_timer(
+  connection: glisten.Connection(Message),
+) -> option.Option(process.Timer) {
+  process.send_after(connection.subject, idle_timeout, handler.User(Timeout))
+  |> option.Some
+}
+
+pub fn cancel_idle_timer(timer: option.Option(process.Timer)) -> Nil {
+  case timer {
+    option.Some(timer) -> {
+      let _cancelled = process.cancel_timer(timer)
+      Nil
+    }
+    option.None -> Nil
+  }
 }

@@ -1,5 +1,5 @@
-import ewe/internal/connection
-import ewe/internal/http1
+import ewe/internal/http1/connection as http1
+import ewe/internal/http1/parser
 import gleam/http
 import gleam/option.{None, Some}
 
@@ -8,25 +8,26 @@ pub fn simple_get_test() {
     "GET /foo?a=1 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(head, metadata, remaining)) = http1.parse(buffer)
+  let assert Ok(parser.Complete(head, metadata, remaining)) =
+    parser.parse(buffer)
 
   assert head.method == http.Get
   assert head.host == "example.com"
   assert head.port == None
   assert head.path == "/foo"
   assert head.query == Some("a=1")
-  assert head.version == http1.Http11
+  assert head.version == parser.Http11
   assert head.headers
     == [#("host", "example.com"), #("connection", "keep-alive")]
-  assert metadata.keep_alive
-  assert metadata.framing == connection.NoBody
+  assert metadata.keep_alive == http1.KeepAlive
+  assert metadata.framing == http1.NoBody
   assert remaining == <<>>
 }
 
 pub fn host_with_port_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.host == "example.com"
   assert head.port == Some(8080)
@@ -34,8 +35,8 @@ pub fn host_with_port_test() {
 
 pub fn host_ipv6_with_port_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.host == "[::1]"
   assert head.port == Some(8080)
@@ -43,13 +44,13 @@ pub fn host_ipv6_with_port_test() {
 
 pub fn missing_host_on_http11_rejected_test() {
   let buffer = <<"GET / HTTP/1.1\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.MissingHost)
+  assert parser.parse(buffer) == Error(parser.MissingHost)
 }
 
 pub fn missing_host_on_http10_allowed_test() {
   let buffer = <<"GET / HTTP/1.0\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.host == ""
   assert head.port == None
@@ -57,31 +58,31 @@ pub fn missing_host_on_http10_allowed_test() {
 
 pub fn duplicate_host_rejected_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.DuplicateHost)
+  assert parser.parse(buffer) == Error(parser.DuplicateHost)
 }
 
 pub fn relative_path_rejected_test() {
   let buffer = <<"GET foo HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.BadTarget)
+  assert parser.parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn asterisk_form_allowed_for_options_test() {
   let buffer = <<"OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.path == "*"
 }
 
 pub fn asterisk_form_rejected_for_get_test() {
   let buffer = <<"GET * HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.BadTarget)
+  assert parser.parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn connect_authority_form_test() {
   let buffer = <<"CONNECT example.com:443 HTTP/1.1\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.host == "example.com"
   assert head.port == Some(443)
@@ -91,7 +92,7 @@ pub fn connect_authority_form_test() {
 
 pub fn connect_without_port_rejected_test() {
   let buffer = <<"CONNECT example.com HTTP/1.1\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.BadTarget)
+  assert parser.parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn mixed_case_and_ows_headers_test() {
@@ -99,7 +100,8 @@ pub fn mixed_case_and_ows_headers_test() {
     "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length:  13  \r\nConnection: close\r\n\r\nHELLO WORLD!!":utf8,
   >>
 
-  let assert Ok(http1.Complete(head, metadata, remaining)) = http1.parse(buffer)
+  let assert Ok(parser.Complete(head, metadata, remaining)) =
+    parser.parse(buffer)
 
   assert head.headers
     == [
@@ -107,8 +109,8 @@ pub fn mixed_case_and_ows_headers_test() {
       #("content-length", "13"),
       #("connection", "close"),
     ]
-  assert metadata.framing == connection.Fixed(13)
-  assert !metadata.keep_alive
+  assert metadata.framing == http1.Fixed(13)
+  assert metadata.keep_alive == http1.CloseAfterResponse
   assert remaining == <<"HELLO WORLD!!":utf8>>
 }
 
@@ -117,8 +119,8 @@ pub fn tab_ows_trimmed_test() {
     "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name:\t\tvalue\t\t\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.headers == [#("host", "example.com"), #("x-name", "value")]
 }
@@ -128,10 +130,10 @@ pub fn chunked_transfer_encoding_test() {
     "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert metadata.framing == connection.Chunked
+  assert metadata.framing == http1.Chunked
 }
 
 pub fn transfer_encoding_chunked_among_multiple_tokens_test() {
@@ -139,10 +141,10 @@ pub fn transfer_encoding_chunked_among_multiple_tokens_test() {
     "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert metadata.framing == connection.Chunked
+  assert metadata.framing == http1.Chunked
 }
 
 pub fn conflicting_content_length_and_chunked_rejected_test() {
@@ -150,7 +152,7 @@ pub fn conflicting_content_length_and_chunked_rejected_test() {
     "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello":utf8,
   >>
 
-  assert http1.parse(buffer) == Error(http1.AmbiguousFraming)
+  assert parser.parse(buffer) == Error(parser.AmbiguousFraming)
 }
 
 pub fn conflicting_transfer_encoding_and_content_length_reversed_order_rejected_test() {
@@ -158,7 +160,7 @@ pub fn conflicting_transfer_encoding_and_content_length_reversed_order_rejected_
     "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello":utf8,
   >>
 
-  assert http1.parse(buffer) == Error(http1.AmbiguousFraming)
+  assert parser.parse(buffer) == Error(parser.AmbiguousFraming)
 }
 
 pub fn connection_close_lookalike_is_not_close_test() {
@@ -166,10 +168,11 @@ pub fn connection_close_lookalike_is_not_close_test() {
     "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close-enough\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert metadata.keep_alive as "\"close-enough\" is not the \"close\" token"
+  assert metadata.keep_alive == http1.KeepAlive
+    as "\"close-enough\" is not the \"close\" token"
 }
 
 pub fn connection_close_among_multiple_tokens_test() {
@@ -177,84 +180,85 @@ pub fn connection_close_among_multiple_tokens_test() {
     "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, Close\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert !metadata.keep_alive
+  assert metadata.keep_alive == http1.CloseAfterResponse
 }
 
 pub fn http11_defaults_to_keep_alive_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert metadata.keep_alive
+  assert metadata.keep_alive == http1.KeepAlive
     as "HTTP/1.1 without Connection defaults to keep-alive"
 }
 
 pub fn http10_defaults_to_close_test() {
   let buffer = <<"GET / HTTP/1.0\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert !metadata.keep_alive as "HTTP/1.0 without Connection defaults to close"
+  assert metadata.keep_alive == http1.CloseAfterResponse
+    as "HTTP/1.0 without Connection defaults to close"
 }
 
 pub fn http10_explicit_keep_alive_test() {
   let buffer = <<"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert metadata.keep_alive
+  assert metadata.keep_alive == http1.KeepAlive
 }
 
 pub fn http10_explicit_close_stays_close_test() {
   let buffer = <<"GET / HTTP/1.0\r\nConnection: close\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
-  assert !metadata.keep_alive
+  assert metadata.keep_alive == http1.CloseAfterResponse
 }
 
 pub fn custom_method_test() {
   let buffer = <<"PROPFIND /dav HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.method == http.Other("PROPFIND")
 }
 
 pub fn incomplete_request_line_test() {
   let buffer = <<"GET /foo HTTP/1.1\r\n":utf8>>
-  assert http1.parse(buffer) == Ok(http1.Incomplete)
+  assert parser.parse(buffer) == Ok(parser.Incomplete)
 }
 
 pub fn incomplete_headers_test() {
   let buffer = <<"GET /foo HTTP/1.1\r\nHost: example.com\r\n":utf8>>
-  assert http1.parse(buffer) == Ok(http1.Incomplete)
+  assert parser.parse(buffer) == Ok(parser.Incomplete)
 }
 
 pub fn split_across_reads_test() {
   let first = <<"GET / HTTP/1.1\r\nHo":utf8>>
-  assert http1.parse(first) == Ok(http1.Incomplete)
+  assert parser.parse(first) == Ok(parser.Incomplete)
 
   let second = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(second)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(second)
 
   assert head.path == "/"
 }
 
 pub fn bad_request_line_test() {
   let buffer = <<"GET /foo HTTP/9.9\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.BadVersion)
+  assert parser.parse(buffer) == Error(parser.BadVersion)
 }
 
 pub fn duplicate_content_length_test() {
   let buffer = <<
     "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n":utf8,
   >>
-  assert http1.parse(buffer) == Error(http1.DuplicateContentLength)
+  assert parser.parse(buffer) == Error(parser.DuplicateContentLength)
 }
 
 pub fn multibyte_utf8_header_value_test() {
@@ -262,8 +266,8 @@ pub fn multibyte_utf8_header_value_test() {
     "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: caf\u{00E9}\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(head, _metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert head.headers == [#("host", "example.com"), #("x-name", "café")]
 }
@@ -275,32 +279,32 @@ pub fn invalid_utf8_header_value_rejected_test() {
     "\r\n\r\n":utf8,
   >>
 
-  assert http1.parse(buffer) == Error(http1.BadHeader)
+  assert parser.parse(buffer) == Error(parser.BadHeader)
 }
 
 pub fn bare_lf_rejected_test() {
   let buffer = <<"GET / HTTP/1.1\nHost: example.com\r\n\r\n":utf8>>
-  assert http1.parse(buffer) == Error(http1.BadRequestLine)
+  assert parser.parse(buffer) == Error(parser.BadRequestLine)
 }
 
 pub fn no_query_string_test() {
   let buffer = <<"GET /plain HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
 
-  assert http1.parse(buffer)
+  assert parser.parse(buffer)
     == Ok(
-      http1.Complete(
-        http1.Head(
+      parser.Complete(
+        parser.Head(
           method: http.Get,
           host: "example.com",
           port: None,
           path: "/plain",
           query: None,
-          version: http1.Http11,
+          version: parser.Http11,
           headers: [#("host", "example.com")],
         ),
-        http1.Metadata(
-          framing: connection.NoBody,
-          keep_alive: True,
+        parser.Metadata(
+          framing: http1.NoBody,
+          keep_alive: http1.KeepAlive,
           upgrade: None,
         ),
         <<>>,
@@ -313,8 +317,8 @@ pub fn websocket_upgrade_requested_test() {
     "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == Some("websocket")
 }
@@ -324,8 +328,8 @@ pub fn upgrade_token_case_insensitive_test() {
     "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == Some("websocket")
 }
@@ -335,8 +339,8 @@ pub fn upgrade_among_multiple_connection_tokens_test() {
     "GET /h2c HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == Some("h2c")
 }
@@ -346,8 +350,8 @@ pub fn upgrade_header_without_connection_token_ignored_test() {
     "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == None
     as "Upgrade requires Connection: upgrade to be honored (RFC 9110 §7.8)"
@@ -358,8 +362,8 @@ pub fn upgrade_header_before_connection_header_test() {
     "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n":utf8,
   >>
 
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == Some("websocket")
     as "order of Upgrade vs. Connection headers shouldn't matter"
@@ -367,8 +371,8 @@ pub fn upgrade_header_before_connection_header_test() {
 
 pub fn no_upgrade_requested_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  let assert Ok(http1.Complete(_head, metadata, _remaining)) =
-    http1.parse(buffer)
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) =
+    parser.parse(buffer)
 
   assert metadata.upgrade == None
 }
