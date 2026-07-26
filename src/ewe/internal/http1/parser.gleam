@@ -348,21 +348,26 @@ fn split_bracketed_host(
 }
 
 fn parse_port(bits: BitArray) -> Result(Int, Nil) {
-  case bits {
-    <<>> -> Error(Nil)
-    _bits -> parse_port_digits(bits, 0)
+  case parse_decimal(bits) {
+    Ok(port) if port <= 65_535 -> Ok(port)
+    Ok(_port) -> Error(Nil)
+    Error(Nil) -> Error(Nil)
   }
 }
 
-fn parse_port_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
+fn parse_decimal(bits: BitArray) -> Result(Int, Nil) {
   case bits {
-    <<>> ->
-      case acc <= 65_535 {
-        True -> Ok(acc)
-        False -> Error(Nil)
-      }
     <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
-      parse_port_digits(remaining, acc * 10 + { byte - 48 })
+      parse_decimal_digits(remaining, byte - 48)
+    _bits -> Error(Nil)
+  }
+}
+
+fn parse_decimal_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
+  case bits {
+    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
+      parse_decimal_digits(remaining, acc * 10 + { byte - 48 })
+    <<>> -> Ok(acc)
     _bits -> Error(Nil)
   }
 }
@@ -464,11 +469,11 @@ fn parse_header_line(
           let name = lowercase_ascii(name)
           let value = trim_ows(value)
           case bit_array_to_string(name), bit_array_to_string(value) {
-            Ok(name), Ok(value) -> {
-              use state <- try_step(classify(name, value, state))
-              StepDone(#(#(name, value), state))
+            Ok(name_text), Ok(value_text) -> {
+              use state <- try_step(classify(name_text, value, state))
+              StepDone(#(#(name_text, value_text), state))
             }
-            _other, _other -> ParseError(BadHeader)
+            _name, _value -> ParseError(BadHeader)
           }
         }
         _bad -> ParseError(BadHeader)
@@ -478,7 +483,7 @@ fn parse_header_line(
 
 fn classify(
   name: String,
-  value: String,
+  value: BitArray,
   state: HeaderState,
 ) -> Step(HeaderState) {
   case name {
@@ -486,46 +491,42 @@ fn classify(
       case state.content_length {
         option.Some(_length) -> ParseError(DuplicateContentLength)
         option.None ->
-          case int.parse(value) {
-            Ok(length) if length >= 0 ->
+          case parse_decimal(value) {
+            Ok(length) ->
               StepDone(
                 HeaderState(..state, content_length: option.Some(length)),
               )
-            _bad -> ParseError(BadContentLength)
+            Error(Nil) -> ParseError(BadContentLength)
           }
       }
     "transfer-encoding" -> {
-      let lowered = value |> bit_array.from_string |> lowercase_ascii
+      let lowered = lowercase_ascii(value)
       let chunked = state.chunked || has_token(lowered, <<"chunked":utf8>>)
       StepDone(HeaderState(..state, chunked:))
     }
     "connection" -> {
-      let lowered = value |> bit_array.from_string |> lowercase_ascii
+      let requested = value |> lowercase_ascii |> tokens
       let connection = case
-        has_token(lowered, <<"close":utf8>>),
-        has_token(lowered, <<"keep-alive":utf8>>)
+        list.contains(requested, <<"close":utf8>>),
+        list.contains(requested, <<"keep-alive":utf8>>)
       {
         True, _keep_alive -> RequestedClose
         False, True -> RequestedKeepAlive
         False, False -> state.connection
       }
       let connection_upgrade =
-        state.connection_upgrade || has_token(lowered, <<"upgrade":utf8>>)
+        state.connection_upgrade || list.contains(requested, <<"upgrade":utf8>>)
       StepDone(HeaderState(..state, connection:, connection_upgrade:))
     }
     "upgrade" -> {
-      let lowered =
-        value
-        |> bit_array.from_string
-        |> lowercase_ascii
-        |> unsafe_to_string
+      let lowered = value |> lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, upgrade: option.Some(lowered)))
     }
     "host" ->
       case state.host {
         option.Some(_host) -> ParseError(DuplicateHost)
         option.None ->
-          case split_host_port(bit_array.from_string(value)) {
+          case split_host_port(value) {
             Ok(#(host, port)) -> {
               let host = option.Some(#(unsafe_to_string(host), port))
               StepDone(HeaderState(..state, host:))
@@ -559,56 +560,6 @@ pub fn extract_line(
   }
 }
 
-pub fn lowercase_ascii(bits: BitArray) -> BitArray {
-  case has_uppercase(bits) {
-    False -> bits
-    True -> lowercase_walk(bits) |> list_to_bit_array
-  }
-}
-
-fn has_uppercase(bits: BitArray) -> Bool {
-  case bits {
-    <<>> -> False
-    <<byte, _remaining:bits>> if byte >= 65 && byte <= 90 -> True
-    <<_byte, remaining:bits>> -> has_uppercase(remaining)
-    _other -> False
-  }
-}
-
-fn lowercase_walk(bits: BitArray) -> List(Int) {
-  case bits {
-    <<>> -> []
-    <<"A", remaining:bits>> -> [0x61, ..lowercase_walk(remaining)]
-    <<"B", remaining:bits>> -> [0x62, ..lowercase_walk(remaining)]
-    <<"C", remaining:bits>> -> [0x63, ..lowercase_walk(remaining)]
-    <<"D", remaining:bits>> -> [0x64, ..lowercase_walk(remaining)]
-    <<"E", remaining:bits>> -> [0x65, ..lowercase_walk(remaining)]
-    <<"F", remaining:bits>> -> [0x66, ..lowercase_walk(remaining)]
-    <<"G", remaining:bits>> -> [0x67, ..lowercase_walk(remaining)]
-    <<"H", remaining:bits>> -> [0x68, ..lowercase_walk(remaining)]
-    <<"I", remaining:bits>> -> [0x69, ..lowercase_walk(remaining)]
-    <<"J", remaining:bits>> -> [0x6A, ..lowercase_walk(remaining)]
-    <<"K", remaining:bits>> -> [0x6B, ..lowercase_walk(remaining)]
-    <<"L", remaining:bits>> -> [0x6C, ..lowercase_walk(remaining)]
-    <<"M", remaining:bits>> -> [0x6D, ..lowercase_walk(remaining)]
-    <<"N", remaining:bits>> -> [0x6E, ..lowercase_walk(remaining)]
-    <<"O", remaining:bits>> -> [0x6F, ..lowercase_walk(remaining)]
-    <<"P", remaining:bits>> -> [0x70, ..lowercase_walk(remaining)]
-    <<"Q", remaining:bits>> -> [0x71, ..lowercase_walk(remaining)]
-    <<"R", remaining:bits>> -> [0x72, ..lowercase_walk(remaining)]
-    <<"S", remaining:bits>> -> [0x73, ..lowercase_walk(remaining)]
-    <<"T", remaining:bits>> -> [0x74, ..lowercase_walk(remaining)]
-    <<"U", remaining:bits>> -> [0x75, ..lowercase_walk(remaining)]
-    <<"V", remaining:bits>> -> [0x76, ..lowercase_walk(remaining)]
-    <<"W", remaining:bits>> -> [0x77, ..lowercase_walk(remaining)]
-    <<"X", remaining:bits>> -> [0x78, ..lowercase_walk(remaining)]
-    <<"Y", remaining:bits>> -> [0x79, ..lowercase_walk(remaining)]
-    <<"Z", remaining:bits>> -> [0x7A, ..lowercase_walk(remaining)]
-    <<byte, remaining:bits>> -> [byte, ..lowercase_walk(remaining)]
-    _other -> []
-  }
-}
-
 fn trim_ows(bits: BitArray) -> BitArray {
   bits
   |> trim_leading_ows
@@ -635,13 +586,14 @@ fn trim_trailing_ows(bits: BitArray) -> BitArray {
   }
 }
 
+/// The comma separated list a header value carries, one trimmed token per
+/// element.
+pub fn tokens(value: BitArray) -> List(BitArray) {
+  split_comma(value) |> list.map(trim_ows)
+}
+
 pub fn has_token(value: BitArray, token: BitArray) -> Bool {
-  case value == token {
-    True -> True
-    False ->
-      split_comma(value)
-      |> list.any(fn(part) { trim_ows(part) == token })
-  }
+  value == token || list.contains(tokens(value), token)
 }
 
 @external(erlang, "http1_ffi", "find_lf")
@@ -665,8 +617,8 @@ pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
 @external(erlang, "http1_ffi", "split_comma")
 fn split_comma(bits: BitArray) -> List(BitArray)
 
-@external(erlang, "http1_ffi", "list_to_bit_array")
-fn list_to_bit_array(bytes: List(Int)) -> BitArray
+@external(erlang, "http1_ffi", "lowercase_ascii")
+pub fn lowercase_ascii(bits: BitArray) -> BitArray
 
 @external(erlang, "http1_ffi", "bit_array_to_string")
 fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)

@@ -10,7 +10,7 @@
     find_close_bracket/1,
     find_unsafe_header_byte/1,
     split_comma/1,
-    list_to_bit_array/1,
+    lowercase_ascii/1,
     bit_array_to_string/1,
     socket_error_reason/1
 ]).
@@ -23,6 +23,10 @@ init() ->
   persistent_term:put({?MODULE, question}, binary:compile_pattern(<<"?">>)),
   persistent_term:put({?MODULE, comma}, binary:compile_pattern(<<",">>)),
   persistent_term:put({?MODULE, close_bracket}, binary:compile_pattern(<<"]">>)),
+  persistent_term:put(
+    {?MODULE, upper},
+    binary:compile_pattern([<<C>> || C <- lists:seq($A, $Z)])
+  ),
   persistent_term:put(
     {?MODULE, unsafe_header},
     binary:compile_pattern([<<"\r">>, <<"\n">>, <<0>>])
@@ -46,9 +50,16 @@ find(Bin, Key) ->
 split_comma(Bin) ->
   binary:split(Bin, persistent_term:get({?MODULE, comma}), [global]).
 
-%% Flattens a list of bytes into a binary in one pass.
-list_to_bit_array(Bytes) ->
-  erlang:list_to_binary(Bytes).
+%% Scans for uppercase natively so an already lowercase binary is returned
+%% untouched, and rewrites in one pass otherwise.
+lowercase_ascii(Bin) ->
+  case binary:match(Bin, persistent_term:get({?MODULE, upper})) of
+    nomatch -> Bin;
+    _Match -> << <<(lower(Byte))>> || <<Byte>> <= Bin >>
+  end.
+
+lower(Byte) when Byte >= $A, Byte =< $Z -> Byte + 32;
+lower(Byte) -> Byte.
 
 %% Reason carried by a `{tcp_error, Socket, Reason}` message.
 socket_error_reason({_Tag, _Socket, Reason}) ->

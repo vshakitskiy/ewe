@@ -50,6 +50,15 @@ pub type Message {
   Timeout
 }
 
+/// Concatenating onto an empty buffer would copy the incoming bytes for
+/// nothing, which is the common case on a connection with no pipelining.
+pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
+  case buffer {
+    <<>> -> data
+    _buffer -> <<buffer:bits, data:bits>>
+  }
+}
+
 pub const idle_timeout = 10_000
 
 pub fn start_idle_timer(

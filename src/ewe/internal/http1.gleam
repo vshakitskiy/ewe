@@ -88,10 +88,7 @@ pub fn handle_message(
       }
 
       case sent {
-        Ok(SentKeepAlive) -> {
-          let idle_timer = connection.start_idle_timer(connection)
-          Continue(State(..state, buffer:, idle_timer:))
-        }
+        Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
         Ok(SentClose) -> Close
         Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
         Error(_reason) -> Close
@@ -108,6 +105,25 @@ pub fn handle_message(
 
       Close
     }
+  }
+}
+
+/// A pipelining client sends its next request without waiting for this 
+/// response, so anything left over has to be handled now. Waiting on the socket
+/// for it would deadlock: those bytes have already arrived.
+fn await_next_request(
+  state: State,
+  buffer: BitArray,
+  connection: glisten.Connection(connection.Message),
+) -> Next {
+  case buffer {
+    <<>> -> {
+      let idle_timer = connection.start_idle_timer(connection)
+      Continue(State(..state, buffer:, idle_timer:))
+    }
+    _buffer ->
+      State(..state, buffer:, idle_timer: option.None)
+      |> handle_message(connection)
   }
 }
 

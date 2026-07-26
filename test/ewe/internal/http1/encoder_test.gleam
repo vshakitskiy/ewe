@@ -39,20 +39,20 @@ pub fn handler_content_length_is_dropped_test() {
   assert string.contains(out, "content-length: 5")
 }
 
-pub fn uppercase_content_length_is_dropped_test() {
+pub fn uppercase_content_length_is_dropped() {
   let out = head([#("Content-Length", "999")], connection.Text("hello"))
 
   assert occurrences(out, "999") == 0
     as "a differently cased content-length is still a content-length, and two on one response is a framing bug"
 }
 
-pub fn mixed_case_transfer_encoding_is_dropped_test() {
+pub fn mixed_case_transfer_encoding_is_dropped() {
   let out = head([#("Transfer-Encoding", "chunked")], connection.Text("hi"))
 
   assert occurrences(out, "chunked") == 0
 }
 
-pub fn uppercase_connection_close_is_honoured_test() {
+pub fn uppercase_connection_close_is_honoured() {
   let out = head([#("Connection", "close")], connection.Text("hi"))
 
   assert string.contains(out, "connection: close")
@@ -60,7 +60,7 @@ pub fn uppercase_connection_close_is_honoured_test() {
     as "the handler's connection header must drive the real one, not sit beside it"
 }
 
-pub fn header_names_are_normalised_to_lowercase_test() {
+pub fn header_names_are_normalised_to_lowercase() {
   let out = head([#("X-Request-Id", "abc")], connection.Text("hi"))
 
   assert string.contains(out, "x-request-id: abc")

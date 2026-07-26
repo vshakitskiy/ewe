@@ -22,18 +22,24 @@ pub fn resolve(
 ) -> Result(connection.File, FileError) {
   use size <- result.try(stat(path))
   let offset = option.unwrap(offset, 0)
-  let available = size - offset
 
-  case offset >= 0 && offset <= size, limit {
-    True, option.None -> {
-      Ok(connection.FileMetadata(path:, offset:, length: available))
+  case offset >= 0 && offset <= size {
+    False -> Error(InvalidOffset)
+    True -> {
+      let available = size - offset
+
+      case limit {
+        option.None ->
+          Ok(connection.FileMetadata(path:, offset:, length: available))
+        option.Some(limit) if limit < 0 -> Error(InvalidLimit)
+        option.Some(limit) ->
+          Ok(connection.FileMetadata(
+            path:,
+            offset:,
+            length: int.min(limit, available),
+          ))
+      }
     }
-    True, option.Some(limit) -> {
-      let length = int.min(limit, available)
-      Ok(connection.FileMetadata(path:, offset:, length:))
-    }
-    _, option.Some(limit) if limit < 0 -> Error(InvalidLimit)
-    False, _ -> Error(InvalidOffset)
   }
 }
 

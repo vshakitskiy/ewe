@@ -1,3 +1,4 @@
+import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
 import gleam/bit_array
@@ -165,7 +166,7 @@ fn read_exact(
           body_read_timeout,
         )
       {
-        Ok(more) -> Ok(#(<<buffer:bits, more:bits>>, <<>>))
+        Ok(more) -> Ok(#(connection.append_buffer(buffer, more), <<>>))
         Error(_reason) -> Error(parser.BodyReadFailed)
       }
   }
@@ -249,7 +250,12 @@ fn pull_until(
     parser.More ->
       case transport.receive_timeout(transport, socket, 0, body_read_timeout) {
         Ok(more) ->
-          pull_until(transport, socket, <<buffer:bits, more:bits>>, step)
+          pull_until(
+            transport,
+            socket,
+            connection.append_buffer(buffer, more),
+            step,
+          )
         Error(_reason) -> Error(parser.BodyReadFailed)
       }
   }

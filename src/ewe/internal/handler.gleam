@@ -1,6 +1,5 @@
 import ewe/internal/connection
 import ewe/internal/http1
-import gleam/bit_array
 import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
@@ -43,7 +42,7 @@ pub fn loop(
   case state, message {
     Initialised(state), glisten.Packet(data) -> {
       connection.cancel_idle_timer(state.idle_timer)
-      let buffer = <<state.buffer:bits, data:bits>>
+      let buffer = connection.append_buffer(state.buffer, data)
 
       case sniff_preface(buffer) {
         NeedMoreData ->
@@ -62,7 +61,7 @@ pub fn loop(
       }
     }
     Http1(state), glisten.Packet(data) ->
-      http1.State(..state, buffer: <<state.buffer:bits, data:bits>>)
+      http1.State(..state, buffer: connection.append_buffer(state.buffer, data))
       |> http1.handle_message(connection)
       |> to_glisten_next
     Http2(..), glisten.Packet(_data) -> todo as "HTTP/2 is not implemented yet!"
@@ -96,9 +95,19 @@ pub fn sniff_preface(buffer: BitArray) -> Sniff {
     <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8, remaining:bits>> ->
       Http2Preface(remaining:)
     _buffer ->
-      case bit_array.starts_with(preface, buffer) {
+      case is_partial_preface(buffer, preface) {
         True -> NeedMoreData
         False -> NotHttp2(buffer:)
       }
+  }
+}
+
+fn is_partial_preface(buffer: BitArray, expected: BitArray) -> Bool {
+  case buffer, expected {
+    <<byte, buffer:bits>>, <<wanted, expected:bits>> if byte == wanted -> {
+      is_partial_preface(buffer, expected)
+    }
+    <<>>, _expected -> True
+    _buffer, _expected -> False
   }
 }
