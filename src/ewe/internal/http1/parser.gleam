@@ -25,7 +25,7 @@ pub type Metadata {
   Metadata(
     framing: http1.Framing,
     keep_alive: http1.KeepAlive,
-    upgrade: option.Option(String),
+    upgrade: option.Option(http1.Upgrade),
   )
 }
 
@@ -415,6 +415,9 @@ pub type HeaderState {
     connection: ConnectionIntent,
     connection_upgrade: Bool,
     upgrade: option.Option(String),
+    websocket_key: option.Option(String),
+    websocket_version: option.Option(String),
+    websocket_extensions: option.Option(String),
     host: option.Option(#(String, option.Option(Int))),
   )
 }
@@ -426,6 +429,9 @@ pub fn initial_header_state() -> HeaderState {
     connection: NothingRequested,
     connection_upgrade: False,
     upgrade: option.None,
+    websocket_key: option.None,
+    websocket_version: option.None,
+    websocket_extensions: option.None,
     host: option.None,
   )
 }
@@ -459,12 +465,22 @@ fn complete_metadata(
     NothingRequested, Http11 -> http1.KeepAlive
     NothingRequested, Http10 -> http1.CloseAfterResponse
   }
-  let upgrade = case state.connection_upgrade {
-    True -> state.upgrade
-    False -> option.None
-  }
+  Metadata(framing:, keep_alive:, upgrade: resolve_upgrade(state))
+}
 
-  Metadata(framing:, keep_alive:, upgrade:)
+/// An `Upgrade` header only asks for anything if the `Connection` header named
+/// it, so one without the other is nothing.
+fn resolve_upgrade(state: HeaderState) -> option.Option(http1.Upgrade) {
+  case state.connection_upgrade, state.upgrade {
+    True, option.Some("websocket") ->
+      option.Some(http1.WebsocketUpgrade(
+        key: state.websocket_key,
+        version: state.websocket_version,
+        extensions: state.websocket_extensions,
+      ))
+    True, option.Some(name) -> option.Some(http1.OtherUpgrade(name))
+    True, option.None | False, _upgrade -> option.None
+  }
 }
 
 pub fn parse_headers(
@@ -560,6 +576,26 @@ fn classify(
     "upgrade" -> {
       let lowered = value |> lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, upgrade: option.Some(lowered)))
+    }
+    // The key is base64 and is echoed back as sent, so unlike the rest it is
+    // kept with its case.
+    "sec-websocket-key" ->
+      StepDone(
+        HeaderState(
+          ..state,
+          websocket_key: option.Some(unsafe_to_string(value)),
+        ),
+      )
+    "sec-websocket-version" ->
+      StepDone(
+        HeaderState(
+          ..state,
+          websocket_version: option.Some(unsafe_to_string(value)),
+        ),
+      )
+    "sec-websocket-extensions" -> {
+      let lowered = value |> lowercase_ascii |> unsafe_to_string
+      StepDone(HeaderState(..state, websocket_extensions: option.Some(lowered)))
     }
     "host" ->
       case state.host {

@@ -5,7 +5,9 @@ import ewe/internal/http1/body as http1_body
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/http1/sse as http1_sse
+import ewe/internal/http1/websocket as http1_websocket
 import ewe/internal/sse
+import ewe/internal/websocket
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -20,12 +22,15 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/result
+import gleam/string
 import glisten
 import glisten/internal/handler
 import glisten/internal/listener
 import glisten/socket
 import glisten/socket/options
 import glisten/transport
+import logging
+import websocks
 
 pub type Connection =
   connection.Connection
@@ -37,6 +42,7 @@ pub type Body {
   File(connection.File)
   Streaming(connection.Streaming)
   Sse(connection.Sse)
+  Websocket(connection.Websocket)
 }
 
 pub type IpAddress {
@@ -393,6 +399,7 @@ fn to_internal_body(body: Body) -> connection.Body {
     File(file) -> connection.File(file)
     Streaming(streaming) -> connection.Streaming(streaming)
     Sse(sse) -> connection.Sse(sse)
+    Websocket(websocket) -> connection.Websocket(websocket)
   }
 }
 
@@ -722,4 +729,291 @@ pub fn sse(
   }
 
   response.set_body(response, Sse(connection.SseMetadata(stream)))
+}
+
+/// A handle for sending frames on an open WebSocket.
+pub type WebsocketConnection =
+  connection.WebsocketConnection
+
+/// What the client sent or what the rest of your program sent to the subject
+/// given to `on_init`. Ping and pong frames are answered by the server and do
+/// not reach the handler.
+pub type WebsocketMessage(user_message) {
+  TextFrame(text: String)
+  BinaryFrame(data: BitArray)
+  UserMessage(message: user_message)
+}
+
+fn from_internal_websocket_message(
+  message: websocket.Message(user_message),
+) -> WebsocketMessage(user_message) {
+  case message {
+    websocket.TextFrame(text) -> TextFrame(text)
+    websocket.BinaryFrame(data) -> BinaryFrame(data)
+    websocket.UserMessage(message) -> UserMessage(message)
+  }
+}
+
+/// What a WebSocket does after the handler has dealt with a message. Build it
+/// with `websocket_continue`, `websocket_stop` or `websocket_stop_abnormal`.
+pub opaque type WebsocketNext(user_state, user_message) {
+  WebsocketContinue(user_state, Option(process.Selector(user_message)))
+  WebsocketStop
+  WebsocketStopAbnormal(reason: String)
+}
+
+/// Carries on handling further messages with `user_state` and the selector the
+/// connection already has.
+pub fn websocket_continue(
+  user_state: user_state,
+) -> WebsocketNext(user_state, user_message) {
+  WebsocketContinue(user_state, None)
+}
+
+/// Carries on listening on `selector` from here on instead of the one the
+/// connection was started with.
+pub fn websocket_continue_with_selector(
+  user_state: user_state,
+  selector: process.Selector(user_message),
+) -> WebsocketNext(user_state, user_message) {
+  WebsocketContinue(user_state, Some(selector))
+}
+
+/// Ends the WebSocket.
+pub fn websocket_stop() -> WebsocketNext(user_state, user_message) {
+  WebsocketStop
+}
+
+/// Ends the WebSocket reporting `reason` as the cause.
+pub fn websocket_stop_abnormal(
+  reason: String,
+) -> WebsocketNext(user_state, user_message) {
+  WebsocketStopAbnormal(reason)
+}
+
+/// Why a WebSocket is being closed, sent to the client in the close frame.
+pub type CloseReason {
+  /// Close without saying why.
+  NoCloseReason
+  /// Close with a status code and a description, which may be empty.
+  CloseReason(code: CloseCode, reason: String)
+}
+
+/// The status code a close frame carries. The codes that exist only to be
+/// reported locally such as 1005 and 1006 are absent. Sending one is a
+/// protocol violation.
+pub type CloseCode {
+  /// The connection did what it was for and is closing normally (1000).
+  NormalClosure
+  /// The endpoint is going away, from a server shutdown or a client navigating
+  /// away (1001).
+  GoingAway
+  /// The other end broke the protocol (1002).
+  ProtocolError
+  /// Data arrived that this endpoint cannot accept (1003).
+  UnsupportedData
+  /// A message did not match the type it declared, such as a text frame that
+  /// is not UTF-8 (1007).
+  InvalidPayloadData
+  /// The other end broke your rules, when no more specific code applies (1008).
+  PolicyViolation
+  /// A message was larger than this endpoint will handle (1009).
+  MessageTooBig
+  /// An extension the client required was not negotiated (1010).
+  MandatoryExtension
+  /// Something went wrong on this side (1011).
+  InternalError
+  /// The server is restarting, and clients may reconnect shortly (1012).
+  ServiceRestart
+  /// The server is overloaded and the client should retry later (1013).
+  TryAgainLater
+  /// An upstream server answered badly (1014).
+  BadGateway
+  /// An application specific code, which must be between 3000 and 4999.
+  ApplicationCode(code: Int)
+}
+
+fn to_internal_close_reason(reason: CloseReason) -> websocks.CloseReason {
+  case reason {
+    NoCloseReason -> websocks.NoCloseReason
+    CloseReason(code:, reason:) ->
+      websocks.CloseReason(to_internal_close_code(code), reason)
+  }
+}
+
+fn to_internal_close_code(code: CloseCode) -> websocks.CloseCode {
+  case code {
+    NormalClosure -> websocks.NormalClosure
+    GoingAway -> websocks.GoingAway
+    ProtocolError -> websocks.ProtocolError
+    UnsupportedData -> websocks.UnsupportedData
+    InvalidPayloadData -> websocks.InvalidPayloadData
+    PolicyViolation -> websocks.PolicyViolation
+    MessageTooBig -> websocks.MessageTooBig
+    MandatoryExtension -> websocks.MandatoryExtension
+    InternalError -> websocks.InternalError
+    ServiceRestart -> websocks.ServiceRestart
+    TryAgainLater -> websocks.TryAgainLater
+    BadGateway -> websocks.BadGateway
+    ApplicationCode(code:) -> websocks.ApplicationCode(code:)
+  }
+}
+
+/// Sends a text frame. If the client has gone the WebSocket ends here.
+pub fn send_text_frame(conn: WebsocketConnection, text: String) -> Nil {
+  case conn {
+    connection.Http1Websocket(conn) -> http1_websocket.send_text(conn, text)
+    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// Sends a binary frame. If the client has gone the WebSocket ends here.
+pub fn send_binary_frame(conn: WebsocketConnection, data: BitArray) -> Nil {
+  case conn {
+    connection.Http1Websocket(conn) -> http1_websocket.send_binary(conn, data)
+    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+/// Starts the closing handshake and ends the WebSocket. Return the value this
+/// gives back from your handler, no frame can be sent after it.
+pub fn send_close_frame(
+  conn: WebsocketConnection,
+  reason: CloseReason,
+) -> WebsocketNext(user_state, user_message) {
+  case conn {
+    connection.Http1Websocket(conn) ->
+      http1_websocket.send_close(conn, to_internal_close_reason(reason))
+    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
+  }
+
+  WebsocketStop
+}
+
+/// Turns the response into a WebSocket which runs until the handler stops it
+/// or the client goes away. The connection stops being HTTP once the handshake
+/// is written so it never carries another request.
+///
+/// A request that is not a valid handshake is answered with a 400 and the
+/// handler is never run.
+///
+/// `on_init` is called once, with an empty selector to add whatever the rest of
+/// your program sends this connection to and returns the starting state along
+/// with that selector. 
+/// `handler` is called for each frame from the client and each message the 
+/// selector picks up. 
+/// `on_close` is called once however the WebSocket ended.
+pub fn upgrade_websocket(
+  request request: request.Request(Connection),
+  on_init on_init: fn(WebsocketConnection, process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
+  handler handler: fn(
+    WebsocketConnection,
+    user_state,
+    WebsocketMessage(user_message),
+  ) -> WebsocketNext(user_state, user_message),
+  on_close on_close: fn(WebsocketConnection, user_state) -> Nil,
+) -> response.Response(Body) {
+  let step = fn(conn, state, message) {
+    case handler(conn, state, from_internal_websocket_message(message)) {
+      WebsocketContinue(state, messages) -> websocket.Proceed(state, messages)
+      WebsocketStop -> websocket.Halt(connection.Stopped)
+      WebsocketStopAbnormal(reason) ->
+        websocket.Halt(connection.StoppedAbnormal(reason))
+    }
+  }
+
+  let socket = fn(conn) {
+    case conn {
+      connection.Http1Websocket(conn) ->
+        http1_websocket.run(conn, on_init, step, on_close)
+      connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
+    }
+  }
+
+  case request.body {
+    connection.Http1(conn) ->
+      case http1_websocket.handshake(request.method, conn) {
+        Ok(http1_websocket.Handshake(accept:, compression:)) -> {
+          let context = websocks.create_context(compression, websocks.Server)
+
+          response.Response(
+            status: 101,
+            headers: handshake_headers(accept, compression),
+            body: Websocket(connection.WebsocketMetadata(
+              context:,
+              handler: socket,
+            )),
+          )
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Debug,
+            "Rejected a WebSocket handshake: "
+              <> http1_websocket.handshake_error_to_string(error),
+          )
+
+          response.set_body(response.new(400), Empty)
+        }
+      }
+    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+  }
+}
+
+fn handshake_headers(
+  accept: String,
+  compression: option.Option(websocks.CompressionExtensions),
+) -> List(#(String, String)) {
+  let headers = [
+    #("connection", "upgrade"),
+    #("upgrade", "websocket"),
+    #("sec-websocket-accept", accept),
+  ]
+
+  case compression {
+    Some(extensions) -> [
+      #("sec-websocket-extensions", compression_header(extensions)),
+      ..headers
+    ]
+    None -> headers
+  }
+}
+
+fn compression_header(extensions: websocks.CompressionExtensions) -> String {
+  let websocks.CompressionExtensions(
+    client_no_context_takeover:,
+    client_max_window_bits:,
+    server_no_context_takeover:,
+    server_max_window_bits:,
+  ) = extensions
+
+  ["permessage-deflate"]
+  |> append_flag(client_no_context_takeover, "client_no_context_takeover")
+  |> append_flag(server_no_context_takeover, "server_no_context_takeover")
+  |> append_window_bits(client_max_window_bits, "client_max_window_bits")
+  |> append_window_bits(server_max_window_bits, "server_max_window_bits")
+  |> list.reverse
+  |> string.join("; ")
+}
+
+fn append_flag(
+  parameters: List(String),
+  enabled: Bool,
+  name: String,
+) -> List(String) {
+  case enabled {
+    True -> [name, ..parameters]
+    False -> parameters
+  }
+}
+
+fn append_window_bits(
+  parameters: List(String),
+  bits: Option(Int),
+  name: String,
+) -> List(String) {
+  case bits {
+    Some(bits) -> [name <> "=" <> int.to_string(bits), ..parameters]
+    None -> parameters
+  }
 }

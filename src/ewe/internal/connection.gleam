@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/option
 import glisten
 import glisten/internal/handler
+import websocks
 
 pub type Connection {
   Http1(http1.Connection)
@@ -17,10 +18,20 @@ pub type Body {
   File(File)
   Streaming(Streaming)
   Sse(Sse)
+  Websocket(Websocket)
 }
 
 pub type Sse {
   SseMetadata(handler: fn(SseConnection) -> Outcome)
+}
+
+/// The context is built during the handshake where the negotiated extensions
+/// are known and handed to whichever protocol goes on to run the socket.
+pub type Websocket {
+  WebsocketMetadata(
+    context: websocks.Context,
+    handler: fn(WebsocketConnection) -> Outcome,
+  )
 }
 
 pub type Streaming {
@@ -28,7 +39,7 @@ pub type Streaming {
 }
 
 /// A raw descriptor belongs to the process that opened it, so whether the
-/// handler can carry one depends on the protocol: an HTTP/1 handler runs in the
+/// handler can carry one depends on the protocol. An HTTP/1 handler runs in the
 /// process that writes the socket, an HTTP/2 stream handler does not.
 pub type File {
   /// Already open, and closed by whoever writes or drops the response.
@@ -47,6 +58,11 @@ pub type ResponseWriter {
 pub type SseConnection {
   Http1Sse(http1.SseConnection)
   Http2Sse
+}
+
+pub type WebsocketConnection {
+  Http1Websocket(http1.WebsocketConnection)
+  Http2Websocket
 }
 
 pub type Outcome {

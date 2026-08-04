@@ -1,6 +1,8 @@
 import gleam/erlang/process
+import gleam/option
 import glisten/socket
 import glisten/transport
+import websocks
 
 /// The limits and timeouts an HTTP/1 connection is held to.
 pub type Config {
@@ -39,6 +41,7 @@ pub type Connection {
     read: Int,
     chunk_remaining: Int,
     config: Config,
+    upgrade: option.Option(Upgrade),
   )
 }
 
@@ -47,6 +50,18 @@ pub type Framing {
   Fixed(length: Int)
   Chunked
   NoBody
+}
+
+/// What a request asked to become instead of HTTP/1, gathered as the headers
+/// go past rather than looked up again afterwards. Whether the fields amount to
+/// a handshake is for whoever answers it to decide.
+pub type Upgrade {
+  WebsocketUpgrade(
+    key: option.Option(String),
+    version: option.Option(String),
+    extensions: option.Option(String),
+  )
+  OtherUpgrade(name: String)
 }
 
 /// Handlers run inside the connection process, so they report what they did to
@@ -103,5 +118,15 @@ pub type SseConnection {
     socket: socket.Socket,
     self: process.Subject(Signal),
     framing: StreamFraming,
+  )
+}
+
+/// The connection has stopped being HTTP by this point so there is nothing to
+/// keep alive and nothing to report back about reuse.
+pub type WebsocketConnection {
+  WebsocketConnection(
+    transport: transport.Transport,
+    socket: socket.Socket,
+    context: websocks.Context,
   )
 }

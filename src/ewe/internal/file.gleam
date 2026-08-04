@@ -79,7 +79,8 @@ pub fn release_body(body: connection.Body) -> Nil {
     | connection.Text(..)
     | connection.Empty
     | connection.Streaming(..)
-    | connection.Sse(..) -> Nil
+    | connection.Sse(..)
+    | connection.Websocket(..) -> Nil
   }
 }
 

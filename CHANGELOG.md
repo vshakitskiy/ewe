@@ -29,17 +29,23 @@
 - In replacement of `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop`
   there is now `stream_response`/`send_chunk`/`finish_chunk`/`finish_response` 
   and no init/loop callback for response streaming anymore.
-- Response streaming and server-sent events no longer spawn a process per
-  response, they run in the connection process itself.
-- `send_chunk` and `send_event` no longer return a `Result`. Writing to a client
-  that has gone now ends the handler where it stands rather than letting it 
-  carry on producing a body with nowhere to go. A stream that ends this way is
-  not an error and is not reported as one while a handler that crashes for its
-  own reasons still does. `on_close` runs either way.
+- Response streaming, server-sent events and websockets no longer spawn a
+  process per response, they run in the connection process itself.
+- `send_chunk`, `send_event`, `send_text_frame` and `send_binary_frame` no
+  longer return a `Result`. Writing to a client that has gone now ends the 
+  handler where it stands rather than letting it carry on producing a body with
+  nowhere to go. A stream that ends this way is not an error and is not reported
+  as one while a handler that crashes for its own reasons still does. `on_close` 
+  runs either way.
 - Rename `SSEConnection`, `SSEEvent` and `SSENext` to `SseConnection`,
   `SseEvent` and `SseNext`.
-- Add `comment`, for the server-sent events comment that keeps an idle stream
+- Add `comment` for the server-sent events comment that keeps an idle stream
   from being closed by an intermediary.
+- Rename the `WebsocketMessage` variants to `TextFrame`, `BinaryFrame` and
+  `UserMessage`.
+- In replacement of the `CloseCode` variants that each carried their own data
+  there is now `CloseReason`, either `NoCloseReason` or a code and a description 
+  which `send_close_frame` takes.
 
 ## v4.0.1 - 04.06.2026
 

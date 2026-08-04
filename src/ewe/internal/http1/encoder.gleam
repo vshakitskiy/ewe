@@ -15,6 +15,7 @@ import gleam/result
 import gleam/string
 import glisten/socket
 import glisten/transport
+import websocks
 
 pub type EncodeError {
   UnsafeHeader(name: String)
@@ -36,6 +37,10 @@ pub type Remainder {
   RemainderSse(
     handler: fn(connection.SseConnection) -> connection.Outcome,
     framing: http1.StreamFraming,
+  )
+  RemainderWebsocket(
+    context: websocks.Context,
+    handler: fn(connection.WebsocketConnection) -> connection.Outcome,
   )
 }
 
@@ -60,9 +65,12 @@ pub fn encode_response(
   let keep_alive = http1.and_keep_alive(keep_alive, state.keep_alive)
   let status = response.status
 
-  let encoded = case is_bodyless(status) {
-    True -> bodyless(state, status, keep_alive, response.body)
-    False -> encode_body(state, status, keep_alive, version, response.body)
+  let encoded = case response.body, is_bodyless(status) {
+    connection.Websocket(connection.WebsocketMetadata(context:, handler:)),
+      _bodyless
+    -> switching_protocols(state, status, context, handler)
+    body, True -> bodyless(state, status, keep_alive, body)
+    body, False -> encode_body(state, status, keep_alive, version, body)
   }
 
   // A HEAD response keeps the framing headers it would have had minus the body.
@@ -86,6 +94,27 @@ fn bodyless(
 ) -> Encoded {
   file.release_body(body)
   Encoded(build_head(state, status, keep_alive, <<>>), keep_alive, NoRemainder)
+}
+
+/// The handshake's own `connection` and `upgrade` headers are the whole point
+/// of the response so no framing header is written and the head is closed off
+/// without one.
+fn switching_protocols(
+  state: EncodeState,
+  status: Int,
+  context: websocks.Context,
+  handler: fn(connection.WebsocketConnection) -> connection.Outcome,
+) -> Encoded {
+  let head =
+    append_date(state.tree)
+    |> bytes_tree.append(<<"\r\n":utf8>>)
+    |> bytes_tree.prepend(status_line(status))
+
+  Encoded(
+    head,
+    http1.CloseAfterResponse,
+    RemainderWebsocket(context:, handler:),
+  )
 }
 
 fn encode_body(
@@ -119,6 +148,7 @@ fn encode_body(
       encode_stream(state, status, keep_alive, version, handler)
     connection.Sse(connection.SseMetadata(handler)) ->
       encode_sse(state, status, keep_alive, version, handler)
+    connection.Websocket(..) -> bodyless(state, status, keep_alive, body)
   }
 }
 
@@ -129,7 +159,8 @@ fn drop_body(encoded: Encoded) -> Encoded {
     NoRemainder
     | RemainderInline(..)
     | RemainderStream(..)
-    | RemainderSse(..) -> Nil
+    | RemainderSse(..)
+    | RemainderWebsocket(..) -> Nil
   }
 
   Encoded(..encoded, remainder: NoRemainder)
@@ -318,11 +349,13 @@ fn finish(writer: ResponseWriter) -> Nil {
 type Reserved {
   Framing
   FramingAndSse
+  Handshake
 }
 
 fn reserved(body: connection.Body) -> Reserved {
   case body {
     connection.Sse(..) -> FramingAndSse
+    connection.Websocket(..) -> Handshake
     connection.Bytes(..)
     | connection.Text(..)
     | connection.Empty
@@ -339,10 +372,12 @@ fn encode_headers(
   use state, #(name, value) <- list.try_fold(headers, initial)
 
   // TODO: just trust the handler?
-  case name {
-    "content-length" | "transfer-encoding" | "date" -> Ok(state)
-    "content-type" | "cache-control" if reserved == FramingAndSse -> Ok(state)
-    "connection" ->
+  case name, reserved {
+    "date", _reserved -> Ok(state)
+    _name, Handshake -> append_header(state, name, value)
+    "content-length", _reserved | "transfer-encoding", _reserved -> Ok(state)
+    "content-type", FramingAndSse | "cache-control", FramingAndSse -> Ok(state)
+    "connection", _reserved ->
       case parser.find_unsafe_header_byte(value) {
         Error(Nil) -> {
           let lowered = value |> bit_array.from_string |> parser.lowercase_ascii
@@ -354,29 +389,32 @@ fn encode_headers(
         }
         Ok(_position) -> Error(UnsafeHeader(name))
       }
-    _other ->
-      case
-        parser.find_unsafe_header_byte(name),
-        parser.find_unsafe_header_byte(value)
-      {
-        Error(Nil), Error(Nil) -> {
-          let tree =
-            bytes_tree.append_string(state.tree, name)
-            |> bytes_tree.append(<<": ":utf8>>)
-            |> bytes_tree.append_string(value)
-            |> bytes_tree.append(<<"\r\n":utf8>>)
+    _name, _reserved -> append_header(state, name, value)
+  }
+}
 
-          Ok(EncodeState(..state, tree:))
-        }
-        _other, _other -> Error(UnsafeHeader(name))
-      }
+fn append_header(
+  state: EncodeState,
+  name: String,
+  value: String,
+) -> Result(EncodeState, EncodeError) {
+  case
+    parser.find_unsafe_header_byte(name),
+    parser.find_unsafe_header_byte(value)
+  {
+    Error(Nil), Error(Nil) -> {
+      let tree =
+        bytes_tree.append_string(state.tree, name)
+        |> bytes_tree.append(<<": ":utf8, value:utf8, "\r\n":utf8>>)
+
+      Ok(EncodeState(..state, tree:))
+    }
+    _name, _value -> Error(UnsafeHeader(name))
   }
 }
 
 fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
-  bytes_tree.append_string(tree, "date: ")
-  |> bytes_tree.append(clock.get())
-  |> bytes_tree.append(<<"\r\n":utf8>>)
+  bytes_tree.append(tree, <<"date: ":utf8, clock.get():bits, "\r\n":utf8>>)
 }
 
 fn append_connection(
@@ -388,9 +426,7 @@ fn append_connection(
     http1.CloseAfterResponse -> <<"close":utf8>>
   }
 
-  bytes_tree.append(tree, <<"connection: ":utf8>>)
-  |> bytes_tree.append(value)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
+  bytes_tree.append(tree, <<"connection: ":utf8, value:bits, "\r\n":utf8>>)
 }
 
 fn status_line(status: Int) -> BitArray {

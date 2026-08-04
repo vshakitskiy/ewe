@@ -59,6 +59,7 @@ pub fn handle_message(
           read: 0,
           chunk_remaining: 0,
           config: state.config,
+          upgrade: metadata.upgrade,
         )
 
       let response =
@@ -227,6 +228,21 @@ fn send_response(
             }
           }
         }
+      }
+    }
+    // Once the handshake is written the connection has stopped being HTTP, so
+    // it never goes back to the request loop however the socket ends.
+    encoder.RemainderWebsocket(context:, handler: websocket_handler) -> {
+      use Nil <- result.try(transport.send(transport, socket, head))
+
+      let outcome =
+        http1.WebsocketConnection(transport:, socket:, context:)
+        |> connection.Http1Websocket
+        |> websocket_handler
+
+      case outcome {
+        connection.Stopped -> Ok(SentClose)
+        connection.StoppedAbnormal(reason) -> Ok(SentAbnormal(reason))
       }
     }
     encoder.RemainderSse(handler: sse_handler, framing:) -> {

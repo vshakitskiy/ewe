@@ -365,7 +365,8 @@ pub fn websocket_upgrade_requested_test() {
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
-  assert metadata.upgrade == Some("websocket")
+  assert metadata.upgrade
+    == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
 }
 
 pub fn upgrade_token_case_insensitive_test() {
@@ -375,7 +376,8 @@ pub fn upgrade_token_case_insensitive_test() {
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
-  assert metadata.upgrade == Some("websocket")
+  assert metadata.upgrade
+    == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
 }
 
 pub fn upgrade_among_multiple_connection_tokens_test() {
@@ -385,7 +387,7 @@ pub fn upgrade_among_multiple_connection_tokens_test() {
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
-  assert metadata.upgrade == Some("h2c")
+  assert metadata.upgrade == Some(http1.OtherUpgrade("h2c"))
 }
 
 pub fn upgrade_header_without_connection_token_ignored_test() {
@@ -406,12 +408,39 @@ pub fn upgrade_header_before_connection_header_test() {
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
-  assert metadata.upgrade == Some("websocket")
+  assert metadata.upgrade
+    == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
     as "order of Upgrade vs. Connection headers shouldn't matter"
 }
 
 pub fn no_upgrade_requested_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
+
+  assert metadata.upgrade == None
+}
+
+pub fn websocket_handshake_fields_collected_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: Permessage-Deflate; client_max_window_bits\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
+
+  assert metadata.upgrade
+    == Some(http1.WebsocketUpgrade(
+      // Base64 is case sensitive, so the key alone keeps the case it arrived in.
+      key: Some("dGhlIHNhbXBsZSBub25jZQ=="),
+      version: Some("13"),
+      extensions: Some("permessage-deflate; client_max_window_bits"),
+    ))
+}
+
+pub fn websocket_headers_without_an_upgrade_are_ignored_test() {
+  let buffer = <<
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n":utf8,
+  >>
+
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.upgrade == None
