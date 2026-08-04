@@ -4,6 +4,7 @@ import ewe/internal/http1/body
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/http1/parser
+import ewe/internal/stream
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -199,24 +200,32 @@ fn send_response(
     encoder.RemainderStream(handler: stream_handler, framing:) -> {
       use Nil <- result.try(transport.send(transport, socket, head))
 
-      connection.Http1Writer(http1.ResponseWriter(
-        transport:,
-        socket:,
-        self:,
-        framing:,
-        keep_alive:,
-      ))
-      |> stream_handler
+      let writer =
+        connection.Http1Writer(http1.ResponseWriter(
+          transport:,
+          socket:,
+          self:,
+          framing:,
+          keep_alive:,
+        ))
 
-      let drained = drain_messages(self)
-      case drained.stream {
-        option.Some(http1.StreamFinished(keep_alive:)) ->
-          Ok(to_sent(keep_alive))
-        // A handler that returns without finishing left the body unterminated,
-        // so close it out here and drop a connection we can no longer reuse.
-        option.None -> {
-          let _ = encoder.end_stream(transport, socket, framing)
-          Ok(SentClose)
+      case stream.rescue_dead(fn() { stream_handler(writer) }) {
+        // The client went away mid stream. There is nothing to terminate the
+        // body with and nothing to reuse.
+        Error(_reason) -> Ok(SentClose)
+        Ok(Nil) -> {
+          let drained = drain_messages(self)
+          case drained.stream {
+            option.Some(http1.StreamFinished(keep_alive:)) ->
+              Ok(to_sent(keep_alive))
+            // A handler that returns without finishing left the body 
+            // unterminated, so close it out here and drop a connection we can
+            // no longer reuse.
+            option.None -> {
+              let _ = encoder.end_stream(transport, socket, framing)
+              Ok(SentClose)
+            }
+          }
         }
       }
     }

@@ -3,6 +3,7 @@ import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
+import ewe/internal/stream
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
@@ -260,8 +261,9 @@ pub fn frame(
 }
 
 pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
-  let bytes = frame(bytes_tree.from_bit_array(chunk), writer.framing)
-  let _ = transport.send(writer.transport, writer.socket, bytes)
+  frame(bytes_tree.from_bit_array(chunk), writer.framing)
+  |> write(writer, _)
+
   writer
 }
 
@@ -275,13 +277,22 @@ pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
       )
     http1.CloseDelimitedStream -> bytes_tree.from_bit_array(chunk)
   }
-  let _ = transport.send(writer.transport, writer.socket, bytes)
+  write(writer, bytes)
   finish(writer)
 }
 
 pub fn finish_response(writer: ResponseWriter) -> Nil {
-  let _ = end_stream(writer.transport, writer.socket, writer.framing)
-  finish(writer)
+  case end_stream(writer.transport, writer.socket, writer.framing) {
+    Ok(Nil) -> finish(writer)
+    Error(reason) -> stream.dead(reason)
+  }
+}
+
+fn write(writer: ResponseWriter, bytes: bytes_tree.BytesTree) -> Nil {
+  case transport.send(writer.transport, writer.socket, bytes) {
+    Ok(Nil) -> Nil
+    Error(reason) -> stream.dead(reason)
+  }
 }
 
 pub fn end_stream(

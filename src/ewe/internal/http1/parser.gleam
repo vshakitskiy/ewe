@@ -1,7 +1,6 @@
 import ewe/internal/http1/connection as http1
 import gleam/bit_array
 import gleam/http
-import gleam/int
 import gleam/list
 import gleam/option
 

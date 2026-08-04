@@ -2,6 +2,7 @@ import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/sse
+import ewe/internal/stream
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
@@ -25,12 +26,26 @@ pub fn run(
   case activate(conn) {
     Ok(Nil) ->
       loop(conn, handle, selector(subject), state, Clean, step, on_close)
-    Error(reason) -> {
-      on_close(handle, state)
-      finished(conn, http1.CloseAfterResponse)
-      connection.StoppedAbnormal(socket.reason_to_string(reason))
-    }
+    Error(reason) ->
+      socket.reason_to_string(reason)
+      |> connection.StoppedAbnormal
+      |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
   }
+}
+
+/// Every way a stream ends runs the handler's `on_close`, reports whether the
+/// connection survived it, and answers with the outcome.
+fn ended(
+  conn: http1.SseConnection,
+  handle: connection.SseConnection,
+  state: user_state,
+  on_close: fn(connection.SseConnection, user_state) -> Nil,
+  keep_alive: http1.KeepAlive,
+  outcome: connection.Outcome,
+) -> connection.Outcome {
+  on_close(handle, state)
+  finished(conn, keep_alive)
+  outcome
 }
 
 /// Whether anything happened during the stream that rules out handing the
@@ -54,25 +69,42 @@ fn loop(
     // Whatever the client sent has been taken off the socket and cannot be put
     // back, so the connection is no longer safe to reuse.
     ClientData -> loop(conn, handle, selector, state, Spoiled, step, on_close)
-    Disconnected -> {
-      on_close(handle, state)
-      finished(conn, http1.CloseAfterResponse)
-      connection.Stopped
-    }
-    Failed(reason) -> {
-      on_close(handle, state)
-      finished(conn, http1.CloseAfterResponse)
+    Disconnected ->
+      ended(
+        conn,
+        handle,
+        state,
+        on_close,
+        http1.CloseAfterResponse,
+        connection.Stopped,
+      )
+    Failed(reason) ->
       connection.StoppedAbnormal(reason)
-    }
+      |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
     Message(message) ->
-      case step(handle, state, message) {
-        sse.Proceed(state) ->
+      // A send inside the handler can find the client gone before the socket
+      // has told us, so both routes out land on the same teardown.
+      case stream.rescue_dead(fn() { step(handle, state, message) }) {
+        Error(_reason) ->
+          ended(
+            conn,
+            handle,
+            state,
+            on_close,
+            http1.CloseAfterResponse,
+            connection.Stopped,
+          )
+        Ok(sse.Proceed(state)) ->
           loop(conn, handle, selector, state, reuse, step, on_close)
-        sse.Halt(outcome) -> {
-          on_close(handle, state)
-          finished(conn, keep_alive(outcome, reuse))
-          outcome
-        }
+        Ok(sse.Halt(outcome)) ->
+          ended(
+            conn,
+            handle,
+            state,
+            on_close,
+            keep_alive(outcome, reuse),
+            outcome,
+          )
       }
   }
 }
@@ -93,13 +125,13 @@ fn finished(conn: http1.SseConnection, keep_alive: http1.KeepAlive) -> Nil {
   |> process.send(conn.self, _)
 }
 
-pub fn send(
-  conn: http1.SseConnection,
-  event: sse.Event,
-) -> Result(Nil, socket.SocketReason) {
-  sse.encode(event)
-  |> encoder.frame(conn.framing)
-  |> transport.send(conn.transport, conn.socket, _)
+pub fn send(conn: http1.SseConnection, event: sse.Event) -> Nil {
+  let bytes = sse.encode(event) |> encoder.frame(conn.framing)
+
+  case transport.send(conn.transport, conn.socket, bytes) {
+    Ok(Nil) -> Nil
+    Error(reason) -> stream.dead(reason)
+  }
 }
 
 /// glisten re arms `{active, once}` only once its loop callback returns, and an

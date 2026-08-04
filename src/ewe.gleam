@@ -582,6 +582,11 @@ pub type ResponseWriter =
 
 /// Starts a streamed response. `handler` must end by calling `finish_chunk` or
 /// `finish_response` on it, since that's what closes the stream.
+///
+/// A send to a client that has gone ends the handler there and then, rather
+/// than letting it carry on producing a body with nowhere to go. Nothing after
+/// that send runs, so hold anything that needs releasing in a way that survives
+/// on the process ending rather than in code after the write.
 pub fn stream_response(
   response: response.Response(a),
   handler: fn(ResponseWriter) -> Nil,
@@ -676,11 +681,9 @@ pub fn event_retry(event: SseEvent, retry: Int) -> SseEvent {
   sse.Event(..event, retry: Some(retry))
 }
 
-/// Sends event to the client.
-pub fn send_event(
-  conn: SseConnection,
-  event: SseEvent,
-) -> Result(Nil, socket.SocketReason) {
+/// Sends event to the client. If the client has gone the stream ends here:
+/// `on_close` runs and the handler is not called again.
+pub fn send_event(conn: SseConnection, event: SseEvent) -> Nil {
   case conn {
     connection.Http1Sse(conn) -> http1_sse.send(conn, event)
     connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
