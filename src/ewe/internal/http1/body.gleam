@@ -14,8 +14,6 @@ pub type BodyError {
   InvalidBody
 }
 
-const body_read_timeout = 10_000
-
 pub fn read_body(
   conn: http1.Connection,
   limit: Int,
@@ -54,10 +52,11 @@ pub fn read_body_chunk(
   max_chunk_bytes max_chunk_bytes: Int,
   limit limit: Int,
 ) -> Result(ChunkRead, BodyError) {
-  let http1.Connection(self:, buffer:, read:, chunk_remaining:, ..) = conn
+  let self = conn.self
 
   case pull_chunk(conn, max_chunk_bytes, limit) {
     Ok(PulledChunk(data, next)) -> {
+      let http1.Connection(buffer:, read:, chunk_remaining:, ..) = next
       send_body_signal(
         self,
         http1.BodyProgress(buffer:, read:, chunk_remaining:),
@@ -142,6 +141,7 @@ fn pull_fixed_chunk(
         socket,
         buffer,
         want,
+        conn.config.body_read_timeout,
       ))
       let conn = http1.Connection(..conn, buffer: leftover, read: read + want)
       Ok(PulledChunk(data, conn))
@@ -154,6 +154,7 @@ fn read_exact(
   socket: socket.Socket,
   buffer: BitArray,
   length: Int,
+  timeout: Int,
 ) -> Result(#(BitArray, BitArray), parser.ParseError) {
   case buffer {
     <<data:bytes-size(length), leftover:bits>> -> Ok(#(data, leftover))
@@ -163,7 +164,7 @@ fn read_exact(
           transport,
           socket,
           length - bit_array.byte_size(buffer),
-          body_read_timeout,
+          timeout,
         )
       {
         Ok(more) -> Ok(#(connection.append_buffer(buffer, more), <<>>))
@@ -179,22 +180,36 @@ fn pull_chunked_chunk(
   chunk_remaining: Int,
   max_chunk_bytes: Int,
 ) -> Result(Pulled, parser.ParseError) {
-  let http1.Connection(transport:, socket:, buffer:, ..) = conn
+  let http1.Connection(transport:, socket:, buffer:, config:, ..) = conn
 
   case chunk_remaining {
     0 -> {
-      use #(size, buffer) <- result.try(pull_until(
-        transport,
-        socket,
-        buffer,
-        parse_chunk_line,
-      ))
+      use #(size, buffer) <- result.try(
+        pull_until(
+          transport,
+          socket,
+          buffer,
+          config.body_read_timeout,
+          parse_chunk_line(_, config),
+        ),
+      )
 
       case size {
         0 -> {
           use #(trailers, _state, buffer) <- result.try({
-            use buffer <- pull_until(transport, socket, buffer)
-            parser.parse_headers(buffer, [], 0, parser.initial_header_state())
+            use buffer <- pull_until(
+              transport,
+              socket,
+              buffer,
+              config.body_read_timeout,
+            )
+            parser.parse_headers(
+              buffer,
+              [],
+              0,
+              parser.initial_header_state(),
+              config,
+            )
           })
 
           Ok(PulledDone(trailers, buffer))
@@ -224,7 +239,12 @@ fn take_chunk_slice(
   }
 
   use #(data, buffer) <- result.try({
-    use buffer <- pull_until(transport, socket, buffer)
+    use buffer <- pull_until(
+      transport,
+      socket,
+      buffer,
+      conn.config.body_read_timeout,
+    )
     take_chunk_prefix(buffer, want, slice)
   })
 
@@ -242,18 +262,20 @@ fn pull_until(
   transport: transport.Transport,
   socket: socket.Socket,
   buffer: BitArray,
+  timeout: Int,
   step: fn(BitArray) -> parser.Step(a),
 ) -> Result(a, parser.ParseError) {
   case step(buffer) {
     parser.StepDone(value) -> Ok(value)
     parser.ParseError(error) -> Error(error)
     parser.More ->
-      case transport.receive_timeout(transport, socket, 0, body_read_timeout) {
+      case transport.receive_timeout(transport, socket, 0, timeout) {
         Ok(more) ->
           pull_until(
             transport,
             socket,
             connection.append_buffer(buffer, more),
+            timeout,
             step,
           )
         Error(_reason) -> Error(parser.BodyReadFailed)
@@ -261,10 +283,13 @@ fn pull_until(
   }
 }
 
-fn parse_chunk_line(buffer: BitArray) -> parser.Step(#(Int, BitArray)) {
+fn parse_chunk_line(
+  buffer: BitArray,
+  config: http1.Config,
+) -> parser.Step(#(Int, BitArray)) {
   use #(line, remaining) <- parser.try_step(parser.extract_line(
     buffer,
-    parser.max_chunk_size_line,
+    config.max_chunk_size_line,
     parser.ChunkSizeLineTooLong,
     parser.BadChunkSize,
   ))

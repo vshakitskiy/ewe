@@ -59,7 +59,42 @@ pub fn encode_response(
   let keep_alive = http1.and_keep_alive(keep_alive, state.keep_alive)
   let status = response.status
 
-  let encoded = case response.body {
+  let encoded = case is_bodyless(status) {
+    True -> bodyless(state, status, keep_alive, response.body)
+    False -> encode_body(state, status, keep_alive, version, response.body)
+  }
+
+  // A HEAD response keeps the framing headers it would have had minus the body.
+  Ok(case method {
+    http.Head -> drop_body(encoded)
+    _method -> encoded
+  })
+}
+
+/// These statuses are defined as carrying no body so they get neither one nor
+/// a framing header for the client to wait on.
+fn is_bodyless(status: Int) -> Bool {
+  status == 204 || status == 304 || { status >= 100 && status < 200 }
+}
+
+fn bodyless(
+  state: EncodeState,
+  status: Int,
+  keep_alive: http1.KeepAlive,
+  body: connection.Body,
+) -> Encoded {
+  file.release_body(body)
+  Encoded(build_head(state, status, keep_alive, <<>>), keep_alive, NoRemainder)
+}
+
+fn encode_body(
+  state: EncodeState,
+  status: Int,
+  keep_alive: http1.KeepAlive,
+  version: parser.Version,
+  body: connection.Body,
+) -> Encoded {
+  case body {
     connection.Bytes(tree) ->
       sized(
         state,
@@ -84,12 +119,6 @@ pub fn encode_response(
     connection.Sse(connection.SseMetadata(handler)) ->
       encode_sse(state, status, keep_alive, version, handler)
   }
-
-  // A HEAD response keeps the framing headers it would have had, minus the body.
-  Ok(case method {
-    http.Head -> drop_body(encoded)
-    _method -> encoded
-  })
 }
 
 /// Anything the body was holding is let go here.
@@ -421,9 +450,15 @@ fn status_line(status: Int) -> BitArray {
   }
 }
 
-pub fn internal_server_error() -> bytes_tree.BytesTree {
+/// A bare response for a request that never reached a handler, sent on a
+/// connection that is closed straight after.
+pub fn error_response(status: Int) -> bytes_tree.BytesTree {
   EncodeState(bytes_tree.new(), http1.CloseAfterResponse)
-  |> build_head(500, http1.CloseAfterResponse, <<
+  |> build_head(status, http1.CloseAfterResponse, <<
     "content-length: 0\r\n":utf8,
   >>)
+}
+
+pub fn internal_server_error() -> bytes_tree.BytesTree {
+  error_response(500)
 }

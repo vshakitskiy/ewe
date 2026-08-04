@@ -11,16 +11,30 @@
 - `ResponseBody` is now named `Body`.
 - Builder's `new` now requires listener and connection factory names provided in
   order to prevent possible atom table exhaustion.
+- Add `Http1Config`, `default_http1_config` and `with_http1` to set the limits
+  and timeouts for every HTTP/1 connection. The request line, header line and
+  header count limits, chunk size line limit, idle and body read timeouts, and
+  the auto drain limit and chunk size.
 - Switch from `erlang:decode_packet` to self implemented parsing solution.
+- Responses are now framed by the server, which computes `content-length` or
+  `transfer-encoding: chunked` for a streamed body and drops the handler's own
+  `content-length`, `transfer-encoding` and `date` headers.
 - In replacement of `stream_body` there is now `read_body_chunk`, no consumer
   api anymore.
 - Request loop no longer ignore request's body on the socket if it was not 
   consumed inside user's handler. We now flush remaining body bytes allowing 
   correct reuse of the socket for the next request. If the size of the bytes is 
-  more than 1mb, we close the connection instead.
+  more than 1mb, we close the connection instead. That limit is the
+  `auto_drain_limit` of `Http1Config`.
 - In replacement of `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop`
   there is now `stream_response`/`send_chunk`/`finish_chunk`/`finish_response` 
   and no init/loop callback for response streaming anymore.
+- Response streaming and server-sent events no longer spawn a process per
+  response, they run in the connection process itself.
+- Rename `SSEConnection`, `SSEEvent` and `SSENext` to `SseConnection`,
+  `SseEvent` and `SseNext`.
+- Add `comment`, for the server-sent events comment that keeps an idle stream
+  from being closed by an intermediary.
 
 ## v4.0.1 - 04.06.2026
 

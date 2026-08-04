@@ -22,8 +22,6 @@ pub fn resolve(
   limit: option.Option(Int),
 ) -> Result(connection.File, FileError) {
   case conn {
-    // The handler already runs in the process that writes the socket, so it can
-    // hold the descriptor itself. 
     connection.Http1(_conn) -> {
       use handle <- result.try(open(path))
 

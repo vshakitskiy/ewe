@@ -1,5 +1,6 @@
 import ewe/internal/connection
 import ewe/internal/http1
+import ewe/internal/http1/connection as http1_connection
 import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
@@ -18,6 +19,7 @@ pub type State {
 pub fn on_init(
   handler: fn(request.Request(connection.Connection)) ->
     response.Response(connection.Body),
+  config: http1_connection.Config,
 ) {
   fn(connection: glisten.Connection(connection.Message)) -> #(
     State,
@@ -27,7 +29,8 @@ pub fn on_init(
       http1.State(
         handler:,
         buffer: <<>>,
-        idle_timer: connection.start_idle_timer(connection),
+        idle_timer: connection.start_idle_timer(connection, config.idle_timeout),
+        config:,
       )
 
     #(Initialised(state), option.None)
@@ -49,7 +52,10 @@ pub fn loop(
           http1.State(
             ..state,
             buffer:,
-            idle_timer: connection.start_idle_timer(connection),
+            idle_timer: connection.start_idle_timer(
+              connection,
+              state.config.idle_timeout,
+            ),
           )
           |> Initialised
           |> glisten.continue

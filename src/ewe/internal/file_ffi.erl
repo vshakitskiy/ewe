@@ -28,8 +28,6 @@ open(Path) ->
     {error, _Reason} -> {error, unknown_error}
   end.
 
-%% Sizes the open handle, so the bytes framed are the ones about to be sent
-%% rather than whatever the path pointed at a moment ago.
 size(Fd) ->
   case file:position(Fd, eof) of
     {ok, Size} -> {ok, Size};

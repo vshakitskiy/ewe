@@ -2,8 +2,33 @@ import gleam/erlang/process
 import glisten/socket
 import glisten/transport
 
-/// A handler's HTTP/1 connection. Where to write, where to report back to, 
-/// and how much of the request body is still unread.
+/// The limits and timeouts an HTTP/1 connection is held to.
+pub type Config {
+  Config(
+    max_request_line: Int,
+    max_header_line: Int,
+    max_headers: Int,
+    max_chunk_size_line: Int,
+    idle_timeout: Int,
+    body_read_timeout: Int,
+    auto_drain_limit: Int,
+    auto_drain_chunk_bytes: Int,
+  )
+}
+
+pub fn default_config() -> Config {
+  Config(
+    max_request_line: 8192,
+    max_header_line: 8192,
+    max_headers: 100,
+    max_chunk_size_line: 128,
+    idle_timeout: 10_000,
+    body_read_timeout: 10_000,
+    auto_drain_limit: 1_048_576,
+    auto_drain_chunk_bytes: 65_536,
+  )
+}
+
 pub type Connection {
   Connection(
     transport: transport.Transport,
@@ -13,6 +38,7 @@ pub type Connection {
     framing: Framing,
     read: Int,
     chunk_remaining: Int,
+    config: Config,
   )
 }
 

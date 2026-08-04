@@ -2,6 +2,7 @@ import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
 import ewe/internal/http1/body as http1_body
+import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/http1/sse as http1_sse
 import ewe/internal/sse
@@ -145,6 +146,88 @@ fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
   }
 }
 
+/// The limits and timeouts for every HTTP/1 connection. Build one by updating 
+/// `default_http1_config`:
+///
+/// ```gleam
+/// Http1Config(..ewe.default_http1_config(), max_headers: 50)
+/// ```
+///
+/// Sizes are in bytes and timeouts in milliseconds.
+pub type Http1Config {
+  Http1Config(
+    /// Longest request line accepted beyond which the request is refused with a 
+    /// 414.
+    max_request_line: Int,
+    /// Longest single header line accepted beyond which the request is refused 
+    /// with a 431.
+    max_header_line: Int,
+    /// How many header fields a request may carry beyond which it is refused
+    /// with a 431.
+    max_headers: Int,
+    /// Longest chunk size line accepted in a chunked body.
+    max_chunk_size_line: Int,
+    /// How long a connection may sit without sending anything before it is
+    /// closed.
+    idle_timeout: Int,
+    /// How long a single read of a request body waits for the client.
+    body_read_timeout: Int,
+    /// How much of a body the handler never read is drained so the connection
+    /// can be reused. A body larger than this closes the connection instead.
+    auto_drain_limit: Int,
+    /// How much of that drain is read at a time.
+    auto_drain_chunk_bytes: Int,
+  )
+}
+
+pub fn default_http1_config() -> Http1Config {
+  let http1.Config(
+    max_request_line:,
+    max_header_line:,
+    max_headers:,
+    max_chunk_size_line:,
+    idle_timeout:,
+    body_read_timeout:,
+    auto_drain_limit:,
+    auto_drain_chunk_bytes:,
+  ) = http1.default_config()
+
+  Http1Config(
+    max_request_line:,
+    max_header_line:,
+    max_headers:,
+    max_chunk_size_line:,
+    idle_timeout:,
+    body_read_timeout:,
+    auto_drain_limit:,
+    auto_drain_chunk_bytes:,
+  )
+}
+
+fn to_internal_http1_config(config: Http1Config) -> http1.Config {
+  let Http1Config(
+    max_request_line:,
+    max_header_line:,
+    max_headers:,
+    max_chunk_size_line:,
+    idle_timeout:,
+    body_read_timeout:,
+    auto_drain_limit:,
+    auto_drain_chunk_bytes:,
+  ) = config
+
+  http1.Config(
+    max_request_line:,
+    max_header_line:,
+    max_headers:,
+    max_chunk_size_line:,
+    idle_timeout:,
+    body_read_timeout:,
+    auto_drain_limit:,
+    auto_drain_chunk_bytes:,
+  )
+}
+
 /// Contains all server configurations, can be adjusted by different builder
 /// functions.
 pub opaque type Builder {
@@ -152,6 +235,7 @@ pub opaque type Builder {
     handler: fn(request.Request(Connection)) -> response.Response(Body),
     bind_target: BindTarget,
     tls: Option(TlsConfig),
+    http1: Http1Config,
     listener_name: process.Name(listener.Message),
     connection_factory_name: process.Name(
       factory.Message(
@@ -181,6 +265,7 @@ pub fn new(
     handler:,
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
     tls: None,
+    http1: default_http1_config(),
     listener_name:,
     connection_factory_name:,
     on_start: fn(scheme, address) {
@@ -295,6 +380,11 @@ pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
 
+/// Replaces the limits and timeouts applied to HTTP/1 connections.
+pub fn with_http1(builder: Builder, config: Http1Config) -> Builder {
+  Builder(..builder, http1: config)
+}
+
 fn to_internal_body(body: Body) -> connection.Body {
   case body {
     Bytes(tree) -> connection.Bytes(tree)
@@ -319,7 +409,10 @@ pub fn start(
     glisten.new(
       listener_name: builder.listener_name,
       connection_factory_name: builder.connection_factory_name,
-      on_init: handler_.on_init(handler),
+      on_init: handler_.on_init(
+        handler,
+        to_internal_http1_config(builder.http1),
+      ),
       loop: handler_.loop,
     )
 

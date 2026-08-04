@@ -22,6 +22,7 @@ pub type State {
       response.Response(connection.Body),
     buffer: BitArray,
     idle_timer: option.Option(process.Timer),
+    config: http1.Config,
   )
 }
 
@@ -43,7 +44,7 @@ pub fn handle_message(
 ) -> Next {
   connection.cancel_idle_timer(state.idle_timer)
 
-  case parser.parse(state.buffer) {
+  case parser.parse(state.buffer, state.config) {
     Ok(parser.Complete(head, metadata, remaining)) -> {
       let self = process.new_subject()
 
@@ -56,6 +57,7 @@ pub fn handle_message(
           framing: metadata.framing,
           read: 0,
           chunk_remaining: 0,
+          config: state.config,
         )
 
       let response =
@@ -63,7 +65,7 @@ pub fn handle_message(
 
       let drained = drain_messages(self)
       let ResolvedBody(buffer, body_keep_alive) =
-        resolve_body(body_connection, drained.body)
+        resolve_body(body_connection, drained.body, state.config)
       let keep_alive =
         http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
@@ -95,14 +97,23 @@ pub fn handle_message(
         Error(_reason) -> Close
       }
     }
-    Ok(parser.Incomplete) ->
-      State(..state, idle_timer: connection.start_idle_timer(connection))
-      |> Continue
+    Ok(parser.Incomplete) -> {
+      let idle_timer =
+        connection.start_idle_timer(connection, state.config.idle_timeout)
+      Continue(State(..state, idle_timer:))
+    }
     Error(error) -> {
       logging.log(
         logging.Error,
         "Failed to parse HTTP/1.x request: " <> parser.error_to_string(error),
       )
+
+      let _sent =
+        transport.send(
+          connection.transport,
+          connection.socket,
+          encoder.error_response(parser.error_to_status(error)),
+        )
 
       Close
     }
@@ -119,7 +130,8 @@ fn await_next_request(
 ) -> Next {
   case buffer {
     <<>> -> {
-      let idle_timer = connection.start_idle_timer(connection)
+      let idle_timer =
+        connection.start_idle_timer(connection, state.config.idle_timeout)
       Continue(State(..state, buffer:, idle_timer:))
     }
     _buffer ->
@@ -244,10 +256,6 @@ fn to_sent(keep_alive: http1.KeepAlive) -> Sent {
   }
 }
 
-const auto_drain_limit = 1_048_576
-
-const auto_drain_chunk_bytes = 65_536
-
 /// What the request body left behind: the bytes after it, which begin the next
 /// pipelined request, and whether it was consumed cleanly enough to reuse the
 /// connection at all.
@@ -258,6 +266,7 @@ type ResolvedBody {
 fn resolve_body(
   conn: http1.Connection,
   drained: option.Option(http1.BodySignal),
+  config: http1.Config,
 ) -> ResolvedBody {
   case drained {
     option.Some(http1.BodyDrained(leftover)) ->
@@ -266,8 +275,8 @@ fn resolve_body(
       ResolvedBody(<<>>, http1.CloseAfterResponse)
     option.Some(http1.BodyProgress(buffer:, read:, chunk_remaining:)) ->
       http1.Connection(..conn, buffer:, read:, chunk_remaining:)
-      |> drain_remaining
-    option.None -> drain_remaining(conn)
+      |> drain_remaining(config)
+    option.None -> drain_remaining(conn, config)
   }
 }
 
@@ -295,14 +304,21 @@ fn do_drain_messages(
   }
 }
 
-fn drain_remaining(conn: http1.Connection) -> ResolvedBody {
+fn drain_remaining(
+  conn: http1.Connection,
+  config: http1.Config,
+) -> ResolvedBody {
   let http1.Connection(read:, ..) = conn
-  do_drain_remaining(conn, read + auto_drain_limit)
+  do_drain_remaining(conn, read + config.auto_drain_limit, config)
 }
 
-fn do_drain_remaining(conn: http1.Connection, limit: Int) -> ResolvedBody {
-  case body.pull_chunk(conn, auto_drain_chunk_bytes, limit) {
-    Ok(body.PulledChunk(_data, next)) -> do_drain_remaining(next, limit)
+fn do_drain_remaining(
+  conn: http1.Connection,
+  limit: Int,
+  config: http1.Config,
+) -> ResolvedBody {
+  case body.pull_chunk(conn, config.auto_drain_chunk_bytes, limit) {
+    Ok(body.PulledChunk(_data, next)) -> do_drain_remaining(next, limit, config)
     Ok(body.PulledDone(_trailers, leftover)) ->
       ResolvedBody(leftover, http1.KeepAlive)
     Error(_reason) -> ResolvedBody(<<>>, http1.CloseAfterResponse)

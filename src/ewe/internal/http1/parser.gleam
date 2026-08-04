@@ -45,6 +45,7 @@ pub type ParseError {
   BadHost
   MissingHost
   AmbiguousFraming
+  UnsupportedTransferEncoding
   ChunkSizeLineTooLong
   BadChunkSize
   BadChunkFraming
@@ -54,17 +55,14 @@ pub type ParseError {
 
 pub fn error_to_string(error: ParseError) -> String {
   case error {
-    RequestLineTooLong ->
-      "request line exceeds " <> int.to_string(max_request_line) <> " bytes"
+    RequestLineTooLong -> "request line exceeds the configured limit"
     BadRequestLine -> "malformed request line"
     BadMethod -> "invalid request method"
     BadTarget -> "invalid request target"
     BadVersion -> "unsupported or malformed HTTP version"
-    HeaderLineTooLong ->
-      "header line exceeds " <> int.to_string(max_header_line) <> " bytes"
+    HeaderLineTooLong -> "header line exceeds the configured limit"
     BadHeader -> "malformed header line"
-    TooManyHeaders ->
-      "too many headers (max " <> int.to_string(max_headers) <> ")"
+    TooManyHeaders -> "too many headers"
     DuplicateContentLength -> "duplicate Content-Length header"
     BadContentLength -> "invalid Content-Length value"
     DuplicateHost -> "duplicate Host header"
@@ -72,14 +70,38 @@ pub fn error_to_string(error: ParseError) -> String {
     MissingHost -> "missing required Host header"
     AmbiguousFraming ->
       "conflicting Content-Length and Transfer-Encoding headers"
-    ChunkSizeLineTooLong ->
-      "chunk size line exceeds "
-      <> int.to_string(max_chunk_size_line)
-      <> " bytes"
+    UnsupportedTransferEncoding -> "unsupported transfer coding"
+    ChunkSizeLineTooLong -> "chunk size line exceeds the configured limit"
     BadChunkSize -> "malformed chunk size"
     BadChunkFraming -> "malformed chunk data framing"
     ChunkTooLarge -> "chunked body exceeds size limit"
     BodyReadFailed -> "failed to read request body from the socket"
+  }
+}
+
+/// The status a rejected request is answered with, so the client is told why
+/// rather than left to work it out from a closed socket.
+pub fn error_to_status(error: ParseError) -> Int {
+  case error {
+    RequestLineTooLong -> 414
+    HeaderLineTooLong | TooManyHeaders -> 431
+    ChunkTooLarge -> 413
+    BadVersion -> 505
+    UnsupportedTransferEncoding -> 501
+    BadRequestLine
+    | BadMethod
+    | BadTarget
+    | BadHeader
+    | DuplicateContentLength
+    | BadContentLength
+    | DuplicateHost
+    | BadHost
+    | MissingHost
+    | AmbiguousFraming
+    | ChunkSizeLineTooLong
+    | BadChunkSize
+    | BadChunkFraming
+    | BodyReadFailed -> 400
   }
 }
 
@@ -88,18 +110,14 @@ pub type Parsed {
   Incomplete
 }
 
-const max_request_line = 8192
-
-const max_header_line = 8192
-
-const max_headers = 100
-
-pub const max_chunk_size_line = 128
-
-pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
+pub fn parse(
+  buffer: BitArray,
+  config: http1.Config,
+) -> Result(Parsed, ParseError) {
   let step = {
     use #(method, target, version, remaining) <- try_step(parse_request_line(
       buffer,
+      config,
     ))
 
     use #(headers, state, remaining) <- try_step(parse_headers(
@@ -107,6 +125,7 @@ pub fn parse(buffer: BitArray) -> Result(Parsed, ParseError) {
       [],
       0,
       initial_header_state(),
+      config,
     ))
 
     use #(host, port, path, query) <- try_step(resolve_target(
@@ -148,10 +167,11 @@ pub fn try_step(step: Step(a), next: fn(a) -> Step(b)) -> Step(b) {
 
 fn parse_request_line(
   buffer: BitArray,
+  config: http1.Config,
 ) -> Step(#(http.Method, BitArray, Version, BitArray)) {
   use #(line, remaining) <- try_step(extract_line(
     buffer,
-    max_request_line,
+    config.max_request_line,
     RequestLineTooLong,
     BadRequestLine,
   ))
@@ -380,10 +400,19 @@ pub type ConnectionIntent {
   NothingRequested
 }
 
+/// The final transfer coding the request declared. Only `chunked` delimits a
+/// body, and it is the only coding decoded here, so anything else leaves a
+/// length that cannot be determined.
+pub type TransferEncoding {
+  NoTransferEncoding
+  ChunkedFinal
+  UnsupportedFinal
+}
+
 pub type HeaderState {
   HeaderState(
     content_length: option.Option(Int),
-    chunked: Bool,
+    transfer_encoding: TransferEncoding,
     connection: ConnectionIntent,
     connection_upgrade: Bool,
     upgrade: option.Option(String),
@@ -394,7 +423,7 @@ pub type HeaderState {
 pub fn initial_header_state() -> HeaderState {
   HeaderState(
     content_length: option.None,
-    chunked: False,
+    transfer_encoding: NoTransferEncoding,
     connection: NothingRequested,
     connection_upgrade: False,
     upgrade: option.None,
@@ -403,13 +432,19 @@ pub fn initial_header_state() -> HeaderState {
 }
 
 fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
-  case state.content_length, state.chunked {
-    option.Some(_length), True -> ParseError(AmbiguousFraming)
-    option.Some(length), False ->
+  case state.content_length, state.transfer_encoding {
+    _length, UnsupportedFinal -> ParseError(UnsupportedTransferEncoding)
+    option.Some(_length), ChunkedFinal -> ParseError(AmbiguousFraming)
+    option.Some(length), NoTransferEncoding ->
       StepDone(complete_metadata(state, version, http1.Fixed(length)))
-    option.None, True ->
-      StepDone(complete_metadata(state, version, http1.Chunked))
-    option.None, False ->
+    // HTTP/1.0 has no chunked coding, so a body claiming it has no framing at
+    // all and cannot be told apart from the next request.
+    option.None, ChunkedFinal ->
+      case version {
+        Http11 -> StepDone(complete_metadata(state, version, http1.Chunked))
+        Http10 -> ParseError(AmbiguousFraming)
+      }
+    option.None, NoTransferEncoding ->
       StepDone(complete_metadata(state, version, http1.NoBody))
   }
 }
@@ -438,20 +473,21 @@ pub fn parse_headers(
   acc: List(#(String, String)),
   count: Int,
   state: HeaderState,
+  config: http1.Config,
 ) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
   use #(line, remaining) <- try_step(extract_line(
     buffer,
-    max_header_line,
+    config.max_header_line,
     HeaderLineTooLong,
     BadHeader,
   ))
 
   case line {
     <<>> -> StepDone(#(list.reverse(acc), state, remaining))
-    _line if count >= max_headers -> ParseError(TooManyHeaders)
+    _line if count >= config.max_headers -> ParseError(TooManyHeaders)
     _line -> {
       use #(header, state) <- try_step(parse_header_line(line, state))
-      parse_headers(remaining, [header, ..acc], count + 1, state)
+      parse_headers(remaining, [header, ..acc], count + 1, state, config)
     }
   }
 }
@@ -499,10 +535,14 @@ fn classify(
             Error(Nil) -> ParseError(BadContentLength)
           }
       }
+    // Repeated headers concatenate into one coding list, so the last one seen
+    // carries the final coding.
     "transfer-encoding" -> {
-      let lowered = lowercase_ascii(value)
-      let chunked = state.chunked || has_token(lowered, <<"chunked":utf8>>)
-      StepDone(HeaderState(..state, chunked:))
+      let transfer_encoding = case value |> lowercase_ascii |> tokens {
+        [<<"chunked":utf8>>] -> ChunkedFinal
+        _other -> UnsupportedFinal
+      }
+      StepDone(HeaderState(..state, transfer_encoding:))
     }
     "connection" -> {
       let requested = value |> lowercase_ascii |> tokens
@@ -551,11 +591,17 @@ pub fn extract_line(
         False -> More
       }
     Ok(0) -> ParseError(malformed)
+    // The check above only bounds what is buffered while the line is still
+    // arriving, so a line that turns up whole in one packet is measured here.
     Ok(position) ->
-      case buffer {
-        <<line:bytes-size(position - 1), "\r\n":utf8, remaining:bits>> ->
-          StepDone(#(line, remaining))
-        _bad -> ParseError(malformed)
+      case position - 1 > max_len {
+        True -> ParseError(too_long)
+        False ->
+          case buffer {
+            <<line:bytes-size(position - 1), "\r\n":utf8, remaining:bits>> ->
+              StepDone(#(line, remaining))
+            _bad -> ParseError(malformed)
+          }
       }
   }
 }

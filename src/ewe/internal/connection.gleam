@@ -67,12 +67,11 @@ pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
   }
 }
 
-pub const idle_timeout = 10_000
-
 pub fn start_idle_timer(
   connection: glisten.Connection(Message),
+  timeout: Int,
 ) -> option.Option(process.Timer) {
-  process.send_after(connection.subject, idle_timeout, handler.User(Timeout))
+  process.send_after(connection.subject, timeout, handler.User(Timeout))
   |> option.Some
 }
 

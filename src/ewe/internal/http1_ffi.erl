@@ -15,6 +15,8 @@
     socket_error_reason/1
 ]).
 
+-define(HIGH_BITS, 16#80808080808080).
+
 %% Compiles and caches match patterns once at module load.
 init() ->
   persistent_term:put({?MODULE, lf}, binary:compile_pattern(<<"\n">>)),
@@ -65,14 +67,40 @@ lower(Byte) -> Byte.
 socket_error_reason({_Tag, _Socket, Reason}) ->
   Reason.
 
-%% Validates UTF-8 via native BIFs and returns the bytes unchanged.
-bit_array_to_string(Bin) ->
-  case unicode:bin_is_7bit(Bin) of
-    true ->
+%% Validates UTF-8 and returns the bytes unchanged. Everything skip_ascii walks
+%% past is ASCII which is valid UTF-8 and never part of a multi-byte sequence
+%% so whatever it stops on still starts on a character boundary and can be
+%% validated on its own.
+bit_array_to_string(Bin) when is_binary(Bin) ->
+  case skip_ascii(Bin) of
+    <<>> ->
       {ok, Bin};
-    false ->
-      case unicode:characters_to_binary(Bin) of
+    Rest ->
+      case unicode:characters_to_binary(Rest, utf8) of
         Out when is_binary(Out) -> {ok, Bin};
-        _ -> {error, nil}
+        _Invalid -> {error, nil}
       end
-  end.
+  end;
+bit_array_to_string(_Bits) ->
+  {error, nil}.
+
+%% Tests seven bytes per word rather than eight, since 56 bits is the widest that
+%% still fits an immediate integer on a 64-bit VM so no word allocates.
+skip_ascii(<<A:56, B:56, C:56, D:56, Rest/binary>>) when
+    A band ?HIGH_BITS =:= 0,
+    B band ?HIGH_BITS =:= 0,
+    C band ?HIGH_BITS =:= 0,
+    D band ?HIGH_BITS =:= 0
+->
+  skip_ascii(Rest);
+skip_ascii(<<Word:56, Rest/binary>>) when Word band ?HIGH_BITS =:= 0 ->
+  skip_ascii(Rest);
+%% Tails shorter than a word, each masked to its own width.
+skip_ascii(<<Word:48>>) when Word band 16#808080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:40>>) when Word band 16#8080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:32>>) when Word band 16#80808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:24>>) when Word band 16#808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:16>>) when Word band 16#8080 =:= 0 -> <<>>;
+skip_ascii(<<Word:8>>) when Word band 16#80 =:= 0 -> <<>>;
+skip_ascii(Rest) ->
+  Rest.
