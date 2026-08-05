@@ -582,6 +582,16 @@ pub fn read_body_chunk(
   }
 }
 
+// TODO: obviously not the string reason variant but this is for later!
+/// Why a write to the client did not go through.
+pub type SendError {
+  SendError(reason: String)
+}
+
+fn to_send_error(reason: socket.SocketReason) -> SendError {
+  SendError(socket.reason_to_string(reason))
+}
+
 /// A handle for writing a streamed response's body, obtained from
 /// `stream_response`.
 pub type ResponseWriter =
@@ -596,35 +606,52 @@ pub type ResponseWriter =
 /// on the process ending rather than in code after the write.
 pub fn stream_response(
   response: response.Response(a),
-  handler: fn(ResponseWriter) -> Nil,
+  handler: fn(ResponseWriter) -> Result(Nil, SendError),
 ) -> response.Response(Body) {
-  response.set_body(response, Streaming(connection.StreamingMetadata(handler)))
+  // What the handler was left holding when a write failed is its own business,
+  // ewe already learns whether the stream finished from the writer.
+  let stream = fn(writer) {
+    let _sent = handler(writer)
+    Nil
+  }
+
+  response.set_body(response, Streaming(connection.StreamingMetadata(stream)))
 }
 
 /// Sends one response body chunk, threading the writer through so it can be
 /// piped. For the last chunk use `finish_chunk` instead, it closes the
 /// stream in the same round trip.
-pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
+pub fn send_chunk(
+  writer: ResponseWriter,
+  chunk: BitArray,
+) -> Result(ResponseWriter, SendError) {
   case writer {
     connection.Http1Writer(writer) ->
-      connection.Http1Writer(encoder.send_chunk(writer, chunk))
+      encoder.send_chunk(writer, chunk)
+      |> result.map(connection.Http1Writer)
+      |> result.map_error(to_send_error)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
 /// Sends `chunk` as the final response body chunk and closes the stream.
-pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
+pub fn finish_chunk(
+  writer: ResponseWriter,
+  chunk: BitArray,
+) -> Result(Nil, SendError) {
   case writer {
-    connection.Http1Writer(writer) -> encoder.finish_chunk(writer, chunk)
+    connection.Http1Writer(writer) ->
+      encoder.finish_chunk(writer, chunk) |> result.map_error(to_send_error)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
 /// Closes the stream with no further data. Use `finish_chunk` instead if
 /// there's one last chunk to send.
-pub fn finish_response(writer: ResponseWriter) -> Nil {
+pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   case writer {
-    connection.Http1Writer(writer) -> encoder.finish_response(writer)
+    connection.Http1Writer(writer) ->
+      encoder.finish_response(writer) |> result.map_error(to_send_error)
     connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -690,9 +717,13 @@ pub fn event_retry(event: SseEvent, retry: Int) -> SseEvent {
 
 /// Sends event to the client. If the client has gone the stream ends here:
 /// `on_close` runs and the handler is not called again.
-pub fn send_event(conn: SseConnection, event: SseEvent) -> Nil {
+pub fn send_event(
+  conn: SseConnection,
+  event: SseEvent,
+) -> Result(Nil, SendError) {
   case conn {
-    connection.Http1Sse(conn) -> http1_sse.send(conn, event)
+    connection.Http1Sse(conn) ->
+      http1_sse.send(conn, event) |> result.map_error(to_send_error)
     connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -860,17 +891,25 @@ fn to_internal_close_code(code: CloseCode) -> websocks.CloseCode {
 }
 
 /// Sends a text frame. If the client has gone the WebSocket ends here.
-pub fn send_text_frame(conn: WebsocketConnection, text: String) -> Nil {
+pub fn send_text_frame(
+  conn: WebsocketConnection,
+  text: String,
+) -> Result(Nil, SendError) {
   case conn {
-    connection.Http1Websocket(conn) -> http1_websocket.send_text(conn, text)
+    connection.Http1Websocket(conn) ->
+      http1_websocket.send_text(conn, text) |> result.map_error(to_send_error)
     connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
 /// Sends a binary frame. If the client has gone the WebSocket ends here.
-pub fn send_binary_frame(conn: WebsocketConnection, data: BitArray) -> Nil {
+pub fn send_binary_frame(
+  conn: WebsocketConnection,
+  data: BitArray,
+) -> Result(Nil, SendError) {
   case conn {
-    connection.Http1Websocket(conn) -> http1_websocket.send_binary(conn, data)
+    connection.Http1Websocket(conn) ->
+      http1_websocket.send_binary(conn, data) |> result.map_error(to_send_error)
     connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
   }
 }
@@ -881,7 +920,7 @@ pub fn send_close_frame(
   conn: WebsocketConnection,
   reason: CloseReason,
 ) -> WebsocketNext(user_state, user_message) {
-  case conn {
+  let _sent = case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_close(conn, to_internal_close_reason(reason))
     connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"

@@ -1,14 +1,15 @@
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
+import ewe/internal/rescue
 import ewe/internal/sse
-import ewe/internal/stream
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
 import glisten/socket
 import glisten/socket/options
 import glisten/transport
+import logging
 
 /// Runs a Server-Sent Events stream, reporting through `conn.self` whether the
 /// connection can carry another request afterwards.
@@ -40,7 +41,10 @@ fn ended(
   keep_alive: http1.KeepAlive,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  let _dead = stream.rescue_dead(fn() { on_close(handle, state) })
+  // A bug in `on_close` is still a bug but it must not take the connection
+  // down on the way out of a stream that has already ended.
+  // TODO: log for a user?
+  let _crashed = rescue.handler(fn() { on_close(handle, state) })
   finished(conn, keep_alive)
   outcome
 }
@@ -60,6 +64,25 @@ fn dropped(
     http1.CloseAfterResponse,
     connection.Stopped,
   )
+}
+
+/// A handler that crashed cannot be asked what to do next so the stream is
+/// ended for it and the connection given up rather than the crash taking the
+/// whole process with it.
+fn crashed(
+  conn: http1.SseConnection,
+  handle: connection.SseConnection,
+  state: user_state,
+  on_close: fn(connection.SseConnection, user_state) -> Nil,
+  details: String,
+) -> connection.Outcome {
+  logging.log(
+    logging.Error,
+    "Caught a crash in the server-sent events handler: " <> details,
+  )
+
+  connection.StoppedAbnormal("the handler crashed")
+  |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
 }
 
 /// The socket gave out, which ends the stream whatever it was doing.
@@ -106,10 +129,8 @@ fn loop(
       connection.StoppedAbnormal(reason)
       |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
     Message(message) ->
-      // A send inside the handler can find the client gone before the socket
-      // has told us, so both routes out land on the same teardown.
-      case stream.rescue_dead(fn() { step(handle, state, message) }) {
-        Error(_reason) -> dropped(conn, handle, state, on_close)
+      case rescue.handler(fn() { step(handle, state, message) }) {
+        Error(details) -> crashed(conn, handle, state, on_close, details)
         Ok(sse.Proceed(state)) ->
           loop(conn, handle, selector, state, reuse, step, on_close)
         Ok(sse.Halt(outcome)) ->
@@ -141,13 +162,13 @@ fn finished(conn: http1.SseConnection, keep_alive: http1.KeepAlive) -> Nil {
   |> process.send(conn.self, _)
 }
 
-pub fn send(conn: http1.SseConnection, event: sse.Event) -> Nil {
-  let bytes = sse.encode(event) |> encoder.frame(conn.framing)
-
-  case transport.send(conn.transport, conn.socket, bytes) {
-    Ok(Nil) -> Nil
-    Error(reason) -> stream.dead(reason)
-  }
+pub fn send(
+  conn: http1.SseConnection,
+  event: sse.Event,
+) -> Result(Nil, socket.SocketReason) {
+  sse.encode(event)
+  |> encoder.frame(conn.framing)
+  |> transport.send(conn.transport, conn.socket, _)
 }
 
 /// glisten rearms `{active, once}` only once its loop callback returns and an

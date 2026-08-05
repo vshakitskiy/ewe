@@ -1,6 +1,6 @@
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
-import ewe/internal/stream
+import ewe/internal/rescue
 import ewe/internal/websocket
 import gleam/bytes_tree
 import gleam/dynamic
@@ -12,6 +12,7 @@ import gleam/result
 import glisten/socket
 import glisten/socket/options
 import glisten/transport
+import logging
 import websocks
 
 pub type HandshakeError {
@@ -107,7 +108,10 @@ fn ended(
   outcome: connection.Outcome,
 ) -> connection.Outcome {
   let handle = connection.Http1Websocket(conn)
-  let _dead = stream.rescue_dead(fn() { on_close(handle, state) })
+  // A bug in `on_close` is still a bug but it must not take the connection
+  // down on the way out of a socket that has already ended.
+  // TODO: log for the user?
+  let _crashed = rescue.handler(fn() { on_close(handle, state) })
 
   websocks.close_context(conn.context)
   outcome
@@ -119,6 +123,27 @@ fn stopped(
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   ended(conn, state, on_close, connection.Stopped)
+}
+
+/// A handler that crashed cannot be asked what to do next so the socket is
+/// ended for it rather than the crash taking the whole process with it.
+fn crashed(
+  conn: http1.WebsocketConnection,
+  state: user_state,
+  on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+  details: String,
+) -> connection.Outcome {
+  logging.log(
+    logging.Error,
+    "Caught a crash in the websocket handler: " <> details,
+  )
+
+  ended(
+    conn,
+    state,
+    on_close,
+    connection.StoppedAbnormal("the handler crashed"),
+  )
 }
 
 /// The socket gave out which ends the connection whatever it was doing.
@@ -241,8 +266,8 @@ fn deliver(
 ) -> connection.Outcome {
   let handle = connection.Http1Websocket(conn)
 
-  case stream.rescue_dead(fn() { step(handle, state, message) }) {
-    Error(_reason) -> stopped(conn, state, on_close)
+  case rescue.handler(fn() { step(handle, state, message) }) {
+    Error(details) -> crashed(conn, state, on_close, details)
     Ok(websocket.Proceed(user_state: state, messages:)) -> {
       let selector = case messages {
         option.Some(messages) -> merge_socket_selector(messages)
@@ -272,30 +297,36 @@ fn resolve(
   }
 }
 
-pub fn send_text(conn: http1.WebsocketConnection, text: String) -> Nil {
+pub fn send_text(
+  conn: http1.WebsocketConnection,
+  text: String,
+) -> Result(Nil, socket.SocketReason) {
   websocks.encode_text_frame(
     payload: bit_array_from_string(text),
     context: conn.context,
     masking: option.None,
   )
-  |> write_or_die(conn, _)
+  |> write(conn, _)
 }
 
-pub fn send_binary(conn: http1.WebsocketConnection, data: BitArray) -> Nil {
+pub fn send_binary(
+  conn: http1.WebsocketConnection,
+  data: BitArray,
+) -> Result(Nil, socket.SocketReason) {
   websocks.encode_binary_frame(
     payload: data,
     context: conn.context,
     masking: option.None,
   )
-  |> write_or_die(conn, _)
+  |> write(conn, _)
 }
 
 pub fn send_close(
   conn: http1.WebsocketConnection,
   reason: websocks.CloseReason,
-) -> Nil {
+) -> Result(Nil, socket.SocketReason) {
   websocks.encode_close_frame(reason:, masking: option.None)
-  |> write_or_die(conn, _)
+  |> write(conn, _)
 }
 
 fn with_context(
@@ -318,13 +349,6 @@ fn write(
 ) -> Result(Nil, socket.SocketReason) {
   bytes_tree.from_bit_array(frame)
   |> transport.send(conn.transport, conn.socket, _)
-}
-
-fn write_or_die(conn: http1.WebsocketConnection, frame: BitArray) -> Nil {
-  case write(conn, frame) {
-    Ok(Nil) -> Nil
-    Error(reason) -> stream.dead(reason)
-  }
 }
 
 /// glisten rearms the socket only once its loop callback returns and a socket

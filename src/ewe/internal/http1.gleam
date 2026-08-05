@@ -4,7 +4,7 @@ import ewe/internal/http1/body
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/http1/parser
-import ewe/internal/stream
+import ewe/internal/rescue
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
@@ -64,7 +64,7 @@ pub fn handle_message(
 
       let request = to_request(head, connection, body_connection)
 
-      case rescue_handler(fn() { state.handler(request) }) {
+      case rescue.handler(fn() { state.handler(request) }) {
         Error(details) -> crashed(connection, details)
         Ok(response) -> {
           let drained = drain_messages(self)
@@ -244,10 +244,15 @@ fn send_response(
           keep_alive:,
         ))
 
-      case stream.rescue_dead(fn() { stream_handler(writer) }) {
-        // The client went away mid stream. There is nothing to terminate the
-        // body with and nothing to reuse.
-        Error(_reason) -> Ok(SentClose)
+      case rescue.handler(fn() { stream_handler(writer) }) {
+        // The head is already on the wire so no other answer can be given.
+        Error(details) -> {
+          logging.log(
+            logging.Error,
+            "Caught a crash in the streaming handler: " <> details,
+          )
+          Ok(SentClose)
+        }
         Ok(Nil) -> {
           let drained = drain_messages(self)
           case drained.stream {
@@ -383,6 +388,3 @@ fn do_drain_remaining(
     Error(_reason) -> ResolvedBody(<<>>, http1.CloseAfterResponse)
   }
 }
-
-@external(erlang, "ewe_ffi", "rescue_handler")
-fn rescue_handler(handler: fn() -> a) -> Result(a, String)

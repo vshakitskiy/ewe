@@ -3,7 +3,6 @@ import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
-import ewe/internal/stream
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
@@ -291,14 +290,19 @@ pub fn frame(
   }
 }
 
-pub fn send_chunk(writer: ResponseWriter, chunk: BitArray) -> ResponseWriter {
+pub fn send_chunk(
+  writer: ResponseWriter,
+  chunk: BitArray,
+) -> Result(ResponseWriter, socket.SocketReason) {
   frame(bytes_tree.from_bit_array(chunk), writer.framing)
   |> write(writer, _)
-
-  writer
+  |> result.replace(writer)
 }
 
-pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
+pub fn finish_chunk(
+  writer: ResponseWriter,
+  chunk: BitArray,
+) -> Result(Nil, socket.SocketReason) {
   // The terminator rides along with the last chunk to save a write.
   let bytes = case writer.framing {
     http1.ChunkedStream ->
@@ -308,22 +312,22 @@ pub fn finish_chunk(writer: ResponseWriter, chunk: BitArray) -> Nil {
       )
     http1.CloseDelimitedStream -> bytes_tree.from_bit_array(chunk)
   }
-  write(writer, bytes)
-  finish(writer)
+
+  write(writer, bytes) |> finished(writer, _)
 }
 
-pub fn finish_response(writer: ResponseWriter) -> Nil {
-  case end_stream(writer.transport, writer.socket, writer.framing) {
-    Ok(Nil) -> finish(writer)
-    Error(reason) -> stream.dead(reason)
-  }
+pub fn finish_response(
+  writer: ResponseWriter,
+) -> Result(Nil, socket.SocketReason) {
+  end_stream(writer.transport, writer.socket, writer.framing)
+  |> finished(writer, _)
 }
 
-fn write(writer: ResponseWriter, bytes: bytes_tree.BytesTree) -> Nil {
-  case transport.send(writer.transport, writer.socket, bytes) {
-    Ok(Nil) -> Nil
-    Error(reason) -> stream.dead(reason)
-  }
+fn write(
+  writer: ResponseWriter,
+  bytes: bytes_tree.BytesTree,
+) -> Result(Nil, socket.SocketReason) {
+  transport.send(writer.transport, writer.socket, bytes)
 }
 
 pub fn end_stream(
@@ -338,10 +342,23 @@ pub fn end_stream(
   }
 }
 
-fn finish(writer: ResponseWriter) -> Nil {
-  http1.StreamFinished(keep_alive: writer.keep_alive)
+/// The stream is over either way so the connection process is told so even
+/// when the last write never landed. One that ended on a failed write leaves
+/// nothing to hand back.
+fn finished(
+  writer: ResponseWriter,
+  sent: Result(Nil, socket.SocketReason),
+) -> Result(Nil, socket.SocketReason) {
+  let keep_alive = case sent {
+    Ok(Nil) -> writer.keep_alive
+    Error(_reason) -> http1.CloseAfterResponse
+  }
+
+  http1.StreamFinished(keep_alive:)
   |> http1.StreamSignal
   |> process.send(writer.self, _)
+
+  sent
 }
 
 /// Which headers the encoder writes itself for a body, and so drops from the

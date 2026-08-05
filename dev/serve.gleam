@@ -5,6 +5,7 @@ import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/option
+import gleam/result
 import logging
 
 pub fn main() -> Nil {
@@ -38,7 +39,7 @@ fn handle_request(
     http.Post, "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
     http.Get, "/stream" -> {
       use writer <- ewe.stream_response(response.new(200))
-      let writer = ewe.send_chunk(writer, <<"hello, ":utf8>>)
+      use writer <- result.try(ewe.send_chunk(writer, <<"hello, ":utf8>>))
       ewe.finish_chunk(writer, <<"Joe!":utf8>>)
     }
     http.Get, "/file/small" -> {
