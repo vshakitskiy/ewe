@@ -1,9 +1,24 @@
 -module(ewe_ffi).
 
--export([identity/1, now_datetime/0, set_http_date/1, get_http_date/0]).
+-export([
+    identity/1,
+    now_datetime/0,
+    set_http_date/1,
+    get_http_date/0,
+    rescue_handler/1
+]).
 
 identity(X) ->
   X.
+
+rescue_handler(Func) ->
+  try
+    {ok, Func()}
+  catch
+    Class:Reason:Stacktrace ->
+      Formatted = erl_error:format_exception(Class, Reason, Stacktrace),
+      {error, unicode:characters_to_binary(Formatted)}
+  end.
 
 now_datetime() ->
   {Date, Time} = calendar:universal_time(),

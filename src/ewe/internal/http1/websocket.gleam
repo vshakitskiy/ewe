@@ -77,9 +77,6 @@ pub fn handshake(
   }
 }
 
-/// How many socket messages are delivered before the loop rearms.
-const active_count = 100
-
 pub fn run(
   conn: http1.WebsocketConnection,
   on_init: fn(connection.WebsocketConnection, process.Selector(user_message)) ->
@@ -97,24 +94,49 @@ pub fn run(
   case activate(conn) {
     Ok(Nil) ->
       loop(conn, merge_socket_selector(messages), state, step, on_close)
-    Error(reason) ->
-      socket.reason_to_string(reason)
-      |> connection.StoppedAbnormal
-      |> ended(conn, state, on_close, _)
+    Error(reason) -> socket_failed(conn, state, on_close, reason)
   }
 }
 
-/// Every way a socket ends frees the compression resources the context holds
-/// and runs the handler's `on_close`.
+/// Every way a socket ends runs the handler's `on_close` and then frees the
+/// compression resources the context holds.
 fn ended(
   conn: http1.WebsocketConnection,
   state: user_state,
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
+  let handle = connection.Http1Websocket(conn)
+  let _dead = stream.rescue_dead(fn() { on_close(handle, state) })
+
   websocks.close_context(conn.context)
-  on_close(connection.Http1Websocket(conn), state)
   outcome
+}
+
+fn stopped(
+  conn: http1.WebsocketConnection,
+  state: user_state,
+  on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+) -> connection.Outcome {
+  ended(conn, state, on_close, connection.Stopped)
+}
+
+/// The socket gave out which ends the connection whatever it was doing.
+fn socket_failed(
+  conn: http1.WebsocketConnection,
+  state: user_state,
+  on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+  reason: socket.SocketReason,
+) -> connection.Outcome {
+  socket.reason_to_string(reason)
+  |> connection.StoppedAbnormal
+  |> ended(conn, state, on_close, _)
+}
+
+/// Where the loop carries on once the handler has seen a message.
+type Resume {
+  DrainBuffer
+  AwaitSocket
 }
 
 fn loop(
@@ -129,24 +151,22 @@ fn loop(
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
-    Closed -> ended(conn, state, on_close, connection.Stopped)
+    Closed -> stopped(conn, state, on_close)
     Failed(reason) ->
       ended(conn, state, on_close, connection.StoppedAbnormal(reason))
     Exhausted ->
       case activate(conn) {
         Ok(Nil) -> loop(conn, selector, state, step, on_close)
-        Error(reason) ->
-          socket.reason_to_string(reason)
-          |> connection.StoppedAbnormal
-          |> ended(conn, state, on_close, _)
+        Error(reason) -> socket_failed(conn, state, on_close, reason)
       }
     Packet(data) ->
       websocks.push_data(conn.context, data)
       |> with_context(conn, _)
       |> drain(selector, state, step, on_close)
+    // Nothing reached the socket, so there is nothing new to decode.
     Received(message) ->
       websocket.UserMessage(message)
-      |> deliver(conn, selector, state, step, on_close, _)
+      |> deliver(conn, selector, state, step, on_close, AwaitSocket, _)
   }
 }
 
@@ -178,13 +198,13 @@ fn drain(
         // the handler's business.
         websocks.Control(websocks.Ping(payload)) ->
           case
-            write(conn, websocks.encode_pong_frame(payload:, masking: none))
+            write(
+              conn,
+              websocks.encode_pong_frame(payload:, masking: option.None),
+            )
           {
             Ok(Nil) -> drain(conn, selector, state, step, on_close)
-            Error(reason) ->
-              socket.reason_to_string(reason)
-              |> connection.StoppedAbnormal
-              |> ended(conn, state, on_close, _)
+            Error(reason) -> socket_failed(conn, state, on_close, reason)
           }
         websocks.Control(websocks.Pong(_payload)) ->
           drain(conn, selector, state, step, on_close)
@@ -194,10 +214,10 @@ fn drain(
           close(conn, reason) |> resolve(conn, state, on_close, _)
         websocks.Text(payload) ->
           websocket.TextFrame(unsafe_to_string(payload))
-          |> deliver(conn, selector, state, step, on_close, _)
+          |> deliver(conn, selector, state, step, on_close, DrainBuffer, _)
         websocks.Binary(payload) ->
           websocket.BinaryFrame(payload)
-          |> deliver(conn, selector, state, step, on_close, _)
+          |> deliver(conn, selector, state, step, on_close, DrainBuffer, _)
         // Fragments are reassembled by the decoder so one never surfaces.
         websocks.Continuation(_payload) ->
           drain(conn, selector, state, step, on_close)
@@ -216,19 +236,23 @@ fn deliver(
     websocket.Message(user_message),
   ) -> websocket.Step(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+  resume: Resume,
   message: websocket.Message(user_message),
 ) -> connection.Outcome {
   let handle = connection.Http1Websocket(conn)
 
   case stream.rescue_dead(fn() { step(handle, state, message) }) {
-    Error(_reason) -> ended(conn, state, on_close, connection.Stopped)
+    Error(_reason) -> stopped(conn, state, on_close)
     Ok(websocket.Proceed(user_state: state, messages:)) -> {
       let selector = case messages {
         option.Some(messages) -> merge_socket_selector(messages)
         option.None -> selector
       }
 
-      drain(conn, selector, state, step, on_close)
+      case resume {
+        DrainBuffer -> drain(conn, selector, state, step, on_close)
+        AwaitSocket -> loop(conn, selector, state, step, on_close)
+      }
     }
     Ok(websocket.Halt(outcome)) -> ended(conn, state, on_close, outcome)
   }
@@ -243,11 +267,8 @@ fn resolve(
   sent: Result(Nil, socket.SocketReason),
 ) -> connection.Outcome {
   case sent {
-    Ok(Nil) -> ended(conn, state, on_close, connection.Stopped)
-    Error(reason) ->
-      socket.reason_to_string(reason)
-      |> connection.StoppedAbnormal
-      |> ended(conn, state, on_close, _)
+    Ok(Nil) -> stopped(conn, state, on_close)
+    Error(reason) -> socket_failed(conn, state, on_close, reason)
   }
 }
 
@@ -255,7 +276,7 @@ pub fn send_text(conn: http1.WebsocketConnection, text: String) -> Nil {
   websocks.encode_text_frame(
     payload: bit_array_from_string(text),
     context: conn.context,
-    masking: none,
+    masking: option.None,
   )
   |> write_or_die(conn, _)
 }
@@ -264,7 +285,7 @@ pub fn send_binary(conn: http1.WebsocketConnection, data: BitArray) -> Nil {
   websocks.encode_binary_frame(
     payload: data,
     context: conn.context,
-    masking: none,
+    masking: option.None,
   )
   |> write_or_die(conn, _)
 }
@@ -273,11 +294,9 @@ pub fn send_close(
   conn: http1.WebsocketConnection,
   reason: websocks.CloseReason,
 ) -> Nil {
-  websocks.encode_close_frame(reason:, masking: none)
+  websocks.encode_close_frame(reason:, masking: option.None)
   |> write_or_die(conn, _)
 }
-
-const none = option.None
 
 fn with_context(
   conn: http1.WebsocketConnection,
@@ -290,7 +309,7 @@ fn close(
   conn: http1.WebsocketConnection,
   reason: websocks.CloseReason,
 ) -> Result(Nil, socket.SocketReason) {
-  write(conn, websocks.encode_close_frame(reason:, masking: none))
+  write(conn, websocks.encode_close_frame(reason:, masking: option.None))
 }
 
 fn write(
@@ -314,7 +333,7 @@ fn activate(
   conn: http1.WebsocketConnection,
 ) -> Result(Nil, socket.SocketReason) {
   transport.set_opts(conn.transport, conn.socket, [
-    options.ActiveMode(options.Count(active_count)),
+    options.ActiveMode(options.Count(http1.active_count)),
   ])
 }
 

@@ -702,10 +702,10 @@ pub fn send_event(conn: SseConnection, event: SseEvent) -> Nil {
 /// reusable afterwards as long as the handler ended the stream itself and the 
 /// client sent nothing during it.
 ///
-/// `on_init` is called once, with a subject the rest of your program uses to
-/// push messages at the client, and returns the starting state. `handler` is
-/// called for each message sent to that subject. `on_close` is called once 
-/// however the stream ended.
+/// - `on_init` is called once, with a subject the rest of your program uses to
+/// push messages at the client, and returns the starting state. 
+/// - `handler` is called for each message sent to that subject. 
+/// - `on_close` is called once however the stream ended.
 pub fn sse(
   response: response.Response(a),
   on_init on_init: fn(process.Subject(user_message)) -> user_state,
@@ -897,12 +897,12 @@ pub fn send_close_frame(
 /// A request that is not a valid handshake is answered with a 400 and the
 /// handler is never run.
 ///
-/// `on_init` is called once, with an empty selector to add whatever the rest of
-/// your program sends this connection to and returns the starting state along
-/// with that selector. 
-/// `handler` is called for each frame from the client and each message the 
+/// - `on_init` is called once with an empty selector to add whatever the rest 
+/// of your program sends this connection to and returns the starting state 
+/// along with that selector. 
+/// - `handler` is called for each frame from the client and each message the 
 /// selector picks up. 
-/// `on_close` is called once however the WebSocket ended.
+/// - `on_close` is called once however the WebSocket ended.
 pub fn upgrade_websocket(
   request request: request.Request(Connection),
   on_init on_init: fn(WebsocketConnection, process.Selector(user_message)) ->

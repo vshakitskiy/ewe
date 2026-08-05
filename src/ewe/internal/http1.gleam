@@ -62,41 +62,55 @@ pub fn handle_message(
           upgrade: metadata.upgrade,
         )
 
-      let response =
-        state.handler(to_request(head, connection, body_connection))
+      let request = to_request(head, connection, body_connection)
 
-      let drained = drain_messages(self)
-      let ResolvedBody(buffer, body_keep_alive) =
-        resolve_body(body_connection, drained.body, state.config)
-      let keep_alive =
-        http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
+      case rescue_handler(fn() { state.handler(request) }) {
+        Error(details) -> crashed(connection, details)
+        Ok(response) -> {
+          let drained = drain_messages(self)
+          let ResolvedBody(buffer, body_keep_alive) =
+            resolve_body(body_connection, drained.body, state.config)
+          let keep_alive =
+            http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
-      let sent = case
-        encoder.encode_response(response, head.method, head.version, keep_alive)
-      {
-        Ok(encoded) ->
-          send_response(encoded, connection.transport, connection.socket, self)
-        Error(encoder.UnsafeHeader(name)) -> {
-          logging.log(
-            logging.Error,
-            "Handler produced an unsafe response header: " <> name,
-          )
-          file.release_body(response.body)
+          let sent = case
+            encoder.encode_response(
+              response,
+              head.method,
+              head.version,
+              keep_alive,
+            )
+          {
+            Ok(encoded) ->
+              send_response(
+                encoded,
+                connection.transport,
+                connection.socket,
+                self,
+              )
+            Error(encoder.UnsafeHeader(name)) -> {
+              logging.log(
+                logging.Error,
+                "Handler produced an unsafe response header: " <> name,
+              )
+              file.release_body(response.body)
 
-          transport.send(
-            connection.transport,
-            connection.socket,
-            encoder.internal_server_error(),
-          )
-          |> result.replace(SentClose)
+              transport.send(
+                connection.transport,
+                connection.socket,
+                encoder.internal_server_error(),
+              )
+              |> result.replace(SentClose)
+            }
+          }
+
+          case sent {
+            Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
+            Ok(SentClose) -> Close
+            Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
+            Error(_reason) -> Close
+          }
         }
-      }
-
-      case sent {
-        Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
-        Ok(SentClose) -> Close
-        Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
-        Error(_reason) -> Close
       }
     }
     Ok(parser.Incomplete) -> {
@@ -122,9 +136,29 @@ pub fn handle_message(
   }
 }
 
-/// A pipelining client sends its next request without waiting for this 
-/// response, so anything left over has to be handled now. Waiting on the socket
-/// for it would deadlock: those bytes have already arrived.
+/// A handler that crashed has said nothing about what it read or meant to
+/// send so the connection is answered and dropped rather than handed back.
+fn crashed(
+  connection: glisten.Connection(connection.Message),
+  details: String,
+) -> Next {
+  logging.log(
+    logging.Error,
+    "Caught a crash in the request handler: " <> details,
+  )
+
+  let _sent =
+    transport.send(
+      connection.transport,
+      connection.socket,
+      encoder.internal_server_error(),
+    )
+
+  Close
+}
+
+/// A pipelining client sends its next request without waiting for this
+/// response so anything left over has to be handled now.
 fn await_next_request(
   state: State,
   buffer: BitArray,
@@ -349,3 +383,6 @@ fn do_drain_remaining(
     Error(_reason) -> ResolvedBody(<<>>, http1.CloseAfterResponse)
   }
 }
+
+@external(erlang, "ewe_ffi", "rescue_handler")
+fn rescue_handler(handler: fn() -> a) -> Result(a, String)

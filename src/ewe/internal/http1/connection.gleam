@@ -45,6 +45,11 @@ pub type Connection {
   )
 }
 
+/// How many socket messages a stream is delivered before it has to ask for
+/// more. Bounded so a peer that keeps sending cannot grow the mailbox faster
+/// than the loop drains it.
+pub const active_count = 100
+
 /// How the request body declares its length.
 pub type Framing {
   Fixed(length: Int)

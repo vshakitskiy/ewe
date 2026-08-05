@@ -26,10 +26,7 @@ pub fn run(
   case activate(conn) {
     Ok(Nil) ->
       loop(conn, handle, selector(subject), state, Clean, step, on_close)
-    Error(reason) ->
-      socket.reason_to_string(reason)
-      |> connection.StoppedAbnormal
-      |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
+    Error(reason) -> socket_failed(conn, handle, state, on_close, reason)
   }
 }
 
@@ -43,9 +40,39 @@ fn ended(
   keep_alive: http1.KeepAlive,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  on_close(handle, state)
+  let _dead = stream.rescue_dead(fn() { on_close(handle, state) })
   finished(conn, keep_alive)
   outcome
+}
+
+/// A stream the client hung up on or one the handler could no longer write to.
+fn dropped(
+  conn: http1.SseConnection,
+  handle: connection.SseConnection,
+  state: user_state,
+  on_close: fn(connection.SseConnection, user_state) -> Nil,
+) -> connection.Outcome {
+  ended(
+    conn,
+    handle,
+    state,
+    on_close,
+    http1.CloseAfterResponse,
+    connection.Stopped,
+  )
+}
+
+/// The socket gave out, which ends the stream whatever it was doing.
+fn socket_failed(
+  conn: http1.SseConnection,
+  handle: connection.SseConnection,
+  state: user_state,
+  on_close: fn(connection.SseConnection, user_state) -> Nil,
+  reason: socket.SocketReason,
+) -> connection.Outcome {
+  socket.reason_to_string(reason)
+  |> connection.StoppedAbnormal
+  |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
 }
 
 /// Whether anything happened during the stream that rules out handing the
@@ -69,15 +96,12 @@ fn loop(
     // Whatever the client sent has been taken off the socket and cannot be put
     // back, so the connection is no longer safe to reuse.
     ClientData -> loop(conn, handle, selector, state, Spoiled, step, on_close)
-    Disconnected ->
-      ended(
-        conn,
-        handle,
-        state,
-        on_close,
-        http1.CloseAfterResponse,
-        connection.Stopped,
-      )
+    Exhausted ->
+      case activate(conn) {
+        Ok(Nil) -> loop(conn, handle, selector, state, reuse, step, on_close)
+        Error(reason) -> socket_failed(conn, handle, state, on_close, reason)
+      }
+    Disconnected -> dropped(conn, handle, state, on_close)
     Failed(reason) ->
       connection.StoppedAbnormal(reason)
       |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
@@ -85,15 +109,7 @@ fn loop(
       // A send inside the handler can find the client gone before the socket
       // has told us, so both routes out land on the same teardown.
       case stream.rescue_dead(fn() { step(handle, state, message) }) {
-        Error(_reason) ->
-          ended(
-            conn,
-            handle,
-            state,
-            on_close,
-            http1.CloseAfterResponse,
-            connection.Stopped,
-          )
+        Error(_reason) -> dropped(conn, handle, state, on_close)
         Ok(sse.Proceed(state)) ->
           loop(conn, handle, selector, state, reuse, step, on_close)
         Ok(sse.Halt(outcome)) ->
@@ -134,13 +150,11 @@ pub fn send(conn: http1.SseConnection, event: sse.Event) -> Nil {
   }
 }
 
-/// glisten re arms `{active, once}` only once its loop callback returns, and an
-/// SSE stream does not return until it is over. Without switching to full
-/// active mode the socket goes quiet for the whole stream, `tcp_closed`
-/// included, and a client hanging up would never be noticed.
+/// glisten rearms `{active, once}` only once its loop callback returns and an
+/// SSE stream does not return until it is over.
 fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketReason) {
   transport.set_opts(conn.transport, conn.socket, [
-    options.ActiveMode(options.Active),
+    options.ActiveMode(options.Count(http1.active_count)),
   ])
 }
 
@@ -150,6 +164,7 @@ type Received(user_message) {
   Disconnected
   Failed(reason: String)
   ClientData
+  Exhausted
 }
 
 /// glisten handles socket messages in its own loop, which is blocked for the
@@ -165,6 +180,12 @@ fn selector(
   |> process.select_record(atom.create("ssl_error"), 2, failed)
   |> process.select_record(atom.create("tcp"), 2, client_data)
   |> process.select_record(atom.create("ssl"), 2, client_data)
+  |> process.select_record(atom.create("tcp_passive"), 1, exhausted)
+  |> process.select_record(atom.create("ssl_passive"), 1, exhausted)
+}
+
+fn exhausted(_record: dynamic.Dynamic) -> Received(user_message) {
+  Exhausted
 }
 
 fn disconnected(_record: dynamic.Dynamic) -> Received(user_message) {
@@ -177,9 +198,7 @@ fn failed(record: dynamic.Dynamic) -> Received(user_message) {
   |> Failed
 }
 
-/// Clients are not expected to send anything once the stream is open. Matching
-/// it anyway keeps a chatty one from growing the mailbox without bound, at the
-/// cost of giving up on reusing the connection.
+/// Clients are not expected to send anything once the stream is open.
 fn client_data(_record: dynamic.Dynamic) -> Received(user_message) {
   ClientData
 }

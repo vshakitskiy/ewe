@@ -15,6 +15,8 @@
   and timeouts for every HTTP/1 connection. The request line, header line and
   header count limits, chunk size line limit, idle and body read timeouts, and
   the auto drain limit and chunk size.
+- In replacement of the `idle_timeout` builder function there is now the
+  `idle_timeout` field of `Http1Config`.
 - Switch from `erlang:decode_packet` to self implemented parsing solution.
 - Responses are now framed by the server, which computes `content-length` or
   `transfer-encoding: chunked` for a streamed body and drops the handler's own
