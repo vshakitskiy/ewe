@@ -25,7 +25,7 @@ pub fn main() -> Nil {
 fn handle_request(
   request: request.Request(ewe.Connection),
 ) -> response.Response(ewe.Body) {
-  ewe.upgrade_websocket(
+  ewe.websocket(
     request:,
     on_init: fn(_conn, messages) { #(Nil, messages) },
     handler: echo_message,

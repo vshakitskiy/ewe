@@ -39,6 +39,7 @@
   `SseEvent` and `SseNext`.
 - Add `comment` for the server-sent events comment that keeps an idle stream
   from being closed by an intermediary.
+- Rename `upgrade_websocket` to `websocket` matching `sse`.
 - Rename the `WebsocketMessage` variants to `TextFrame`, `BinaryFrame` and
   `UserMessage`.
 - In replacement of the `CloseCode` variants that each carried their own data

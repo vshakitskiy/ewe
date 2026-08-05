@@ -1,3 +1,142 @@
+//// <script>
+//// const docs = [
+////   {
+////     header: "IP Address",
+////     functions: ["ip_address_to_string"]
+////   },
+////   {
+////     header: "Information",
+////     functions: [
+////       "get_client_info",
+////       "get_server_info"
+////     ]
+////   },
+////   {
+////     header: "Builder",
+////     functions: [
+////       "new",
+////       "bind",
+////       "listening",
+////       "listening_random",
+////       "force_ipv6",
+////       "unix",
+////       "with_tls",
+////       "with_tls_pem",
+////       "with_tls_der",
+////       "with_http1",
+////       "default_http1_config",
+////       "quiet",
+////       "on_start"
+////     ]
+////   },
+////   {
+////     header: "Server",
+////     functions: [
+////       "start",
+////       "supervised"
+////     ]
+////   },
+////   {
+////     header: "Request",
+////     functions: [
+////       "read_body",
+////       "read_body_chunk"
+////     ]
+////   },
+////   {
+////     header: "Response",
+////     functions: ["file"]
+////   },
+////   {
+////     header: "Streaming Response",
+////     functions: [
+////       "stream_response",
+////       "send_chunk",
+////       "finish_chunk",
+////       "finish_response"
+////     ]
+////   },
+////   {
+////     header: "Websocket",
+////     functions: [
+////       "websocket",
+////       "send_binary_frame",
+////       "send_text_frame",
+////       "send_close_frame",
+////       "websocket_continue",
+////       "websocket_continue_with_selector",
+////       "websocket_stop",
+////       "websocket_stop_abnormal"
+////     ]
+////   },
+////   {
+////     header: "Server-Sent Events",
+////     functions: [
+////       "sse",
+////       "event",
+////       "comment",
+////       "event_name",
+////       "event_id",
+////       "event_retry",
+////       "send_event",
+////       "sse_continue",
+////       "sse_stop",
+////       "sse_stop_abnormal"
+////     ]
+////   }
+//// ]
+////
+//// const callback = () => {
+////   const list = document.querySelector(".sidebar > ul:last-of-type")
+////   const sortedLists = document.createDocumentFragment()
+////   const sortedMembers = document.createDocumentFragment()
+////
+////   for (const section of docs) {
+////     sortedLists.append((() => {
+////       const node = document.createElement("h3")
+////       node.append(section.header)
+////       return node
+////     })())
+////     sortedMembers.append((() => {
+////       const node = document.createElement("h2")
+////       node.append(section.header)
+////       return node
+////     })())
+////
+////     const sortedList = document.createElement("ul")
+////     sortedLists.append(sortedList)
+////
+////     const sortedFunctions = [...section.functions].sort()
+////
+////     for (const funcName of sortedFunctions) {
+////       const href = `#${funcName}`
+////       const member = document.querySelector(
+////         `.member:has(h2 > a[href="${href}"])`
+////       )
+////       const sidebar = list.querySelector(`li:has(a[href="${href}"])`)
+////       if (sidebar) sortedList.append(sidebar)
+////       if (member) sortedMembers.append(member)
+////     }
+////   }
+////
+////   document.querySelector(".sidebar").insertBefore(sortedLists, list)
+////   document
+////     .querySelector(".module-members:has(#module-values)")
+////     .insertBefore(
+////       sortedMembers,
+////       document.querySelector("#module-values").nextSibling
+////     )
+//// }
+////
+//// document.readyState !== "loading"
+////   ? callback()
+////   : document.addEventListener(
+////     "DOMContentLoaded",
+////     callback,
+////     { once: true }
+////   )
+//// </script>
+
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
@@ -582,8 +721,8 @@ pub fn read_body_chunk(
   }
 }
 
-// TODO: obviously not the string reason variant but this is for later!
-/// Why a write to the client did not go through.
+/// Why a write to the client did not go through. TODO: obviously not the string 
+/// reason variant but this is for later!
 pub type SendError {
   SendError(reason: String)
 }
@@ -942,7 +1081,7 @@ pub fn send_close_frame(
 /// - `handler` is called for each frame from the client and each message the 
 /// selector picks up. 
 /// - `on_close` is called once however the WebSocket ended.
-pub fn upgrade_websocket(
+pub fn websocket(
   request request: request.Request(Connection),
   on_init on_init: fn(WebsocketConnection, process.Selector(user_message)) ->
     #(user_state, process.Selector(user_message)),
