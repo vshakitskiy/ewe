@@ -5,18 +5,19 @@
 - Add support for unix sockets.
 - Add support for in-memory certificate files for the tls.
 - Change some of the function argument lables.
-- Rename `enable_tls` to `with_tls`.
+- Rename `enable_tls` to `with_tls`, which now takes the certificate source as a
+  `Tls` value: `Disk`, `Pem` or `Der`.
 - Remove `with_name`.
 - Drop the library's own `Request`, `Response` aliases. 
 - `ResponseBody` is now named `Body`.
 - Builder's `new` now requires listener and connection factory names provided in
   order to prevent possible atom table exhaustion.
-- Add `Http1Config`, `default_http1_config` and `with_http1` to set the limits
+- Add `Http1Options`, `default_http1_options` and `with_http1` to set the limits
   and timeouts for every HTTP/1 connection. The request line, header line and
   header count limits, chunk size line limit, idle and body read timeouts, and
   the auto drain limit and chunk size.
 - In replacement of the `idle_timeout` builder function there is now the
-  `idle_timeout` field of `Http1Config`.
+  `idle_timeout` field of `Http1Options`.
 - Switch from `erlang:decode_packet` to self implemented parsing solution.
 - Responses are now framed by the server, which computes `content-length` or
   `transfer-encoding: chunked` for a streamed body and drops the handler's own
@@ -27,7 +28,7 @@
   consumed inside user's handler. We now flush remaining body bytes allowing 
   correct reuse of the socket for the next request. If the size of the bytes is 
   more than 1mb, we close the connection instead. That limit is the
-  `auto_drain_limit` of `Http1Config`.
+  `auto_drain_limit` of `Http1Options`.
 - In replacement of `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop`
   there is now `stream_response`/`send_chunk`/`finish_chunk`/`finish_response` 
   and no init/loop callback for response streaming anymore.

@@ -21,10 +21,8 @@
 ////       "force_ipv6",
 ////       "unix",
 ////       "with_tls",
-////       "with_tls_pem",
-////       "with_tls_der",
 ////       "with_http1",
-////       "default_http1_config",
+////       "default_http1_options",
 ////       "quiet",
 ////       "on_start"
 ////     ]
@@ -263,14 +261,18 @@ type BindTarget {
   UnixBind(path: String)
 }
 
-type TlsConfig {
-  CertKeyFiles(certfile: String, keyfile: String)
-  CertKeyPem(cert: BitArray, key: BitArray)
-  CertKeyDer(cert: BitArray, key_type: TlsKeyType, key: BitArray)
+/// Where the TLS certificate and key given to `with_tls` come from.
+pub type Tls {
+  /// Paths to PEM-encoded certificate and key files on disk.
+  Disk(cert: String, key: String)
+  /// In-memory PEM-encoded certificate and key.
+  Pem(cert: BitArray, key: BitArray)
+  /// In-memory DER-encoded certificate and key.
+  Der(cert: BitArray, key: BitArray, key_type: TlsKeyType)
 }
 
-/// The private key encoding type, required when providing DER-encoded
-/// certificate and key via `with_tls_der`.
+/// The private key encoding type, required when providing a DER-encoded
+/// certificate and key via `Der`.
 pub type TlsKeyType {
   /// Traditional RSA key.
   RsaPrivateKey
@@ -291,16 +293,16 @@ fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
   }
 }
 
-/// The limits and timeouts for every HTTP/1 connection. Build one by updating 
-/// `default_http1_config`:
+/// The limits and timeouts for every HTTP/1 connection. Build one by updating
+/// `default_http1_options`:
 ///
 /// ```gleam
-/// Http1Config(..ewe.default_http1_config(), max_headers: 50)
+/// Http1Options(..ewe.default_http1_options(), max_headers: 50)
 /// ```
 ///
 /// Sizes are in bytes and timeouts in milliseconds.
-pub type Http1Config {
-  Http1Config(
+pub type Http1Options {
+  Http1Options(
     /// Longest request line accepted beyond which the request is refused with a 
     /// 414.
     max_request_line: Int,
@@ -325,7 +327,7 @@ pub type Http1Config {
   )
 }
 
-pub fn default_http1_config() -> Http1Config {
+pub fn default_http1_options() -> Http1Options {
   let http1.Config(
     max_request_line:,
     max_header_line:,
@@ -337,7 +339,7 @@ pub fn default_http1_config() -> Http1Config {
     auto_drain_chunk_bytes:,
   ) = http1.default_config()
 
-  Http1Config(
+  Http1Options(
     max_request_line:,
     max_header_line:,
     max_headers:,
@@ -349,8 +351,8 @@ pub fn default_http1_config() -> Http1Config {
   )
 }
 
-fn to_internal_http1_config(config: Http1Config) -> http1.Config {
-  let Http1Config(
+fn to_internal_http1_options(options: Http1Options) -> http1.Config {
+  let Http1Options(
     max_request_line:,
     max_header_line:,
     max_headers:,
@@ -359,7 +361,7 @@ fn to_internal_http1_config(config: Http1Config) -> http1.Config {
     body_read_timeout:,
     auto_drain_limit:,
     auto_drain_chunk_bytes:,
-  ) = config
+  ) = options
 
   http1.Config(
     max_request_line:,
@@ -379,8 +381,8 @@ pub opaque type Builder {
   Builder(
     handler: fn(request.Request(Connection)) -> response.Response(Body),
     bind_target: BindTarget,
-    tls: Option(TlsConfig),
-    http1: Http1Config,
+    tls: Option(Tls),
+    http1: Http1Options,
     listener_name: process.Name(listener.Message),
     connection_factory_name: process.Name(
       factory.Message(
@@ -410,7 +412,7 @@ pub fn new(
     handler:,
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
     tls: None,
-    http1: default_http1_config(),
+    http1: default_http1_options(),
     listener_name:,
     connection_factory_name:,
     on_start: fn(scheme, address) {
@@ -482,33 +484,15 @@ pub fn unix(builder: Builder, path: String) -> Builder {
   Builder(..builder, bind_target: UnixBind(path))
 }
 
-/// Enables TLS using a certificate and key file on disk.
-pub fn with_tls(
-  builder: Builder,
-  certfile cert: String,
-  keyfile key: String,
-) -> Builder {
-  Builder(..builder, tls: Some(CertKeyFiles(cert, key)))
-}
-
-/// Enables TLS using in-memory PEM-encoded certificate and key data.
-pub fn with_tls_pem(
-  builder: Builder,
-  cert cert: BitArray,
-  key key: BitArray,
-) -> Builder {
-  Builder(..builder, tls: Some(CertKeyPem(cert, key)))
-}
-
-/// Enables TLS using in-memory DER-encoded certificate and key data. The key
-/// type must match the encoding of the provided key binary.
-pub fn with_tls_der(
-  builder: Builder,
-  cert cert: BitArray,
-  key_type key_type: TlsKeyType,
-  key key: BitArray,
-) -> Builder {
-  Builder(..builder, tls: Some(CertKeyDer(cert, key_type, key)))
+/// Enables TLS with the given certificate and key.
+///
+/// ```gleam
+/// ewe.with_tls(builder, ewe.Disk("cert.pem", "key.pem"))
+/// ewe.with_tls(builder, ewe.Pem(cert, key))
+/// ewe.with_tls(builder, ewe.Der(cert, key, ewe.RsaPrivateKey))
+/// ```
+pub fn with_tls(builder: Builder, tls: Tls) -> Builder {
+  Builder(..builder, tls: Some(tls))
 }
 
 /// Sets a callback function called after the server starts. Receives the scheme
@@ -526,8 +510,8 @@ pub fn quiet(builder: Builder) -> Builder {
 }
 
 /// Replaces the limits and timeouts applied to HTTP/1 connections.
-pub fn with_http1(builder: Builder, config: Http1Config) -> Builder {
-  Builder(..builder, http1: config)
+pub fn with_http1(builder: Builder, options: Http1Options) -> Builder {
+  Builder(..builder, http1: options)
 }
 
 fn to_internal_body(body: Body) -> connection.Body {
@@ -557,16 +541,16 @@ pub fn start(
       connection_factory_name: builder.connection_factory_name,
       on_init: handler_.on_init(
         handler,
-        to_internal_http1_config(builder.http1),
+        to_internal_http1_options(builder.http1),
       ),
       loop: handler_.loop,
     )
 
   let pool = case builder.tls {
-    Some(CertKeyFiles(certfile:, keyfile:)) ->
-      glisten.with_tls(pool, certfile:, keyfile:)
-    Some(CertKeyPem(cert:, key:)) -> glisten.with_tls_pem(pool, cert:, key:)
-    Some(CertKeyDer(cert:, key_type:, key:)) ->
+    Some(Disk(cert:, key:)) ->
+      glisten.with_tls(pool, certfile: cert, keyfile: key)
+    Some(Pem(cert:, key:)) -> glisten.with_tls_pem(pool, cert:, key:)
+    Some(Der(cert:, key:, key_type:)) ->
       glisten.with_tls_der(
         pool,
         cert:,
@@ -591,7 +575,7 @@ pub fn start(
   })
 
   let scheme = case builder.tls {
-    Some(_config) -> http.Https
+    Some(_tls) -> http.Https
     None -> http.Http
   }
   let address =
