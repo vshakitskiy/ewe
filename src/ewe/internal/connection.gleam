@@ -1,4 +1,5 @@
 import ewe/internal/http1/connection as http1
+import ewe/internal/http2/connection as http2
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/option
@@ -8,7 +9,7 @@ import websocks
 
 pub type Connection {
   Http1(http1.Connection)
-  Http2
+  Http2(http2.Connection(Body))
 }
 
 pub type Body {
@@ -52,17 +53,18 @@ pub type FileDescriptor
 
 pub type ResponseWriter {
   Http1Writer(http1.ResponseWriter)
-  Http2Writer
+  Http2Writer(http2.ResponseWriter(Body))
 }
 
 pub type SseConnection {
   Http1Sse(http1.SseConnection)
-  Http2Sse
+  Http2Sse(http2.SseConnection(Body))
 }
 
+/// HTTP/2 carries WebSockets over extended CONNECT (RFC 8441), which ewe does
+/// not negotiate yet.
 pub type WebsocketConnection {
   Http1Websocket(http1.WebsocketConnection)
-  Http2Websocket
 }
 
 pub type Outcome {
@@ -72,6 +74,12 @@ pub type Outcome {
 
 pub type Message {
   Timeout
+  Http2Handshake
+  Http2Stream(http2.Reply(Body))
+  Http2Exit(process.ExitMessage)
+  Http2Drain
+  /// A stream process that outstayed the grace it was given after a reset.
+  Http2StreamClose(pid: process.Pid)
 }
 
 /// Concatenating onto an empty buffer would copy the incoming bytes for

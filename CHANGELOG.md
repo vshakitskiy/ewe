@@ -46,6 +46,17 @@
 - In replacement of the `CloseCode` variants that each carried their own data
   there is now `CloseReason`, either `NoCloseReason` or a code and a description 
   which `send_close_frame` takes.
+- Add HTTP/2 support!!!! WebSockets need extended CONNECT over HTTP/2 which ewe 
+  does not negotiate yet, so for now any `websocket` answers 501 on an HTTP/2 
+  connection.
+- Add `Http2Options`, `default_http2_options` and `with_http2` to set the limits
+  and timeouts for every HTTP/2 connection. Concurrent streams, window sizes and
+  their refill marks, frame and header list sizes, the HPACK table size, the
+  CONTINUATION and header block caps, the Rapid Reset window and threshold, the
+  handshake, drain and body read timeouts, and the file read threshold. A value
+  the protocol does not allow is replaced with the default.
+- Add `with_client_verification` which requires clients to present a certificate 
+  signed by a given authority and refuses those that do not.
 
 ## v4.0.1 - 04.06.2026
 

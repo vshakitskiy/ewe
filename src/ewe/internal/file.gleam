@@ -34,7 +34,7 @@ pub fn resolve(
         }
       }
     }
-    connection.Http2 -> {
+    connection.Http2(_connection) -> {
       use size <- result.try(stat(path))
       use #(offset, length) <- result.map(range(size, offset, limit))
 
@@ -92,11 +92,14 @@ pub fn send(
   case file {
     connection.OpenFile(handle:, offset:, length:) ->
       send_handle(transport, socket, handle, offset, length)
-    connection.PendingFile(..) -> todo as "HTTP/2 is not implemented yet!"
+    // Only HTTP/2 leaves a file unopened and its connection process opens one
+    // itself rather than writing it through here.
+    connection.PendingFile(..) ->
+      panic as "an unopened file cannot be written to an HTTP/1 socket"
   }
 }
 
-/// Owns the descriptor from here on, so it is closed however the write ends.
+/// Owns the descriptor from here on so it is closed however the write ends.
 fn send_handle(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -104,7 +107,23 @@ fn send_handle(
   offset: Int,
   length: Int,
 ) -> Result(Nil, socket.SocketReason) {
-  let sent = case length {
+  let sent = send_chunk(transport, socket, handle, offset, length)
+
+  close(handle)
+  sent
+}
+
+/// Writes one range of an open file leaving the descriptor open. HTTP/2 sizes
+/// each range to the stream's send window and comes back for the next one so
+/// the descriptor has to outlive the individual write.
+pub fn send_chunk(
+  transport: transport.Transport,
+  socket: socket.Socket,
+  handle: connection.FileDescriptor,
+  offset: Int,
+  length: Int,
+) -> Result(Nil, socket.SocketReason) {
+  case length {
     0 -> Ok(Nil)
     _length ->
       case transport {
@@ -112,9 +131,6 @@ fn send_handle(
         transport.Ssl -> send_chunks(transport, socket, handle, offset, length)
       }
   }
-
-  close(handle)
-  sent
 }
 
 const chunk_size = 65_536
@@ -148,6 +164,13 @@ fn send_chunks(
   }
 }
 
+@external(erlang, "file_ffi", "read_range")
+pub fn read_range(
+  path: String,
+  offset: Int,
+  length: Int,
+) -> Result(BitArray, FileError)
+
 @external(erlang, "file_ffi", "stat")
 fn stat(path: String) -> Result(Int, FileError)
 
@@ -160,7 +183,7 @@ fn do_sendfile(
 ) -> Result(Nil, socket.SocketReason)
 
 @external(erlang, "file_ffi", "open")
-fn open(path: String) -> Result(connection.FileDescriptor, FileError)
+pub fn open(path: String) -> Result(connection.FileDescriptor, FileError)
 
 @external(erlang, "file_ffi", "size")
 fn size(handle: connection.FileDescriptor) -> Result(Int, FileError)
@@ -173,4 +196,4 @@ fn pread(
 ) -> Result(BitArray, socket.SocketReason)
 
 @external(erlang, "file_ffi", "close")
-fn close(handle: connection.FileDescriptor) -> Nil
+pub fn close(handle: connection.FileDescriptor) -> Nil

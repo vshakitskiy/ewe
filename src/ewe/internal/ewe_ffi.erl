@@ -5,8 +5,11 @@
     now_datetime/0,
     set_http_date/1,
     get_http_date/0,
-    rescue_handler/1
+    rescue_handler/1,
+    is_valid_utf8/1
 ]).
+
+-define(HIGH_BITS, 16#80808080808080).
 
 identity(X) ->
   X.
@@ -49,3 +52,32 @@ ensure_http_date_table() ->
     _ ->
       ?MODULE
   end.
+
+is_valid_utf8(Bin) when is_binary(Bin) ->
+  case skip_ascii(Bin) of
+    <<>> -> true;
+    Rest -> is_binary(unicode:characters_to_binary(Rest, utf8))
+  end;
+is_valid_utf8(_Bits) ->
+  false.
+
+%% Tests seven bytes per word rather than eight since 56 bits is the widest that
+%% still fits an immediate integer on a 64-bit VM so no word allocates.
+skip_ascii(<<A:56, B:56, C:56, D:56, Rest/binary>>) when
+    A band ?HIGH_BITS =:= 0,
+    B band ?HIGH_BITS =:= 0,
+    C band ?HIGH_BITS =:= 0,
+    D band ?HIGH_BITS =:= 0
+->
+  skip_ascii(Rest);
+skip_ascii(<<Word:56, Rest/binary>>) when Word band ?HIGH_BITS =:= 0 ->
+  skip_ascii(Rest);
+%% Tails shorter than a word, each masked to its own width.
+skip_ascii(<<Word:48>>) when Word band 16#808080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:40>>) when Word band 16#8080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:32>>) when Word band 16#80808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:24>>) when Word band 16#808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:16>>) when Word band 16#8080 =:= 0 -> <<>>;
+skip_ascii(<<Word:8>>) when Word band 16#80 =:= 0 -> <<>>;
+skip_ascii(Rest) ->
+  Rest.

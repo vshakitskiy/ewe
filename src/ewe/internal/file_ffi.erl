@@ -2,7 +2,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([stat/1, sendfile/4, open/1, size/1, pread/3, close/1]).
+-export([stat/1, sendfile/4, open/1, size/1, pread/3, read_range/3, close/1]).
 
 stat(Path) ->
   case file:read_file_info(Path, [raw, {time, posix}]) of
@@ -15,7 +15,8 @@ stat(Path) ->
 
 sendfile(Fd, Socket, Offset, Bytes) ->
   case file:sendfile(Fd, Socket, Offset, Bytes, []) of
-    {ok, _Sent} -> {ok, nil};
+    {ok, Bytes} -> {ok, nil};
+    {ok, _Short} -> {error, closed};
     {error, Reason} -> {error, Reason}
   end.
 
@@ -39,6 +40,26 @@ pread(Fd, Offset, Length) ->
     {ok, Data} -> {ok, Data};
     eof -> {ok, <<>>};
     {error, Reason} -> {error, Reason}
+  end.
+
+read_range(_Path, _Offset, 0) ->
+  {ok, <<>>};
+%% A short read means the file shrank between being sized and being read which
+%% leaves no correct body to send so it is reported rather than padded over.
+read_range(Path, Offset, Length) ->
+  case open(Path) of
+    {ok, Fd} ->
+      Result =
+        case file:pread(Fd, Offset, Length) of
+          {ok, Data} when byte_size(Data) =:= Length -> {ok, Data};
+          {ok, _Short} -> {error, unknown_error};
+          eof -> {error, unknown_error};
+          {error, _Reason} -> {error, unknown_error}
+        end,
+      file:close(Fd),
+      Result;
+    {error, Reason} ->
+      {error, Reason}
   end.
 
 close(Fd) ->

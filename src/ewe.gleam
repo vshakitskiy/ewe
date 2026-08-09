@@ -23,6 +23,9 @@
 ////       "with_tls",
 ////       "with_http1",
 ////       "default_http1_options",
+////       "with_http2",
+////       "default_http2_options",
+////       "with_client_verification",
 ////       "quiet",
 ////       "on_start"
 ////     ]
@@ -143,6 +146,10 @@ import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
 import ewe/internal/http1/sse as http1_sse
 import ewe/internal/http1/websocket as http1_websocket
+import ewe/internal/http2/body as http2_body
+import ewe/internal/http2/connection as http2
+import ewe/internal/http2/sse as http2_sse
+import ewe/internal/http2/stream as http2_stream
 import ewe/internal/sse
 import ewe/internal/websocket
 import gleam/bytes_tree
@@ -231,19 +238,21 @@ fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
 /// Retrieves the client's socket address from the connection. Returns error if
 /// the socket information is unavailable.
 pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
-  case connection {
-    connection.Http1(connection) -> {
-      let peername = transport.peername(connection.transport, connection.socket)
-      use info <- result.map(over: peername)
+  // An HTTP/2 handler runs in a process that has no access to the socket, so the
+  // address is resolved once for the connection and carried on every stream.
+  let peername = case connection {
+    connection.Http1(connection) ->
+      transport.peername(connection.transport, connection.socket)
+    connection.Http2(connection) -> connection.peer
+  }
 
-      case info {
-        socket.TcpSockName(ip_address:, port:) ->
-          from_internal_options_ip_address(ip_address)
-          |> TcpSocketAddress(port:)
-        socket.UnixSockName(path:) -> UnixSocketAddress(path:)
-      }
-    }
-    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+  use info <- result.map(over: peername)
+
+  case info {
+    socket.TcpSockName(ip_address:, port:) ->
+      from_internal_options_ip_address(ip_address)
+      |> TcpSocketAddress(port:)
+    socket.UnixSockName(path:) -> UnixSocketAddress(path:)
   }
 }
 
@@ -375,6 +384,177 @@ fn to_internal_http1_options(options: Http1Options) -> http1.Config {
   )
 }
 
+const max_window_size = 2_147_483_647
+
+/// The limits and timeouts for every HTTP/2 connection. Build one by updating
+/// `default_http2_options`:
+///
+/// ```gleam
+/// Http2Options(..ewe.default_http2_options(), max_concurrent_streams: Some(100))
+/// ```
+///
+/// Sizes are in bytes and timeouts in milliseconds. A value the protocol does
+/// not allow is replaced with the default.
+pub type Http2Options {
+  Http2Options(
+    /// How many streams a client may have open at once. `None` leaves it
+    /// unlimited.
+    max_concurrent_streams: Option(Int),
+    /// How much response body a stream may have in flight before the client
+    /// has to allow more. Must be within 0 and 2147483647.
+    initial_window_size: Int,
+    /// The largest frame the server accepts. Must be within 16384 and 16777215.
+    max_frame_size: Int,
+    /// The largest header list the server accepts. `None` leaves it unlimited.
+    max_header_list_size: Option(Int),
+    /// How much HPACK dynamic table the server keeps for decoding.
+    header_table_size: Int,
+    /// How many CONTINUATION frames one header sequence may span.
+    max_continuation_frames: Int,
+    /// How many bytes of HEADERS and CONTINUATION one header block may total,
+    /// counted before it is decoded.
+    max_header_block_bytes: Int,
+    /// The window over which client stream resets are counted.
+    rapid_reset_window: Int,
+    /// How many resets within that window trip a GOAWAY which is what keeps
+    /// Rapid Reset (CVE-2023-44487) from costing more than it should.
+    rapid_reset_threshold: Int,
+    /// How long a connection may sit in the preface and SETTINGS handshake
+    /// before it is dropped.
+    handshake_timeout: Int,
+    /// How long a draining connection waits for its streams to finish after
+    /// GOAWAY before closing.
+    drain_timeout: Int,
+    /// Once a receive window falls to this it is topped straight back up to
+    /// `recv_window_high_water_mark` rather than trickling small updates.
+    recv_window_low_water_mark: Int,
+    /// What a receive window is topped up to. The wider the gap from the low
+    /// mark the fewer WINDOW_UPDATE round trips a large body costs.
+    recv_window_high_water_mark: Int,
+    /// Files at or below this size are read into memory and framed like any 
+    /// other body. Larger ones are streamed from disk instead.
+    file_read_threshold: Int,
+    /// How long a single read of a request body waits for the client.
+    body_read_timeout: Int,
+  )
+}
+
+pub fn default_http2_options() -> Http2Options {
+  let http2.Config(
+    max_concurrent_streams:,
+    initial_window_size:,
+    max_frame_size:,
+    max_header_list_size:,
+    header_table_size:,
+    max_continuation_frames:,
+    max_header_block_bytes:,
+    rapid_reset_window_ms:,
+    rapid_reset_threshold:,
+    handshake_timeout_ms:,
+    drain_timeout_ms:,
+    recv_window_low_water_mark:,
+    recv_window_high_water_mark:,
+    file_read_threshold:,
+    body_read_timeout:,
+  ) = http2.default_config()
+
+  Http2Options(
+    max_concurrent_streams:,
+    initial_window_size:,
+    max_frame_size:,
+    max_header_list_size:,
+    header_table_size:,
+    max_continuation_frames:,
+    max_header_block_bytes:,
+    rapid_reset_window: rapid_reset_window_ms,
+    rapid_reset_threshold:,
+    handshake_timeout: handshake_timeout_ms,
+    drain_timeout: drain_timeout_ms,
+    recv_window_low_water_mark:,
+    recv_window_high_water_mark:,
+    file_read_threshold:,
+    body_read_timeout:,
+  )
+}
+
+/// Anything the protocol rules out would break connections so it is dropped 
+/// for the default here instead of reaching a peer.
+fn to_internal_http2_options(options: Http2Options) -> http2.Config {
+  let defaults = http2.default_config()
+
+  let max_concurrent_streams = case options.max_concurrent_streams {
+    Some(limit) if limit <= 0 -> None
+    limit -> limit
+  }
+
+  let initial_window_size = case options.initial_window_size {
+    size if size < 0 || size > max_window_size -> defaults.initial_window_size
+    size -> size
+  }
+
+  let max_frame_size = case options.max_frame_size {
+    size if size < 16_384 || size > 16_777_215 -> defaults.max_frame_size
+    size -> size
+  }
+
+  let drain_timeout_ms = case options.drain_timeout {
+    timeout if timeout <= 0 -> defaults.drain_timeout_ms
+    timeout -> timeout
+  }
+
+  let file_read_threshold = case options.file_read_threshold {
+    threshold if threshold < 0 -> defaults.file_read_threshold
+    threshold -> threshold
+  }
+
+  // The marks only mean anything as a pair, so a bad one replaces both.
+  let #(recv_window_low_water_mark, recv_window_high_water_mark) = case
+    options.recv_window_low_water_mark,
+    options.recv_window_high_water_mark
+  {
+    low, high if low > 0 && low < high && high <= max_window_size -> #(low, high)
+    _low, _high -> #(
+      defaults.recv_window_low_water_mark,
+      defaults.recv_window_high_water_mark,
+    )
+  }
+
+  http2.Config(
+    max_concurrent_streams:,
+    initial_window_size:,
+    max_frame_size:,
+    max_header_list_size: options.max_header_list_size,
+    header_table_size: options.header_table_size,
+    max_continuation_frames: options.max_continuation_frames,
+    max_header_block_bytes: options.max_header_block_bytes,
+    rapid_reset_window_ms: options.rapid_reset_window,
+    rapid_reset_threshold: options.rapid_reset_threshold,
+    handshake_timeout_ms: options.handshake_timeout,
+    drain_timeout_ms:,
+    recv_window_low_water_mark:,
+    recv_window_high_water_mark:,
+    file_read_threshold:,
+    body_read_timeout: options.body_read_timeout,
+  )
+}
+
+/// Which certificate authority a client's certificate has to be signed by.
+pub type ClientVerification {
+  /// Path to a PEM file holding the CA certificate.
+  CaCertFile(path: String)
+  /// In-memory DER-encoded CA certificates.
+  CaCertData(certs: List(BitArray))
+}
+
+fn to_internal_client_verification(
+  verification: ClientVerification,
+) -> glisten.CaCert {
+  case verification {
+    CaCertFile(path:) -> glisten.CaCertFile(path)
+    CaCertData(certs:) -> glisten.CaCertData(certs)
+  }
+}
+
 /// Contains all server configurations, can be adjusted by different builder
 /// functions.
 pub opaque type Builder {
@@ -382,7 +562,9 @@ pub opaque type Builder {
     handler: fn(request.Request(Connection)) -> response.Response(Body),
     bind_target: BindTarget,
     tls: Option(Tls),
+    client_verification: Option(ClientVerification),
     http1: Http1Options,
+    http2: Http2Options,
     listener_name: process.Name(listener.Message),
     connection_factory_name: process.Name(
       factory.Message(
@@ -412,7 +594,9 @@ pub fn new(
     handler:,
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
     tls: None,
+    client_verification: None,
     http1: default_http1_options(),
+    http2: default_http2_options(),
     listener_name:,
     connection_factory_name:,
     on_start: fn(scheme, address) {
@@ -514,6 +698,20 @@ pub fn with_http1(builder: Builder, options: Http1Options) -> Builder {
   Builder(..builder, http1: options)
 }
 
+/// Replaces the limits and timeouts applied to HTTP/2 connections.
+pub fn with_http2(builder: Builder, options: Http2Options) -> Builder {
+  Builder(..builder, http2: options)
+}
+
+/// Requires clients to present a certificate signed by the given authority,
+/// refusing those that do not. Needs TLS which `with_tls` configures.
+pub fn with_client_verification(
+  builder: Builder,
+  ca_cert: ClientVerification,
+) -> Builder {
+  Builder(..builder, client_verification: Some(ca_cert))
+}
+
 fn to_internal_body(body: Body) -> connection.Body {
   case body {
     Bytes(tree) -> connection.Bytes(tree)
@@ -542,6 +740,7 @@ pub fn start(
       on_init: handler_.on_init(
         handler,
         to_internal_http1_options(builder.http1),
+        to_internal_http2_options(builder.http2),
       ),
       loop: handler_.loop,
     )
@@ -556,6 +755,22 @@ pub fn start(
         cert:,
         key_type: to_internal_tls_key_type(key_type),
         key:,
+      )
+    None -> pool
+  }
+
+  // h2c needs nothing announced but over TLS a client only knows HTTP/2 is on
+  // offer if ALPN says so.
+  let pool = case builder.tls {
+    Some(_tls) -> glisten.with_http2(pool)
+    None -> pool
+  }
+
+  let pool = case builder.client_verification {
+    Some(ca_cert) ->
+      glisten.with_client_verification(
+        pool,
+        to_internal_client_verification(ca_cert),
       )
     None -> pool
   }
@@ -666,7 +881,22 @@ pub fn read_body(
       request.Request(..req, headers: list.append(req.headers, trailers), body:)
       |> Ok
     }
-    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2(connection) -> {
+      use #(body, trailers) <- result.try(
+        http2_body.read_body(connection, limit)
+        |> result.map_error(from_internal_http2_body_error),
+      )
+
+      request.Request(..req, headers: list.append(req.headers, trailers), body:)
+      |> Ok
+    }
+  }
+}
+
+fn from_internal_http2_body_error(error: http2_body.BodyError) -> BodyError {
+  case error {
+    http2_body.BodyTooLarge -> BodyTooLarge
+    http2_body.InvalidBody -> InvalidBody
   }
 }
 
@@ -701,18 +931,53 @@ pub fn read_body_chunk(
         Error(error) -> Error(from_internal_http1_body_error(error))
       }
     }
-    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2(connection) -> {
+      case http2_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
+        Ok(http2_body.Chunk(data, connection)) -> {
+          let body = connection.Http2(connection)
+          Ok(Chunk(data, request.set_body(req, body)))
+        }
+        Ok(http2_body.Done(trailers)) -> {
+          let headers = list.append(req.headers, trailers)
+          Ok(Done(request.Request(..req, headers:, body: Nil)))
+        }
+        Error(error) -> Error(from_internal_http2_body_error(error))
+      }
+    }
   }
 }
 
-/// Why a write to the client did not go through. TODO: obviously not the string 
-/// reason variant but this is for later!
+// TODO: remove String reason
+/// Why a write to the client did not go through.
 pub type SendError {
-  SendError(reason: String)
+  /// The client is gone so nothing further can be written.
+  ConnectionClosed
+  /// The client cancelled this HTTP/2 stream while the rest of the connection
+  /// carries on. Never returned on HTTP/1.
+  StreamReset
+  /// The write failed for a reason the socket reported that does not amount to
+  /// the client having gone.
+  SocketError(reason: String)
+}
+
+fn from_interrupted(interrupted: http2.Interrupted) -> SendError {
+  case interrupted {
+    http2.StreamReset -> StreamReset
+    // A write is never given a deadline, so the only way one reports a
+    // timeout is the connection having stopped answering at all.
+    http2.ConnectionClosed | http2.TimedOut -> ConnectionClosed
+  }
 }
 
 fn to_send_error(reason: socket.SocketReason) -> SendError {
-  SendError(socket.reason_to_string(reason))
+  case reason {
+    socket.Closed
+    | socket.Econnaborted
+    | socket.Econnreset
+    | socket.Enotconn
+    | socket.Epipe -> ConnectionClosed
+    reason -> SocketError(socket.reason_to_string(reason))
+  }
 }
 
 /// A handle for writing a streamed response's body, obtained from
@@ -753,7 +1018,10 @@ pub fn send_chunk(
       encoder.send_chunk(writer, chunk)
       |> result.map(connection.Http1Writer)
       |> result.map_error(to_send_error)
-    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2Writer(writer) ->
+      http2_stream.send_chunk(writer, chunk)
+      |> result.map(connection.Http2Writer)
+      |> result.map_error(from_interrupted)
   }
 }
 
@@ -765,7 +1033,9 @@ pub fn finish_chunk(
   case writer {
     connection.Http1Writer(writer) ->
       encoder.finish_chunk(writer, chunk) |> result.map_error(to_send_error)
-    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2Writer(writer) ->
+      http2_stream.finish_chunk(writer, chunk)
+      |> result.map_error(from_interrupted)
   }
 }
 
@@ -775,7 +1045,8 @@ pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   case writer {
     connection.Http1Writer(writer) ->
       encoder.finish_response(writer) |> result.map_error(to_send_error)
-    connection.Http2Writer -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2Writer(writer) ->
+      http2_stream.finish_response(writer) |> result.map_error(from_interrupted)
   }
 }
 
@@ -847,7 +1118,8 @@ pub fn send_event(
   case conn {
     connection.Http1Sse(conn) ->
       http1_sse.send(conn, event) |> result.map_error(to_send_error)
-    connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
+    connection.Http2Sse(conn) ->
+      http2_sse.send(conn, event) |> result.map_error(from_interrupted)
   }
 }
 
@@ -878,7 +1150,7 @@ pub fn sse(
   let stream = fn(conn) {
     case conn {
       connection.Http1Sse(conn) -> http1_sse.run(conn, on_init, step, on_close)
-      connection.Http2Sse -> todo as "HTTP/2 is not implemented yet!"
+      connection.Http2Sse(conn) -> http2_sse.run(conn, on_init, step, on_close)
     }
   }
 
@@ -1021,7 +1293,6 @@ pub fn send_text_frame(
   case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_text(conn, text) |> result.map_error(to_send_error)
-    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
@@ -1033,7 +1304,6 @@ pub fn send_binary_frame(
   case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_binary(conn, data) |> result.map_error(to_send_error)
-    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
   }
 }
 
@@ -1046,7 +1316,6 @@ pub fn send_close_frame(
   let _sent = case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_close(conn, to_internal_close_reason(reason))
-    connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
   }
 
   WebsocketStop
@@ -1089,7 +1358,6 @@ pub fn websocket(
     case conn {
       connection.Http1Websocket(conn) ->
         http1_websocket.run(conn, on_init, step, on_close)
-      connection.Http2Websocket -> todo as "HTTP/2 is not implemented yet!"
     }
   }
 
@@ -1118,7 +1386,16 @@ pub fn websocket(
           response.set_body(response.new(400), Empty)
         }
       }
-    connection.Http2 -> todo as "HTTP/2 is not implemented yet!"
+    // WebSockets ride on extended CONNECT over HTTP/2 which ewe does not 
+    // negotiate yet!
+    connection.Http2(_connection) -> {
+      logging.log(
+        logging.Debug,
+        "Rejected a WebSocket handshake! HTTP/2 connections do not carry WebSockets",
+      )
+
+      response.set_body(response.new(501), Empty)
+    }
   }
 }
 
