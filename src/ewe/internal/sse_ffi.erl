@@ -15,7 +15,20 @@ init() ->
   ok.
 
 split_breaks(Bin) ->
-  binary:split(Bin, persistent_term:get({?MODULE, break}), [global]).
+  case has_break(Bin) of
+    false -> [Bin];
+    true -> binary:split(Bin, break_pattern(), [global])
+  end.
 
 strip_breaks(Bin) ->
-  binary:replace(Bin, persistent_term:get({?MODULE, break}), <<>>, [global]).
+  case has_break(Bin) of
+    false -> Bin;
+    true -> binary:replace(Bin, break_pattern(), <<>>, [global])
+  end.
+
+break_pattern() ->
+  persistent_term:get({?MODULE, break}).
+
+has_break(Bin) ->
+  binary:match(Bin, <<"\n">>) =/= nomatch orelse
+    binary:match(Bin, <<"\r">>) =/= nomatch.

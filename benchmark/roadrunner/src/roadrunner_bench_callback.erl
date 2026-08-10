@@ -7,6 +7,8 @@
 -include_lib("kernel/include/file.hrl").
 
 -define(SSE_EVENTS, 32).
+-define(SMALL_COUNT, 100).
+-define(BIG_COUNT, 64).
 
 handle(Req) ->
   route(roadrunner_req:method(Req), roadrunner_req:path(Req), Req).
@@ -29,40 +31,48 @@ route(~"GET", ~"/stream", Req) ->
   end},
   {Resp, Req};
 
-route(~"GET", ~"/sse", Req) ->
-  Headers = [
-    {~"content-type", ~"text/event-stream"},
-    {~"cache-control", ~"no-cache"}
-  ],
-  Resp = {stream, 200, Headers, fun(Send) -> start_sse(Send) end},
-  {Resp, Req};
+route(~"GET", ~"/stream/small", Req) ->
+  {burst(roadrunner_bench_app:payload(small_chunk), ?SMALL_COUNT), Req};
+route(~"GET", ~"/stream/big", Req) ->
+  {burst(roadrunner_bench_app:payload(big_chunk), ?BIG_COUNT), Req};
 
+route(~"GET", ~"/sse", Req) ->
+  {sse_burst(roadrunner_bench_app:payload(small_line), ?SSE_EVENTS), Req};
+route(~"GET", ~"/sse/small", Req) ->
+  {sse_burst(roadrunner_bench_app:payload(small_line), ?SMALL_COUNT), Req};
+route(~"GET", ~"/sse/big", Req) ->
+  {sse_burst(roadrunner_bench_app:payload(big_line), ?BIG_COUNT), Req};
+
+route(~"GET", ~"/file/tiny", Req) ->
+  send_file(Req, "../priv/file_1kb.bin");
 route(~"GET", ~"/file/small", Req) ->
   send_file(Req, "../priv/file_100kb.bin");
 route(~"GET", ~"/file/big", Req) ->
-  send_file(Req, "../priv/file_1gb.bin");
+  send_file(Req, "../priv/file_5mb.bin");
 
 route(_Method, _Path, Req) ->
   {roadrunner_resp:not_found(), Req}.
 
-start_sse(Send) ->
-  self() ! {sse_tick, 1},
-  send_sse(Send).
+sse_headers() ->
+  [{~"content-type", ~"text/event-stream"}, {~"cache-control", ~"no-cache"}].
 
-send_sse(Send) ->
-  receive
-    {sse_tick, N} when N >= ?SSE_EVENTS ->
-      Send(sse_event(N), fin);
-    {sse_tick, N} ->
-      Send(sse_event(N), nofin),
-      self() ! {sse_tick, N + 1},
-      send_sse(Send)
-  end.
+burst(Chunk, Count) ->
+  {stream, 200, [], fun(Send) -> send_burst(Send, Chunk, Count) end}.
 
-sse_event(N) ->
-  Id = integer_to_binary(N),
-  Data = <<"{\"n\":", Id/binary, ",\"at\":\"benchmark\"}">>,
-  iolist_to_binary(roadrunner_sse:event(~"tick", Data, Id)).
+send_burst(Send, Chunk, 1) ->
+  Send(Chunk, fin);
+send_burst(Send, Chunk, Remaining) ->
+  Send(Chunk, nofin),
+  send_burst(Send, Chunk, Remaining - 1).
+
+sse_burst(Data, Count) ->
+  {stream, 200, sse_headers(), fun(Send) -> send_events(Send, Data, Count) end}.
+
+send_events(Send, Data, 1) ->
+  Send(roadrunner_sse:event(~"tick", Data), fin);
+send_events(Send, Data, Remaining) ->
+  Send(roadrunner_sse:event(~"tick", Data), nofin),
+  send_events(Send, Data, Remaining - 1).
 
 read_all_chunks(Req, Acc) ->
   case roadrunner_req:read_body_chunked(Req) of

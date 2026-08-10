@@ -1,18 +1,8 @@
--- POST /echo/chunked with a Transfer-Encoding: chunked body, exercising the
--- incremental/streamed request read path. wrk has no built-in support for
--- chunked request bodies, so the raw request is hand-built here.
-
 wrk.method = "POST"
 
-local chunks = {
-  string.rep("a", 1024),
-  string.rep("b", 1024),
-  string.rep("c", 1024),
-  string.rep("d", 1024),
-}
-
 local encoded = ""
-for _, chunk in ipairs(chunks) do
+for _ = 1, 10 do
+  local chunk = string.rep("a", 1024)
   encoded = encoded .. string.format("%x", #chunk) .. "\r\n" .. chunk .. "\r\n"
 end
 encoded = encoded .. "0\r\n\r\n"

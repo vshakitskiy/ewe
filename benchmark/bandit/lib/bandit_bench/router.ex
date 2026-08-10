@@ -1,7 +1,12 @@
 defmodule BanditBench.Router do
   use Plug.Router
 
-  @sse_events 32
+  @small_count 100
+  @big_count 64
+  @big_repeats 256
+
+  @small_line "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  @big_line String.duplicate(@small_line, @big_repeats)
 
   plug(:match)
   plug(:dispatch)
@@ -27,12 +32,18 @@ defmodule BanditBench.Router do
     conn
   end
 
-  get "/sse" do
+  get "/stream/small" do
+    conn |> send_chunked(200) |> stream_burst(@small_line, @small_count)
+  end
+
+  get "/stream/big" do
+    conn |> send_chunked(200) |> stream_burst(@big_line, @big_count)
+  end
+
+  get "/file/tiny" do
     conn
-    |> put_resp_header("content-type", "text/event-stream")
-    |> put_resp_header("cache-control", "no-cache")
-    |> send_chunked(200)
-    |> sse_burst()
+    |> put_resp_header("content-type", "application/octet-stream")
+    |> send_file(200, "../priv/file_1kb.bin")
   end
 
   get "/file/small" do
@@ -44,37 +55,20 @@ defmodule BanditBench.Router do
   get "/file/big" do
     conn
     |> put_resp_header("content-type", "application/octet-stream")
-    |> send_file(200, "../priv/file_1gb.bin")
+    |> send_file(200, "../priv/file_5mb.bin")
   end
 
   match _ do
     send_resp(conn, 404, "")
   end
 
-  defp sse_burst(conn) do
-    send(self(), {:sse_tick, 1})
-    sse_loop(conn)
-  end
+  defp stream_burst(conn, _data, 0), do: conn
 
-  defp sse_loop(conn) do
-    receive do
-      {:sse_tick, n} when n > @sse_events ->
-        conn
-
-      {:sse_tick, n} ->
-        case chunk(conn, sse_event(n)) do
-          {:ok, conn} ->
-            send(self(), {:sse_tick, n + 1})
-            sse_loop(conn)
-
-          {:error, _reason} ->
-            conn
-        end
+  defp stream_burst(conn, data, remaining) do
+    case chunk(conn, data) do
+      {:ok, conn} -> stream_burst(conn, data, remaining - 1)
+      {:error, _reason} -> conn
     end
-  end
-
-  defp sse_event(n) do
-    "event: tick\nid: #{n}\ndata: {\"n\":#{n},\"at\":\"benchmark\"}\n\n"
   end
 
   defp echo_chunked({:more, partial, conn}, acc) do

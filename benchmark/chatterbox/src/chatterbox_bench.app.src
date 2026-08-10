@@ -1,0 +1,11 @@
+{application, chatterbox_bench,
+ [{description, "Chatterbox HTTP/2 benchmark"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {chatterbox_bench_app, []}},
+  {applications, [kernel, stdlib, chatterbox]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Unlicense"]},
+  {links, []}
+ ]}.
