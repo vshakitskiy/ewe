@@ -10,456 +10,498 @@ ewe [/juː/] - fluffy package for building web servers.
 ## Installation
 
 ```sh
-gleam add ewe@4 gleam_erlang gleam_otp gleam_http logging
+gleam add ewe@5 gleam_erlang gleam_otp gleam_http logging
 ```
 
 ## Getting Started
 
 ```gleam
+import ewe
 import gleam/erlang/process
-import logging
+import gleam/http/request
 import gleam/http/response
-
-import ewe.{type Request, type Response}
+import logging
 
 pub fn main() {
   logging.configure()
   logging.set_level(logging.Info)
 
+  // The acceptor pool wires the listener and the connection factory together
+  // through process names. Create them where your program starts and pass them
+  // in here.
+  //
+  let listener_name = process.new_name("listener_name")
+  let connection_factory_name = process.new_name("connection_factory_name")
+
   let assert Ok(_) =
-    ewe.new(handler)
-    |> ewe.bind("0.0.0.0")
-    |> ewe.listening(port: 8080)
+    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    |> ewe.bind(to: "0.0.0.0")
+    |> ewe.listening(on: 8080)
     |> ewe.start
 
   process.sleep_forever()
 }
 
-fn handler(_req: Request) -> Response {
+fn handle_request(
+  _request: request.Request(ewe.Connection),
+) -> response.Response(ewe.Body) {
+  // When sending a body it is important to include a `content-type` header.
+  // You never set `content-length` or `transfer-encoding` yourself, ewe frames
+  // the response and writes them for you.
+  //
   response.new(200)
   |> response.set_header("content-type", "text/plain; charset=utf-8")
-  |> response.set_body(ewe.TextData("Hello, World!"))
+  |> response.set_body(ewe.Text("Hello, World!"))
 }
 ```
+
+A handler takes a [`request.Request(ewe.Connection)`](https://hexdocs.pm/ewe/ewe.html#Connection)
+and returns a [`response.Response(ewe.Body)`](https://hexdocs.pm/ewe/ewe.html#Body).
+The connection carried by the request is what [`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body),
+[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) and [`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket)
+work on.
+
+Instead of a port you can bind a unix domain socket with [`ewe.unix`](https://hexdocs.pm/ewe/ewe.html#unix),
+or let the OS pick a free port with [`ewe.listening_random`](https://hexdocs.pm/ewe/ewe.html#listening_random)
+and ask for the one it picked with [`ewe.get_server_info`](https://hexdocs.pm/ewe/ewe.html#get_server_info).
 
 ## Usage
 
 ### [HTTPS](examples/src/https.gleam)
 
-To enable HTTPS support via TLS, use [`ewe.enable_tls`](https://hexdocs.pm/ewe/ewe.html#enable_tls) with paths to your certificate and key files. The server validates the certificate and key files on startup and will crash if they're missing or invalid.
+Enable TLS with [`ewe.with_tls`](https://hexdocs.pm/ewe/ewe.html#with_tls), which
+takes the certificate source as a [`ewe.Tls`](https://hexdocs.pm/ewe/ewe.html#Tls)
+value. The certificate and key are validated on startup and the server crashes if
+they are missing or invalid.
 
 ```gleam
-ewe.new(handler)
-|> ewe.bind("0.0.0.0")
-|> ewe.listening(port: 8080)
-|> ewe.enable_tls(
-  certificate_file: "priv/localhost.crt",
-  key_file: "priv/localhost.key",
-)
+ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+|> ewe.bind(to: "0.0.0.0")
+|> ewe.listening(on: 8080)
+// Certificate and key files on disk.
+|> ewe.with_tls(ewe.Disk("priv/localhost.crt", "priv/localhost.key"))
+// Or PEM already in memory: ewe.Pem(cert, key)
+// Or DER in memory:         ewe.Der(cert, key, ewe.RsaPrivateKey)
 |> ewe.start
 ```
 
-### [Sending Response](examples/src/sending_response.gleam)
-
-`ewe` provides several response body types (see [`ewe.ResponseBody`](https://hexdocs.pm/ewe/ewe.html#ResponseBody) type). Request handler must return [`response.Response`](https://hexdocs.pm/gleam_http/gleam/http/response.html#Response) type with [`ewe.ResponseBody`](https://hexdocs.pm/ewe/ewe.html#ResponseBody). You can also use [`ewe.Request`](https://hexdocs.pm/ewe/ewe.html#Request)/[`ewe.Response`](https://hexdocs.pm/ewe/ewe.html#Response) as they are aliases for `request.Request(Connection)`(see [`request.Request`](https://hexdocs.pm/gleam_http/gleam/http/request.html#Request) & [`ewe.Connection`](https://hexdocs.pm/ewe/ewe.html#Connection))/`response.Response(ResponseBody)`.
-
+To refuse clients that do not present a certificate signed by an authority you
+name, add [`ewe.with_client_verification`](https://hexdocs.pm/ewe/ewe.html#with_client_verification).
+It needs TLS to be configured.
 
 ```gleam
+|> ewe.with_tls(ewe.Disk("priv/localhost.crt", "priv/localhost.key"))
+|> ewe.with_client_verification(ewe.CaCertFile("priv/ca.crt"))
+```
+
+### HTTP/2
+
+HTTP/2 is always enabled on ewe. Over TLS ewe offers it through ALPN and a plain
+connection is served as HTTP/2 when it opens with the HTTP/2 preface which is
+what a client with prior knowledge sends. An `Upgrade: h2c` request is not
+negotiated, it is answered as HTTP/1.1.
+
+> [!NOTE]
+> Extended CONNECT is not negotiated yet, so WebSockets over HTTP/2 are not
+> supported.
+
+### [Sending a Response](examples/src/sending_response.gleam)
+
+A response body is one of the [`ewe.Body`](https://hexdocs.pm/ewe/ewe.html#Body)
+variants. `Text` and `Bytes` are in-memory bodies, `Empty` is for responses that
+carry nothing and the rest are built by the functions covered further down:
+`File` by [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file), `Streaming` by
+[`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response), `Sse`
+by [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) and `Websocket` by
+[`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket).
+
+```gleam
+import ewe
+import gleam/bytes_tree
 import gleam/crypto
-import gleam/http/request.{type Request}
-import gleam/http/response.{type Response}
+import gleam/http/request
+import gleam/http/response
 import gleam/int
 import gleam/result
 
-import ewe.{type Connection, type ResponseBody}
-
-fn handler(req: Request(Connection)) -> Response(ResponseBody) {
-  case request.path_segments(req) {
+fn handle_request(
+  request: request.Request(ewe.Connection),
+) -> response.Response(ewe.Body) {
+  case request.path_segments(request) {
     ["hello", name] -> {
-      // Use TextData for text responses.
-      // 
+      // Text for text responses.
       response.new(200)
       |> response.set_header("content-type", "text/plain; charset=utf-8")
-      |> response.set_body(ewe.TextData("Hello, " <> name <> "!"))
+      |> response.set_body(ewe.Text("Hello, " <> name <> "!"))
     }
     ["bytes", amount] -> {
-      // Use BitsData for binary responses.
-      // 
-      let random_bytes =
+      // Bytes for binary responses built from a `BytesTree`.
+      let body =
         int.parse(amount)
         |> result.unwrap(0)
-        |> crypto.strong_random_bytes()
+        |> crypto.strong_random_bytes
+        |> bytes_tree.from_bit_array
+        |> ewe.Bytes
 
       response.new(200)
       |> response.set_header("content-type", "application/octet-stream")
-      |> response.set_body(ewe.BitsData(random_bytes))
+      |> response.set_body(body)
     }
-    _ ->
-      // Use Empty for responses with no body (like 404, 204, etc).
-      // 
+    _segments ->
+      // Empty for responses with no body like 404 or 204.
       response.new(404)
       |> response.set_body(ewe.Empty)
   }
 }
 ```
 
-### [Reading Body](examples/src/reading_body.gleam)
+### [Reading the Request Body](examples/src/reading_body.gleam)
 
-To read the body of a request, use [`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body). This function is intended for cases where the entire body can safely be loaded into memory.
+[`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body) reads the whole body
+into memory up to `limit` bytes. Trailer fields of a chunked request are appended
+to the returned request's headers.
 
 ```gleam
-import gleam/http/request
-import gleam/http/response
-import gleam/result
-
-import ewe.{type Request, type Response}
-
-fn handler(req: Request) -> Response {
+fn handle_request(
+  request: request.Request(ewe.Connection),
+) -> response.Response(ewe.Body) {
   let content_type =
-    request.get_header(req, "content-type")
+    request.get_header(request, "content-type")
     |> result.unwrap("application/octet-stream")
 
-  // Read the entire request body into memory with a 10KB limit. This blocks
-  // until the full body is received.
-  // 
-  case ewe.read_body(req, 10_240) {
+  case ewe.read_body(request, limit: 10_240) {
     Ok(req) ->
       response.new(200)
       |> response.set_header("content-type", content_type)
-      |> response.set_body(ewe.BitsData(req.body))
+      |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
     Error(ewe.BodyTooLarge) ->
       response.new(413)
       |> response.set_header("content-type", "text/plain; charset=utf-8")
-      |> response.set_body(ewe.TextData("Body too large"))
+      |> response.set_body(ewe.Text("Body too large"))
     Error(ewe.InvalidBody) ->
       response.new(400)
       |> response.set_header("content-type", "text/plain; charset=utf-8")
-      |> response.set_body(ewe.TextData("Invalid request"))
+      |> response.set_body(ewe.Text("Invalid request"))
   }
 }
 ```
 
-### [Streaming Body](examples/src/streaming_body.gleam)
+A body the handler never read is drained by the server so the connection can be
+reused. One larger than `auto_drain_limit` closes the connection instead.
 
-For larger request bodies, [`ewe.stream_body`](https://hexdocs.pm/ewe/ewe.html#stream_body) provides a streaming interface. It produces a [`ewe.Consumer`](https://hexdocs.pm/ewe/ewe.html#Consumer) which can be called repeatedly to read fixed-size chunks. This enables efficient handling of large payloads without buffering them fully.
+### [Streaming Bodies](examples/src/streaming_bodies.gleam)
 
-As for responses, use [`ewe.chunked_body`](https://hexdocs.pm/ewe/ewe.html#chunked_body) to send a chunked response for streaming data to the client. The response body is managed through [`ewe.ChunkedBody`](https://hexdocs.pm/ewe/ewe.html#ChunkedBody) and chunks are sent by calling [`ewe.send_chunk`](https://hexdocs.pm/ewe/ewe.html#send_chunk). Handlers control the connection lifecycle with [`ewe.ChunkedNext`](https://hexdocs.pm/ewe/ewe.html#ChunkedNext). 
+[`ewe.read_body_chunk`](https://hexdocs.pm/ewe/ewe.html#read_body_chunk) pulls up
+to `max_chunk_bytes` per call rather than buffering everything. Each
+[`ewe.Chunk`](https://hexdocs.pm/ewe/ewe.html#ReadEvent) carries the request to
+feed into the next call.
 
+Going the other way, [`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response)
+turns a response into a streamed one. Its handler owns an
+[`ewe.ResponseWriter`](https://hexdocs.pm/ewe/ewe.html#ResponseWriter) and must
+end by calling [`ewe.finish_chunk`](https://hexdocs.pm/ewe/ewe.html#finish_chunk)
+or [`ewe.finish_response`](https://hexdocs.pm/ewe/ewe.html#finish_response) since
+that is what closes the stream. The callback runs in the same connection process.
 
 ```gleam
-pub type Message {
-  Chunk(BitArray)
-  Done
-  BodyError(ewe.BodyError)
-}
-
-// Recursively consume chunks from the request body and send them to the
-// chunked response handler via the subject.
-// 
-fn stream_resource(
-  consumer: ewe.Consumer,
-  subject: Subject(Message),
-  chunk_size: Int,
-) -> Nil {
-  process.sleep(int.random(250))
-  // Call the consumer with the chunk size. It returns the next chunk of data
-  // and a new consumer for the remaining body.
-  // 
-  case consumer(chunk_size) {
-    Ok(ewe.Consumed(data, next)) -> {
-      logging.log(logging.Info, {
-        "Consumed " <> int.to_string(bit_array.byte_size(data)) <> " bytes."
-      })
-
-      process.send(subject, Chunk(data))
-      // Recursively process the next chunk.
-      // 
-      stream_resource(next, subject, chunk_size)
-    }
-    Ok(ewe.Done) -> process.send(subject, Done)
-    Error(body_error) -> process.send(subject, BodyError(body_error))
-  }
-}
-
-fn handle_stream(req: Request, chunk_size: Int) -> Response {
+fn handle_stream(
+  req: request.Request(ewe.Connection),
+  max_chunk_bytes: Int,
+) -> response.Response(ewe.Body) {
   let content_type =
     request.get_header(req, "content-type")
     |> result.unwrap("application/octet-stream")
 
-  // Get a consumer function for streaming the request body.
-  // 
-  case ewe.stream_body(req) {
-    Ok(consumer) -> {
-      // Set up a chunked response. The response is sent in chunks as we
-      // consume the request body.
-      // 
-      ewe.chunked_body(
-        req,
-        response.new(200) |> response.set_header("content-type", content_type),
-        // Spawn a separate process to consume the body and send chunks.
-        // This prevents blocking the handler while reading data.
-        // 
-        on_init: fn(subject) {
-          let _pid =
-            fn() { stream_resource(consumer, subject, chunk_size) }
-            |> process.spawn
-        },
-        handler: fn(chunked_body, state, message) {
-          case message {
-            Chunk(data) ->
-              case ewe.send_chunk(chunked_body, data) {
-                Ok(Nil) -> ewe.chunked_continue(state)
-                Error(_) -> ewe.chunked_stop_abnormal("Failed to send chunk")
-              }
-            Done -> ewe.chunked_stop()
-            BodyError(_body_error) ->
-              ewe.chunked_stop_abnormal("failed to read body")
-          }
-        },
-        on_close: fn(_conn, _state) {
-          logging.log(logging.Info, "Stream closed")
-        },
-      )
+  response.new(200)
+  |> response.set_header("content-type", content_type)
+  |> ewe.stream_response(echo_body(req, _, max_chunk_bytes))
+}
+
+// Read the request body one chunk at a time and write each one back out.
+//
+fn echo_body(
+  req: request.Request(ewe.Connection),
+  writer: ewe.ResponseWriter,
+  max_chunk_bytes: Int,
+) -> Result(Nil, ewe.SendError) {
+  case ewe.read_body_chunk(req, max_chunk_bytes:, limit: 10_485_760) {
+    Ok(ewe.Chunk(data:, request:)) -> {
+      use writer <- result.try(ewe.send_chunk(writer, data))
+      echo_body(request, writer, max_chunk_bytes)
     }
-    Error(_) ->
-      response.new(400)
-      |> response.set_header("content-type", "text/plain; charset=utf-8")
-      |> response.set_body(ewe.TextData("Invalid request"))
+    Ok(ewe.Done(_request)) -> ewe.finish_response(writer)
+    Error(_body_error) -> ewe.finish_response(writer)
   }
 }
 ```
 
 ### [Serving Files](examples/src/serving_files.gleam)
 
-Static files can be sent using [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file). It accepts a path and optional `offset`/`limit` parameters. This allows serving HTML pages, assets, or binary files with minimal effort.
+[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) prepares a file as a response
+body, streamed from disk rather than read into memory. `offset` and `limit` serve
+a byte range, which is what a range request needs. It takes the connection, so it
+is the request's body you pass in first.
 
 ```gleam
-import gleam/bool
-import gleam/http/response
-import gleam/list
-import gleam/string
+case ewe.file(request.body, resolved, offset: None, limit: None) {
+  Ok(file) ->
+    response.new(200)
+    |> response.set_header("content-type", "application/octet-stream")
+    |> response.set_body(file)
+  Error(_error) -> not_found()
+}
+```
 
-fn serve_file(path: String) -> Response {
-  // Resolve the URL path against the `public` directory and confirm the result 
-  // stays inside it.
-  //
-  let dir = absname("public")
-  let relative = string.drop_start(path, 1)
-  let segments = string.split(relative, "/")
+On HTTP/1 this opens the file and the body holds it open until the response is
+written so put it on a response you go on to return. A body that is built and
+then discarded keeps its file open until it is collected. On HTTP/2 a file at or
+below `file_read_threshold` is read into memory and framed like any other body.
 
-  use <- bool.guard(
-    when: list.any(segments, fn(seg) { seg == ".." }),
-    return: not_found(),
-  )
+### [Client Address](examples/src/client_info.gleam)
 
-  let resolved = absname_join(dir, relative)
+[`ewe.get_client_info`](https://hexdocs.pm/ewe/ewe.html#get_client_info) reads the
+address a request came from off its connection as a
+[`ewe.SocketAddress`](https://hexdocs.pm/ewe/ewe.html#SocketAddress). It fails
+only when the socket is already gone.
 
-  case string.starts_with(resolved, dir <> "/") {
-    True -> {
-      // Load file from disk using ewe.file(). This efficiently streams the file
-      // content without loading it entirely into memory.
-      //
-      case ewe.file(resolved, offset: None, limit: None) {
-        Ok(file) -> {
-          // Using "application/octet-stream" is safe for any file type, but you
-          // may want to specify content-type based on file extension in 
-          // production.
-          //
-          response.new(200)
-          |> response.set_header("content-type", "application/octet-stream")
-          |> response.set_body(file)
-        }
-        Error(_) -> not_found()
+```gleam
+fn describe_client(connection: ewe.Connection) -> String {
+  case ewe.get_client_info(connection) {
+    Ok(ewe.TcpSocketAddress(ip_address:, port:)) -> {
+      // An IPv6 address is bracketed so the port stays readable next to the
+      // colons the address itself is full of.
+      let host = case ip_address {
+        ewe.IpV6(..) -> "[" <> ewe.ip_address_to_string(ip_address) <> "]"
+        ewe.IpV4(..) -> ewe.ip_address_to_string(ip_address)
       }
+
+      host <> ":" <> int.to_string(port)
     }
-    False -> not_found()
+    Ok(ewe.UnixSocketAddress(path: "")) -> "unix socket"
+    Ok(ewe.UnixSocketAddress(path:)) -> "unix:" <> path
+    Error(Nil) -> "unknown"
   }
 }
-
-@external(erlang, "filename", "absname")
-fn absname(path: String) -> String
-
-@external(erlang, "filename", "absname_join")
-fn absname_join(dir: String, file: String) -> String
 ```
+
+Behind a proxy this is the proxy's address rather than the browser's. The one the
+proxy puts in `x-forwarded-for` is the address to use there but only when the
+proxy is yours, since any client can send that header itself.
 
 ### [WebSocket](examples/src/websocket.gleam)
 
-Use [`ewe.upgrade_websocket`](https://hexdocs.pm/ewe/ewe.html#upgrade_websocket) to switch an HTTP request into a WebSocket connection. Incoming messages are represented as [`ewe.WebsocketMessage`](https://hexdocs.pm/ewe/ewe.html#WebsocketMessage). Outgoing frames are sent with [`ewe.send_text_frame`](https://hexdocs.pm/ewe/ewe.html#send_text_frame) or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame). Handlers control the connection lifecycle with [`ewe.WebsocketNext`](https://hexdocs.pm/ewe/ewe.html#WebsocketNext).
+[`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket) turns a request into
+a WebSocket. A request that is not a valid handshake is answered with a 400 and
+your handler never runs. Frames from the client and messages from the rest of
+your program arrive as [`ewe.WebsocketMessage`](https://hexdocs.pm/ewe/ewe.html#WebsocketMessage)
+values. Answer them with [`ewe.send_text_frame`](https://hexdocs.pm/ewe/ewe.html#send_text_frame)
+or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame)
+and say what happens next with
+[`ewe.WebsocketNext`](https://hexdocs.pm/ewe/ewe.html#WebsocketNext).
 
 ```gleam
-import gleam/erlang/charlist.{type Charlist}
-import gleam/erlang/process.{type Pid, type Subject}
-import gleam/http/request
-import gleam/http/response
-import logging
-
-import ewe.{type Request, type Response}
-
-type PubSubMessage {
-  Subscribe(topic: String, client: Subject(Broadcast))
-  Publish(topic: String, message: Broadcast)
-  Unsubscribe(topic: String, client: Subject(Broadcast))
-}
-
-type Broadcast {
-  Text(String)
-  Bytes(BitArray)
-}
-
-type WebsocketState {
-  WebsocketState(
-    pubsub: Subject(PubSubMessage),
-    topic: String,
-    client: Subject(Broadcast),
-  )
-}
-
-fn handler(req: Request, pubsub: Subject(PubSubMessage)) -> Response {
-  case request.path_segments(req) {
-    ["topic", topic] -> handle_topic(req, pubsub, topic)
-    _ ->
-      response.new(404)
-      |> response.set_body(ewe.Empty)
-  }
-}
-
-fn handle_topic(req: Request, pubsub: Subject(PubSubMessage), topic: String) {
-  // Upgrade the HTTP connection to WebSocket. Unlike SSE, WebSocket is
-  // bidirectional - both client and server can send messages at any time.
-  // 
-  ewe.upgrade_websocket(
-    req,
-    // Initialize the WebSocket connection. The selector allows receiving
-    // messages from both the WebSocket and the pubsub system.
-    // 
+fn handle_topic(
+  req: request.Request(ewe.Connection),
+  pubsub: Subject(pubsub.Message(Broadcast)),
+  topic: String,
+) -> response.Response(ewe.Body) {
+  ewe.websocket(
+    request: req,
+    // Called once. The selector is where you add whatever the rest of your
+    // program sends this connection.
     on_init: fn(_conn, selector) {
       let client = process.new_subject()
-      process.send(pubsub, Subscribe(topic:, client:))
+      pubsub.subscribe(pubsub, topic:, client:)
 
       let state = WebsocketState(pubsub:, topic:, client:)
-      // Add the client subject to the selector to receive broadcast messages.
-      // 
       let selector = process.select(selector, client)
 
       #(state, selector)
     },
     handler: handle_websocket_message,
+    // Called once however the WebSocket ended.
     on_close: fn(_conn, state) {
-      process.send(pubsub, Unsubscribe(state.topic, state.client))
+      pubsub.unsubscribe(state.pubsub, topic: state.topic, client: state.client)
     },
   )
 }
 
-// Handle three types of messages: text from client, binary from client,
-// and broadcast messages from the pubsub system.
-// 
 fn handle_websocket_message(
   conn: ewe.WebsocketConnection,
   state: WebsocketState,
-  msg: ewe.WebsocketMessage(Broadcast),
+  message: ewe.WebsocketMessage(Broadcast),
 ) -> ewe.WebsocketNext(WebsocketState, Broadcast) {
-  case msg {
-    // Text message from the client - broadcast to all subscribers.
-    // 
-    ewe.Text(text) -> {
-      process.send(state.pubsub, Publish(state.topic, Text(text)))
+  case message {
+    ewe.TextFrame(text) -> {
+      pubsub.publish(state.pubsub, topic: state.topic, message: Text(text))
       ewe.websocket_continue(state)
     }
 
-    // Binary message from the client - broadcast to all subscribers.
-    // 
-    ewe.Binary(binary) -> {
-      process.send(state.pubsub, Publish(state.topic, Bytes(binary)))
+    ewe.BinaryFrame(data) -> {
+      pubsub.publish(state.pubsub, topic: state.topic, message: Bytes(data))
       ewe.websocket_continue(state)
     }
 
-    // User message from the pubsub - forward to this client.
-    // 
-    ewe.User(message) -> {
-      let assert Ok(_) = case message {
+    // A message from the rest of the program.
+    ewe.UserMessage(broadcast) -> {
+      let sent = case broadcast {
         Text(text) -> ewe.send_text_frame(conn, text)
-        Bytes(binary) -> ewe.send_binary_frame(conn, binary)
+        Bytes(data) -> ewe.send_binary_frame(conn, data)
       }
 
-      ewe.websocket_continue(state)
+      case sent {
+        Ok(Nil) -> ewe.websocket_continue(state)
+        Error(_send_error) ->
+          ewe.websocket_stop_abnormal("Failed to send a frame")
+      }
     }
   }
 }
 ```
+
+Ping and pong frames are answered by the server and never reach the handler. To
+start the closing handshake yourself, return
+[`ewe.send_close_frame`](https://hexdocs.pm/ewe/ewe.html#send_close_frame) with a
+[`ewe.CloseReason`](https://hexdocs.pm/ewe/ewe.html#CloseReason). No frame can be
+sent after it!
 
 ### [Server-Sent Events](examples/src/sse.gleam)
 
-
-Use [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) to establish a Server-Sent Events connection for real-time data streaming to clients. The connection is managed through [`ewe.SSEConnection`](https://hexdocs.pm/ewe/ewe.html#SSEConnection) and events are sent with [`ewe.send_event`](https://hexdocs.pm/ewe/ewe.html#send_event). Handlers control the connection lifecycle with [`ewe.SSENext`](https://hexdocs.pm/ewe/ewe.html#SSENext). This enables efficient one-way communication for live updates, notifications, or real-time data feeds.
+[`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) turns a response into an SSE
+stream which runs until the handler stops it or the client goes away. `on_init`
+receives the subject the rest of your program pushes messages to, `handler` is
+called for each of those messages and `on_close` runs however the stream ended.
+The `content-type` and `cache-control` headers the stream needs are set by ewe.
 
 ```gleam
-import gleam/bit_array
-import gleam/erlang/process.{type Subject}
-import gleam/http
-import gleam/http/response
+response.new(200)
+|> ewe.sse(
+  on_init: fn(client) {
+    pubsub.subscribe(pubsub, topic:, client:)
 
-import ewe
-
-type PubSubMessage {
-  Subscribe(client: Subject(String))
-  Unsubscribe(client: Subject(String))
-  Publish(String)
-}
-
-fn handler(req: ewe.Request, pubsub: Subject(PubSubMessage)) -> ewe.Response {
-  case req.method, req.path {
-    http.Get, "/sse" ->
-      // Establish a Server-Sent Events connection. SSE is a one-way channel
-      // from server to client. The connection stays open and the server can
-      // push events at any time.
-      // 
-      ewe.sse(
-        req,
-        // Initialize the connection and subscribe this client to the pubsub.
-        // 
-        on_init: fn(client) {
-          process.send(pubsub, Subscribe(client))
-
-          client
-        },
-        // Handle messages from the pubsub and send them as SSE events.
-        // 
-        handler: fn(conn, client, message) {
-          case ewe.send_event(conn, ewe.event(message)) {
-            Ok(Nil) -> ewe.sse_continue(client)
-            Error(_) -> ewe.sse_stop()
-          }
-        },
-        // Clean up when the client disconnects.
-        // 
-        on_close: fn(_conn, client) {
-          process.send(pubsub, Unsubscribe(client))
-        },
-      )
-
-    // Accept messages via POST and broadcast them to all SSE clients.
-    // 
-    http.Post, "/post" -> {
-      case ewe.read_body(req, 128) {
-        Ok(req) -> {
-          case bit_array.to_string(req.body) {
-            Ok(message) -> {
-              process.send(pubsub, Publish(message))
-
-              response.new(200) |> response.set_body(ewe.Empty)
-            }
-            Error(Nil) -> response.new(400) |> response.set_body(ewe.Empty)
-          }
-        }
-        Error(_) -> response.new(400) |> response.set_body(ewe.Empty)
-      }
+    client
+  },
+  handler: fn(conn, client, message) {
+    case ewe.send_event(conn, ewe.event(message)) {
+      Ok(Nil) -> ewe.sse_continue(client)
+      Error(_send_error) -> ewe.sse_stop()
     }
-
-    _, _ -> response.new(404) |> response.set_body(ewe.Empty)
-  }
-}
+  },
+  on_close: fn(_conn, client) {
+    pubsub.unsubscribe(pubsub, topic:, client:)
+  },
+)
 ```
+
+An event is built with [`ewe.event`](https://hexdocs.pm/ewe/ewe.html#event) and
+can carry a name, an id and a reconnection delay through
+[`ewe.event_name`](https://hexdocs.pm/ewe/ewe.html#event_name),
+[`ewe.event_id`](https://hexdocs.pm/ewe/ewe.html#event_id) and
+[`ewe.event_retry`](https://hexdocs.pm/ewe/ewe.html#event_retry).
+[`ewe.comment`](https://hexdocs.pm/ewe/ewe.html#comment) sends something clients
+ignore which is the usual way to keep an idle stream from being closed by a
+proxy.
+
+### Connection Limits and Timeouts
+
+Every connection is held to a set of limits and timeouts. Start from
+[`ewe.default_http1_options`](https://hexdocs.pm/ewe/ewe.html#default_http1_options)
+or [`ewe.default_http2_options`](https://hexdocs.pm/ewe/ewe.html#default_http2_options),
+update the fields you care about and hand the result to
+[`ewe.with_http1`](https://hexdocs.pm/ewe/ewe.html#with_http1) or
+[`ewe.with_http2`](https://hexdocs.pm/ewe/ewe.html#with_http2). Sizes are in bytes
+and timeouts in milliseconds.
+
+```gleam
+let http1 =
+  ewe.Http1Options(
+    ..ewe.default_http1_options(),
+    // Refuse a request carrying more than 50 header fields with a 431.
+    max_headers: 50,
+    // Close a connection that sits idle for 30 seconds.
+    idle_timeout: 30_000,
+  )
+
+let http2 =
+  ewe.Http2Options(
+    ..ewe.default_http2_options(),
+    // Cap how many streams a client may have open at once.
+    max_concurrent_streams: Some(100),
+    // Trip a GOAWAY sooner on a client resetting streams in bulk.
+    rapid_reset_threshold: 50,
+  )
+
+ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+|> ewe.with_http1(http1)
+|> ewe.with_http2(http2)
+|> ewe.start
+```
+
+[`ewe.Http1Options`](https://hexdocs.pm/ewe/ewe.html#Http1Options) covers the
+request line, header line and header count caps, the chunk size line cap, the
+idle and body read timeouts and how much of an unread body is drained so the
+connection can be reused:
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| `max_request_line` | `8192` | Longer request lines are refused with a 414. |
+| `max_header_line` | `8192` | Longer header lines are refused with a 431. |
+| `max_headers` | `100` | Requests carrying more header fields are refused with a 431. |
+| `max_chunk_size_line` | `128` | Longest chunk size line in a chunked body. |
+| `idle_timeout` | `10_000` | How long a connection may sit without sending anything. |
+| `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
+| `auto_drain_limit` | `1_048_576` | An unread body larger than this closes the connection instead of being drained. |
+| `auto_drain_chunk_bytes` | `65_536` | How much of that drain is read at a time. |
+
+[`ewe.Http2Options`](https://hexdocs.pm/ewe/ewe.html#Http2Options) covers the same
+ground plus what the protocol adds. A value the protocol does not allow is
+replaced with the default rather than reaching a peer:
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| `max_concurrent_streams` | `None` | How many streams a client may have open at once. |
+| `initial_window_size` | `2_097_152` | How much response body a stream may have in flight. |
+| `max_frame_size` | `16_384` | Largest frame accepted, between 16384 and 16777215. |
+| `max_header_list_size` | `Some(32_768)` | Largest header list accepted. |
+| `header_table_size` | `4096` | HPACK dynamic table kept for decoding. |
+| `max_continuation_frames` | `100` | How many CONTINUATION frames one header sequence may span. |
+| `max_header_block_bytes` | `65_536` | Bytes one header block may total before decoding. |
+| `rapid_reset_window` | `10_000` | Window over which client stream resets are counted. |
+| `rapid_reset_threshold` | `100` | Resets within that window that trip a GOAWAY which is what keeps Rapid Reset (CVE-2023-44487) in check. |
+| `handshake_timeout` | `10_000` | How long a connection may sit in the preface and SETTINGS handshake. |
+| `drain_timeout` | `4000` | How long a draining connection waits for its streams after GOAWAY. |
+| `recv_window_low_water_mark` | `262_144` | Once a receive window falls to this it is topped back up. |
+| `recv_window_high_water_mark` | `2_097_152` | What it is topped up to; a wider gap costs fewer WINDOW_UPDATE round trips. |
+| `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
+| `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
+
+### Running Under Supervision
+
+[`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start) runs the server on its own.
+When it belongs to a supervision tree next to the rest of your program use
+[`ewe.supervised`](https://hexdocs.pm/ewe/ewe.html#supervised) instead, which
+returns a child specification.
+
+```gleam
+supervisor.new(supervisor.OneForAll)
+|> supervisor.add(pubsub.worker(pubsub_name))
+|> supervisor.add(
+  ewe.new(listener_name:, connection_factory_name:, handler:)
+  |> ewe.bind(to: "0.0.0.0")
+  |> ewe.listening(on: 8080)
+  |> ewe.supervised,
+)
+|> supervisor.start
+```
+
+The line printed on startup comes from [`ewe.on_start`](https://hexdocs.pm/ewe/ewe.html#on_start),
+which receives the scheme and the address the server bound to. Replace it to log
+it your own way or silence it with [`ewe.quiet`](https://hexdocs.pm/ewe/ewe.html#quiet).
+
+## Examples
+
+Most sections above link to a runnable example. They live in
+[examples](examples/), see [its README](examples/README.md) for how to run them.
 
 ## API Reference
 
