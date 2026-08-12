@@ -1,7 +1,7 @@
 name = "ewe"
 version = "5.0.0"
 
-description = "🐑 a fluffy Gleam web server"
+description = "🐑 a fluffy HTTP/1 and HTTP/2 web server for Gleam"
 target = "erlang"
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "vshakitskiy", repo = "ewe" }

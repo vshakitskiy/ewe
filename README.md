@@ -2,10 +2,33 @@
 
 # 🐑 ewe
 
-ewe [/juː/] - fluffy package for building web servers.
+ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
 
 [![Package Version](https://img.shields.io/hexpm/v/ewe)](https://hex.pm/packages/ewe)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/ewe/)
+
+## Contents
+
+- [Installation](#installation)
+- [Getting Started](#getting-started)
+- Usage
+  - [HTTPS](#https)
+  - [HTTP/2](#http2)
+  - [Sending a Response](#sending-a-response)
+  - [Reading the Request Body](#reading-the-request-body)
+  - [Streaming Bodies](#streaming-bodies)
+  - [Serving Files](#serving-files)
+  - [Client Address](#client-address)
+  - [WebSocket](#websocket)
+  - [Server-Sent Events](#server-sent-events)
+  - [Connection Limits and Timeouts](#connection-limits-and-timeouts)
+  - [Running Under Supervision](#running-under-supervision)
+  - [Running as an OTP Application](#running-as-an-otp-application)
+- [Examples](#examples)
+- [API Reference](#api-reference)
+
+Most section headings are links, each one opening the runnable example it is
+based on.
 
 ## Installation
 
@@ -108,11 +131,10 @@ negotiated, it is answered as HTTP/1.1.
 ### [Sending a Response](examples/src/sending_response.gleam)
 
 A response body is one of the [`ewe.Body`](https://hexdocs.pm/ewe/ewe.html#Body)
-variants. `Text` and `Bytes` are in-memory bodies, `Empty` is for responses that
-carry nothing and the rest are built by the functions covered further down:
-`File` by [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file), `Streaming` by
-[`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response), `Sse`
-by [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) and `Websocket` by
+variants. `Text`, `Bytes` and `Empty` are built by hand, the rest come from
+[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file),
+[`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response),
+[`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) and
 [`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket).
 
 ```gleam
@@ -238,9 +260,9 @@ fn echo_body(
 ### [Serving Files](examples/src/serving_files.gleam)
 
 [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) prepares a file as a response
-body, streamed from disk rather than read into memory. `offset` and `limit` serve
-a byte range, which is what a range request needs. It takes the connection, so it
-is the request's body you pass in first.
+body so you never read one in yourself. `offset` and `limit` serve a byte range,
+which is what a range request needs. It takes the connection so it is the
+request's body you pass in first.
 
 ```gleam
 case ewe.file(request.body, resolved, offset: None, limit: None) {
@@ -252,10 +274,9 @@ case ewe.file(request.body, resolved, offset: None, limit: None) {
 }
 ```
 
-On HTTP/1 this opens the file and the body holds it open until the response is
-written so put it on a response you go on to return. A body that is built and
-then discarded keeps its file open until it is collected. On HTTP/2 a file at or
-below `file_read_threshold` is read into memory and framed like any other body.
+> [!NOTE]
+> On HTTP/1 `ewe.file` keeps the file open until the response is written, so put
+> it on a response you go on to return.
 
 ### [Client Address](examples/src/client_info.gleam)
 
@@ -308,7 +329,7 @@ fn handle_topic(
   ewe.websocket(
     request: req,
     // Called once. The selector is where you add whatever the rest of your
-    // program sends this connection.
+    // program sends to this connection.
     on_init: fn(_conn, selector) {
       let client = process.new_subject()
       pubsub.subscribe(pubsub, topic:, client:)
@@ -368,9 +389,9 @@ sent after it!
 ### [Server-Sent Events](examples/src/sse.gleam)
 
 [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) turns a response into an SSE
-stream which runs until the handler stops it or the client goes away. `on_init`
+stream which runs until the handler stops it or the client disconnects. `on_init`
 receives the subject the rest of your program pushes messages to, `handler` is
-called for each of those messages and `on_close` runs however the stream ended.
+called for each of those messages and `on_close` runs once the stream ends.
 The `content-type` and `cache-control` headers the stream needs are set by ewe.
 
 ```gleam
@@ -404,7 +425,7 @@ proxy.
 
 ### Connection Limits and Timeouts
 
-Every connection is held to a set of limits and timeouts. Start from
+Every connection is held to a set of limits and timeouts. Start with
 [`ewe.default_http1_options`](https://hexdocs.pm/ewe/ewe.html#default_http1_options)
 or [`ewe.default_http2_options`](https://hexdocs.pm/ewe/ewe.html#default_http2_options),
 update the fields you care about and hand the result to
@@ -437,10 +458,7 @@ ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
 |> ewe.start
 ```
 
-[`ewe.Http1Options`](https://hexdocs.pm/ewe/ewe.html#Http1Options) covers the
-request line, header line and header count caps, the chunk size line cap, the
-idle and body read timeouts and how much of an unread body is drained so the
-connection can be reused:
+[`ewe.Http1Options`](https://hexdocs.pm/ewe/ewe.html#Http1Options):
 
 | Field | Default | What it does |
 | --- | --- | --- |
@@ -453,9 +471,9 @@ connection can be reused:
 | `auto_drain_limit` | `1_048_576` | An unread body larger than this closes the connection instead of being drained. |
 | `auto_drain_chunk_bytes` | `65_536` | How much of that drain is read at a time. |
 
-[`ewe.Http2Options`](https://hexdocs.pm/ewe/ewe.html#Http2Options) covers the same
-ground plus what the protocol adds. A value the protocol does not allow is
-replaced with the default rather than reaching a peer:
+[`ewe.Http2Options`](https://hexdocs.pm/ewe/ewe.html#Http2Options), where a value
+the protocol does not allow is replaced with the default rather than reaching a
+peer:
 
 | Field | Default | What it does |
 | --- | --- | --- |
@@ -497,6 +515,68 @@ supervisor.new(supervisor.OneForAll)
 The line printed on startup comes from [`ewe.on_start`](https://hexdocs.pm/ewe/ewe.html#on_start),
 which receives the scheme and the address the server bound to. Replace it to log
 it your own way or silence it with [`ewe.quiet`](https://hexdocs.pm/ewe/ewe.html#quiet).
+
+### Running as an OTP Application
+
+The examples start the server straight from `main` with a `let assert`, which is
+the shortest thing that works while you are trying ewe out. A service is better
+off letting the [OTP application](https://www.erlang.org/doc/apps/kernel/application.html)
+controller own the supervision tree: it starts before anything else runs, it
+brings the tree down in order on shutdown and it is what a release expects.
+
+Point `application_start_module` at a module exporting `start/2` and `stop/1`:
+
+```toml
+[erlang]
+application_start_module = "my_app"
+```
+
+`start` returns the pid of the top supervisor to the application controller,
+which is the pid it supervises from there on.
+
+```gleam
+import gleam/erlang/atom
+import gleam/erlang/process
+import gleam/otp/actor
+import gleam/otp/static_supervisor as supervisor
+
+/// The Erlang/OTP application start callback. Starts the top supervisor and
+/// hands its pid back to the application controller.
+pub fn start(_type: a, _args: b) -> Result(process.Pid, actor.StartError) {
+  let listener_name = process.new_name("listener_name")
+  let connection_factory_name = process.new_name("connection_factory_name")
+
+  case
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(
+      ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+      |> ewe.bind(to: "0.0.0.0")
+      |> ewe.listening(on: 8080)
+      |> ewe.supervised,
+    )
+    |> supervisor.start
+  {
+    Ok(actor.Started(pid:, ..)) -> Ok(pid)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// The Erlang/OTP application stop callback, called once every process in the
+/// tree is down. Any final clean up goes here.
+pub fn stop(_state: a) -> atom.Atom {
+  atom.create("ok")
+}
+
+/// The application is already running by the time this is called, so all main
+/// has left to do is keep the node alive.
+pub fn main() {
+  process.sleep_forever()
+}
+```
+
+> [!NOTE]
+> `main` still has to sleep. `gleam run` boots the application and then calls it,
+> so without it the node exits as soon as it returns.
 
 ## Examples
 
