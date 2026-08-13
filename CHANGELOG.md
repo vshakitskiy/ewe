@@ -2,52 +2,38 @@
 
 ## Unreleased
 
-- Add support for unix sockets.
-- Add support for in-memory certificate files for the tls.
-- Change some of the function argument lables.
+### Server
+
+- Add support for Unix sockets.
+- Add support for in-memory TLS certificates.
 - Rename `enable_tls` to `with_tls`, which now takes the certificate source as a
   `Tls` value: `Disk`, `Pem` or `Der`.
+- Add `with_client_verification`, which requires clients to present a
+  certificate signed by a given authority and refuses those that do not.
+- Require listener and connection factory names in `new` to prevent atom table
+  exhaustion.
 - Remove `with_name`.
-- Drop the library's own `Request`, `Response` aliases. 
-- `ResponseBody` is now named `Body`.
-- Builder's `new` now requires listener and connection factory names provided in
-  order to prevent possible atom table exhaustion.
+- Remove `on_crash`. A crashing handler now always answers 500.
+- Pass the listener to `get_server_info` as a `process.Subject(listener.Message)`
+  instead of a `process.Name`.
+- Rename the `interface` label of `bind` to `to`, and the `port` label of
+  `listening` to `on`.
+- Drop the argument labels of `ip_address_to_string`, `get_client_info` and
+  `get_server_info`.
+
+### HTTP/1
+
+- Replace `erlang:decode_packet` with ewe's own parser.
 - Add `Http1Options`, `default_http1_options` and `with_http1` to set the limits
   and timeouts for every HTTP/1 connection. The request line, header line and
   header count limits, chunk size line limit, idle and body read timeouts, and
   the auto drain limit and chunk size.
-- In replacement of the `idle_timeout` builder function there is now the
-  `idle_timeout` field of `Http1Options`.
-- Switch from `erlang:decode_packet` to self implemented parsing solution.
-- Responses are now framed by the server, which computes `content-length` or
-  `transfer-encoding: chunked` for a streamed body and drops the handler's own
-  `content-length`, `transfer-encoding` and `date` headers.
-- In replacement of `stream_body` there is now `read_body_chunk`, no consumer
-  api anymore.
-- Request loop no longer ignore request's body on the socket if it was not 
-  consumed inside user's handler. We now flush remaining body bytes allowing 
-  correct reuse of the socket for the next request. If the size of the bytes is 
-  more than 1mb, we close the connection instead. That limit is the
-  `auto_drain_limit` of `Http1Options`.
-- In replacement of `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop`
-  there is now `stream_response`/`send_chunk`/`finish_chunk`/`finish_response` 
-  and no init/loop callback for response streaming anymore.
-- Response streaming, server-sent events and websockets no longer spawn a
-  process per response, they run in the connection process itself.
-- In replacement of the `glisten` socket reason the send functions used to fail
-  with there is now `SendError`.
-- Rename `SSEConnection`, `SSEEvent` and `SSENext` to `SseConnection`,
-  `SseEvent` and `SseNext`.
-- Add `comment` for the server-sent events comment that keeps an idle stream
-  from being closed by an intermediary.
-- Rename `upgrade_websocket` to `websocket` matching `sse`.
-- Rename the `WebsocketMessage` variants to `TextFrame`, `BinaryFrame` and
-  `UserMessage`.
-- In replacement of the `CloseCode` variants that each carried their own data
-  there is now `CloseReason`, either `NoCloseReason` or a code and a description 
-  which `send_close_frame` takes.
-- Add HTTP/2 support!!!! WebSockets need extended CONNECT over HTTP/2 which ewe 
-  does not negotiate yet, so for now any `websocket` answers 501 on an HTTP/2 
+- Move `idle_timeout` from a builder function to a field of `Http1Options`.
+
+### HTTP/2
+
+- Add HTTP/2 support! WebSockets need extended CONNECT over HTTP/2 which ewe
+  does not negotiate yet, so for now any `websocket` answers 501 on an HTTP/2
   connection.
 - Add `Http2Options`, `default_http2_options` and `with_http2` to set the limits
   and timeouts for every HTTP/2 connection. Concurrent streams, window sizes and
@@ -55,8 +41,46 @@
   CONTINUATION and header block caps, the Rapid Reset window and threshold, the
   handshake, drain and body read timeouts, and the file read threshold. A value
   the protocol does not allow is replaced with the default.
-- Add `with_client_verification` which requires clients to present a certificate 
-  signed by a given authority and refuses those that do not.
+
+### Requests and responses
+
+- Remove the `Request` and `Response` aliases.
+- Rename `ResponseBody` to `Body`.
+- Rename the `bytes_limit` label of `read_body` to `limit`.
+- Take the `Connection` as the first argument of `file`.
+- Replace `stream_body` with `read_body_chunk`. No consumer API anymore.
+- Flush any request body the handler did not read, so the socket can be reused
+  for the next request. Past the `auto_drain_limit` of `Http1Options`, 1 MB by
+  default, the connection is closed instead.
+- Frame responses on the server: ewe computes `content-length` or
+  `transfer-encoding: chunked` for a streamed body and drops the handler's own
+  `content-length`, `transfer-encoding` and `date` headers.
+- Replace `chunked_body`/`send_chunk`/`chunked_continue`/`chunked_stop` with
+  `stream_response`/`send_chunk`/`finish_chunk`/`finish_response`. No init/loop
+  callback for response streaming anymore.
+- Run response streaming, server-sent events and WebSockets in the connection
+  process instead of spawning a process per response.
+- Send functions now fail with `SendError` instead of a raw `glisten` socket
+  reason: `ConnectionClosed`, `StreamReset`, `SendTimedOut`, or a `SocketError`
+  carrying a `SocketReason`. A reason ewe does not classify comes back as
+  `UnknownReason` and is logged. `send_error_to_string` and
+  `socket_reason_to_string` describe either of them.
+
+### Server-Sent Events
+
+- Rename `SSEConnection`, `SSEEvent` and `SSENext` to `SseConnection`,
+  `SseEvent` and `SseNext`.
+- Add `comment` for sending an SSE comment, which keeps an idle stream from
+  being closed by an intermediary.
+
+### WebSocket
+
+- Rename `upgrade_websocket` to `websocket`, matching `sse`.
+- Rename the `WebsocketMessage` variants to `TextFrame`, `BinaryFrame` and
+  `UserMessage`.
+- Replace the `CloseCode` variants that each carried their own data with
+  `CloseReason`, either `NoCloseReason` or a code and a description, which
+  `send_close_frame` takes.
 
 ## v4.0.1 - 04.06.2026
 

@@ -84,6 +84,13 @@
 ////       "sse_stop",
 ////       "sse_stop_abnormal"
 ////     ]
+////   },
+////   {
+////     header: "Errors",
+////     functions: [
+////       "send_error_to_string",
+////       "socket_reason_to_string"
+////     ]
 ////   }
 //// ]
 ////
@@ -176,24 +183,67 @@ import glisten/transport
 import logging
 import websocks
 
+/// The connection a request arrived on.
+///
+/// This is the body of the request given to your handler. Pass it to `read_body` 
+/// or `read_body_chunk` to read the request body, or to `file` to send a file 
+/// back.
 pub type Connection =
   connection.Connection
 
+/// The body of a HTTP response to be sent to the client.
+///
+/// The `Streaming`, `Sse` and `Websocket` variants are created by the functions 
+/// rather than directly.
 pub type Body {
+  /// A body of binary data stored as a `BytesTree`.
+  ///
+  /// If you have a `BitArray` you can use the `bytes_tree.from_bit_array`
+  /// function to convert it.
   Bytes(bytes_tree.BytesTree)
+  /// A body of unicode text sent as UTF-8.
   Text(String)
+  /// No body. The response is sent with a `content-length` of 0.
   Empty
+  /// A body of the contents of a file created with the `file` function.
+  ///
+  /// Large files are safe to send this way as they are never held in memory
+  /// whole. See `file` for how each protocol sends them.
   File(connection.File)
+  /// A body written a chunk at a time created with the `stream_response` 
+  /// function.
   Streaming(connection.Streaming)
+  /// A Server-Sent Events stream created with the `sse` function.
   Sse(connection.Sse)
+  /// A WebSocket created with the `websocket` function.
+  ///
+  /// The connection stops being HTTP once the handshake has been sent so it
+  /// will never carry another request.
   Websocket(connection.Websocket)
 }
 
+/// An IP address.
 pub type IpAddress {
+  /// An IPv4 address, represented as its four bytes. `127.0.0.1` is 
+  /// `IpV4(127, 0, 0, 1)`.
   IpV4(Int, Int, Int, Int)
+  /// An IPv6 address, represented as its eight groups. `::1` is
+  /// `IpV6(0, 0, 0, 0, 0, 0, 0, 1)`.
   IpV6(Int, Int, Int, Int, Int, Int, Int, Int)
 }
 
+/// Convert an IP address to the string form. IPv6 addresses are written in 
+/// lowercase, with the longest run of zero groups collapsed to `::`.
+///
+/// # Examples
+///
+/// ```gleam
+/// ip_address_to_string(IpV4(127, 0, 0, 1))
+/// // -> "127.0.0.1"
+///
+/// ip_address_to_string(IpV6(0, 0, 0, 0, 0, 0, 0, 1))
+/// // -> "::1"
+/// ```
 pub fn ip_address_to_string(address: IpAddress) -> String {
   to_internal_ip_address(address)
   |> glisten.ip_address_to_string
@@ -220,9 +270,11 @@ fn from_internal_ip_address(address: glisten.IpAddress) -> IpAddress {
   }
 }
 
-/// The address a socket is bound to, or the address of a connected peer.
+/// The address a socket is bound to or the address of a connected peer.
 pub type SocketAddress {
+  /// An address and port on a TCP socket.
   TcpSocketAddress(ip_address: IpAddress, port: Int)
+  /// The path of a Unix domain socket.
   UnixSocketAddress(path: String)
 }
 
@@ -235,10 +287,12 @@ fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
   }
 }
 
-/// Retrieves the client's socket address from the connection. Returns error if
-/// the socket information is unavailable.
+/// Get the address of the client at the other end of the connection.
+///
+/// Returns an error if the address could not be looked up such as when the
+/// connection has already closed.
 pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
-  // An HTTP/2 handler runs in a process that has no access to the socket, so the
+  // An HTTP/2 handler runs in a process that has no access to the socket so the
   // address is resolved once for the connection and carried on every stream.
   let peername = case connection {
     connection.Http1(connection) ->
@@ -256,8 +310,19 @@ pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
   }
 }
 
-/// Gets the server's bound address and port. Requires the server to be running.
-/// Pass the subject named with `listener_name` given to `new`.
+/// Get the address the server is listening on. This is how you find the port
+/// picked by `listening_random`.
+///
+/// The server must be running. Pass the subject of the `listener_name` given
+/// to `new`.
+///
+/// # Examples
+///
+/// ```gleam
+/// process.named_subject(listener_name)
+/// |> ewe.get_server_info
+/// // -> TcpSocketAddress(IpV4(127, 0, 0, 1), 3000)
+/// ```
 pub fn get_server_info(
   listener: process.Subject(listener.Message),
 ) -> SocketAddress {
@@ -270,7 +335,7 @@ type BindTarget {
   UnixBind(path: String)
 }
 
-/// Where the TLS certificate and key given to `with_tls` come from.
+/// The source of the TLS certificate and key given to `with_tls`.
 pub type Tls {
   /// Paths to PEM-encoded certificate and key files on disk.
   Disk(cert: String, key: String)
@@ -280,8 +345,7 @@ pub type Tls {
   Der(cert: BitArray, key: BitArray, key_type: TlsKeyType)
 }
 
-/// The private key encoding type, required when providing a DER-encoded
-/// certificate and key via `Der`.
+/// The type of a DER-encoded private key needed by the `Der` variant of `Tls`.
 pub type TlsKeyType {
   /// Traditional RSA key.
   RsaPrivateKey
@@ -302,40 +366,45 @@ fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
   }
 }
 
-/// The limits and timeouts for every HTTP/1 connection. Build one by updating
-/// `default_http1_options`:
+/// The limits and timeouts applied to every HTTP/1 connection.
+///
+/// Sizes are in bytes and timeouts in milliseconds. Build one by updating
+/// `default_http1_options` so you only state the ones you care about.
+///
+/// # Examples
 ///
 /// ```gleam
 /// Http1Options(..ewe.default_http1_options(), max_headers: 50)
 /// ```
-///
-/// Sizes are in bytes and timeouts in milliseconds.
 pub type Http1Options {
   Http1Options(
-    /// Longest request line accepted beyond which the request is refused with a 
-    /// 414.
+    /// The longest request line accepted. A longer one is refused with status
+    /// code 414: URI Too Long.
     max_request_line: Int,
-    /// Longest single header line accepted beyond which the request is refused 
-    /// with a 431.
+    /// The longest single header line accepted. A longer one is refused with
+    /// status code 431: Request Header Fields Too Large.
     max_header_line: Int,
-    /// How many header fields a request may carry beyond which it is refused
-    /// with a 431.
+    /// The most header fields a request may carry. More than this is refused
+    /// with status code 431: Request Header Fields Too Large.
     max_headers: Int,
-    /// Longest chunk size line accepted in a chunked body.
+    /// The longest chunk size line accepted in a chunked body. A longer one is
+    /// refused with status code 413: Content Too Large.
     max_chunk_size_line: Int,
     /// How long a connection may sit without sending anything before it is
     /// closed.
     idle_timeout: Int,
     /// How long a single read of a request body waits for the client.
     body_read_timeout: Int,
-    /// How much of a body the handler never read is drained so the connection
-    /// can be reused. A body larger than this closes the connection instead.
+    /// How much of a body the handler never read is drained so that the
+    /// connection can be reused. A larger body closes the connection instead.
     auto_drain_limit: Int,
     /// How much of that drain is read at a time.
     auto_drain_chunk_bytes: Int,
   )
 }
 
+/// Get the default HTTP/1 limits and timeouts to be adjusted and given to
+/// `with_http1`.
 pub fn default_http1_options() -> Http1Options {
   let http1.Config(
     max_request_line:,
@@ -386,18 +455,21 @@ fn to_internal_http1_options(options: Http1Options) -> http1.Config {
 
 const max_window_size = 2_147_483_647
 
-/// The limits and timeouts for every HTTP/2 connection. Build one by updating
-/// `default_http2_options`:
+/// The limits and timeouts applied to every HTTP/2 connection.
+///
+/// Sizes are in bytes and timeouts in milliseconds. Build one by updating
+/// `default_http2_options` so you only state the ones you care about. A value
+/// the protocol does not allow is replaced with the default rather than being
+/// sent to a peer.
+///
+/// # Examples
 ///
 /// ```gleam
 /// Http2Options(..ewe.default_http2_options(), max_concurrent_streams: Some(100))
 /// ```
-///
-/// Sizes are in bytes and timeouts in milliseconds. A value the protocol does
-/// not allow is replaced with the default.
 pub type Http2Options {
   Http2Options(
-    /// How many streams a client may have open at once. `None` leaves it
+    /// The most streams a client may have open at once. `None` leaves it
     /// unlimited.
     max_concurrent_streams: Option(Int),
     /// How much response body a stream may have in flight before the client
@@ -409,15 +481,15 @@ pub type Http2Options {
     max_header_list_size: Option(Int),
     /// How much HPACK dynamic table the server keeps for decoding.
     header_table_size: Int,
-    /// How many CONTINUATION frames one header sequence may span.
+    /// The most CONTINUATION frames one header sequence may span.
     max_continuation_frames: Int,
-    /// How many bytes of HEADERS and CONTINUATION one header block may total,
+    /// The most bytes of HEADERS and CONTINUATION one header block may total,
     /// counted before it is decoded.
     max_header_block_bytes: Int,
     /// The window over which client stream resets are counted.
     rapid_reset_window: Int,
-    /// How many resets within that window trip a GOAWAY which is what keeps
-    /// Rapid Reset (CVE-2023-44487) from costing more than it should.
+    /// How many resets within that window trip a GOAWAY which is what stops
+    /// Rapid Reset (CVE-2023-44487) costing more than it should.
     rapid_reset_threshold: Int,
     /// How long a connection may sit in the preface and SETTINGS handshake
     /// before it is dropped.
@@ -431,7 +503,7 @@ pub type Http2Options {
     /// What a receive window is topped up to. The wider the gap from the low
     /// mark the fewer WINDOW_UPDATE round trips a large body costs.
     recv_window_high_water_mark: Int,
-    /// Files at or below this size are read into memory and framed like any 
+    /// Files at or below this size are read into memory and framed like any
     /// other body. Larger ones are streamed from disk instead.
     file_read_threshold: Int,
     /// How long a single read of a request body waits for the client.
@@ -439,6 +511,8 @@ pub type Http2Options {
   )
 }
 
+/// Get the default HTTP/2 limits and timeouts to be adjusted and given to
+/// `with_http2`.
 pub fn default_http2_options() -> Http2Options {
   let http2.Config(
     max_concurrent_streams:,
@@ -477,7 +551,7 @@ pub fn default_http2_options() -> Http2Options {
   )
 }
 
-/// Anything the protocol rules out would break connections so it is dropped 
+/// Anything the protocol rules out would break connections so it is dropped
 /// for the default here instead of reaching a peer.
 fn to_internal_http2_options(options: Http2Options) -> http2.Config {
   let defaults = http2.default_config()
@@ -507,7 +581,7 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Config {
     threshold -> threshold
   }
 
-  // The marks only mean anything as a pair, so a bad one replaces both.
+  // The marks only mean anything as a pair so a bad one replaces both.
   let #(recv_window_low_water_mark, recv_window_high_water_mark) = case
     options.recv_window_low_water_mark,
     options.recv_window_high_water_mark
@@ -538,7 +612,8 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Config {
   )
 }
 
-/// Which certificate authority a client's certificate has to be signed by.
+/// The certificate authority a client's certificate has to be signed by, given
+/// to `with_client_verification`.
 pub type ClientVerification {
   /// Path to a PEM file holding the CA certificate.
   CaCertFile(path: String)
@@ -555,8 +630,10 @@ fn to_internal_client_verification(
   }
 }
 
-/// Contains all server configurations, can be adjusted by different builder
-/// functions.
+/// The configuration of a server.
+///
+/// Create one with `new`, adjust it with the builder functions, then give it to
+/// `start` or `supervised`.
 pub opaque type Builder {
   Builder(
     handler: fn(request.Request(Connection)) -> response.Response(Body),
@@ -576,10 +653,32 @@ pub opaque type Builder {
   )
 }
 
-/// Creates a new server configuration with handler and names provided. 
-/// `listener_name` and `connection_factory_name` are process names used for the
-/// acceptor pool to wire together listener and connection factory. Create them 
-/// once, at the point your program starts, and pass them in here.  
+/// Create a new server configuration. The handler is called for every request
+/// and the response it returns is sent to the client.
+///
+/// The two names are used by the acceptor pool to wire its listener and its
+/// connection factory together. Create them once where your program starts
+/// and pass them in here.
+///
+/// The server listens on 127.0.0.1:3000 and prints its address once started.
+/// Use `bind`, `listening` and `on_start` to change that.
+///
+/// # Examples
+///
+/// ```gleam
+/// pub fn main() {
+///   let listener_name = process.new_name("listener_name")
+///   let connection_factory_name = process.new_name("connection_factory_name")
+///
+///   let assert Ok(_) =
+///     ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+///     |> ewe.bind(to: "0.0.0.0")
+///     |> ewe.listening(on: 8080)
+///     |> ewe.start
+///
+///   process.sleep_forever()
+/// }
+/// ```
 pub fn new(
   listener_name listener_name: process.Name(listener.Message),
   connection_factory_name connection_factory_name: process.Name(
@@ -622,9 +721,17 @@ pub fn new(
   )
 }
 
-/// Binds server to a specific network interface; e.g., "0.0.0.0" for all IPv4
-/// interfaces, "127.0.0.1" for localhost, "::" for all IPv6 interfaces, or
-/// "::1" for IPv6 loopback. Crashes the program if the interface is invalid.
+/// Set the network interface the server listens on. `"127.0.0.1"` and
+/// `"localhost"` are the loopback, `"0.0.0.0"` is every IPv4 interface, `"::1"`
+/// is the IPv6 loopback, and `"::"` is every IPv6 interface.
+///
+/// A server listens on either a network interface or a Unix socket so this
+/// undoes a previous call to `unix`.
+///
+/// # Panics
+///
+/// Starting the server will panic if the interface is not `"localhost"` or a
+/// valid IPv4 or IPv6 address.
 pub fn bind(builder: Builder, to interface: String) -> Builder {
   let bind_target = case builder.bind_target {
     TcpBind(port:, ipv6:, ..) -> TcpBind(interface:, port:, ipv6:)
@@ -634,7 +741,10 @@ pub fn bind(builder: Builder, to interface: String) -> Builder {
   Builder(..builder, bind_target:)
 }
 
-/// Sets the listening port for server.
+/// Set the port the server listens on.
+///
+/// A server listens on either a network interface or a Unix socket so this
+/// undoes a previous call to `unix`.
 pub fn listening(builder: Builder, on port: Int) -> Builder {
   let bind_target = case builder.bind_target {
     TcpBind(interface:, ipv6:, ..) -> TcpBind(interface:, port:, ipv6:)
@@ -643,16 +753,21 @@ pub fn listening(builder: Builder, on port: Int) -> Builder {
   Builder(..builder, bind_target:)
 }
 
-/// Sets the listening port to 0, which causes the OS to assign a random
-/// available port.
+/// Listen on port 0, which asks the operating system for any free port. This
+/// is useful in tests where a fixed port would clash.
+///
+/// Use `get_server_info` once the server is running to find the port it was
+/// given.
 pub fn listening_random(builder: Builder) -> Builder {
   listening(builder, on: 0)
 }
 
-/// Forces the underlying socket to use IPv6. On IPv4 provided in `ewe.bind` or
-/// if the system does not support IPv6, the server crashes. The exceptions are
-/// `localhost`, `127.0.0.1` or `0.0.0.0`, they are automatically bound to work
-/// with either address family.
+/// Serve over IPv6.
+///
+/// `bind` must have been given an IPv6 address, or one of `"localhost"`,
+/// `"127.0.0.1"` and `"0.0.0.0"`, which are bound so that they work over either
+/// address family. The server crashes on start with any other IPv4 address and
+/// with any address at all if the system has no IPv6 support.
 pub fn force_ipv6(builder: Builder) -> Builder {
   let bind_target = case builder.bind_target {
     TcpBind(interface:, port:, ..) -> TcpBind(interface:, port:, ipv6: True)
@@ -662,13 +777,20 @@ pub fn force_ipv6(builder: Builder) -> Builder {
   Builder(..builder, bind_target:)
 }
 
-/// Binds server to a unix domain socket at `path` instead of TCP. Overrides
-/// any interface, port and ipv6 settings previously configured.
+/// Listen on a Unix domain socket at the given path instead of on TCP.
+///
+/// A server listens on either a network interface or a Unix socket so this
+/// discards any interface, port and IPv6 setting made before it.
 pub fn unix(builder: Builder, path: String) -> Builder {
   Builder(..builder, bind_target: UnixBind(path))
 }
 
-/// Enables TLS with the given certificate and key.
+/// Serve over TLS with the given certificate and key.
+///
+/// This is also what offers HTTP/2 to clients through ALPN. Without TLS a
+/// client only gets HTTP/2 by opening the connection with the h2c preface.
+///
+/// # Examples
 ///
 /// ```gleam
 /// ewe.with_tls(builder, ewe.Disk("cert.pem", "key.pem"))
@@ -679,8 +801,10 @@ pub fn with_tls(builder: Builder, tls: Tls) -> Builder {
   Builder(..builder, tls: Some(tls))
 }
 
-/// Sets a callback function called after the server starts. Receives the scheme
-/// and server's socket address.
+/// Set the function to run once the server is listening. It is given the
+/// scheme and the address the server ended up on.
+///
+/// By default this prints the address. Use `quiet` to say nothing instead.
 pub fn on_start(
   builder: Builder,
   on_start: fn(http.Scheme, SocketAddress) -> Nil,
@@ -688,23 +812,26 @@ pub fn on_start(
   Builder(..builder, on_start:)
 }
 
-/// Sets an empty `on_start` function.
+/// Print nothing when the server starts by replacing the default `on_start`
+/// function with one that does nothing.
 pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
 
-/// Replaces the limits and timeouts applied to HTTP/1 connections.
+/// Set the limits and timeouts applied to every HTTP/1 connection.
 pub fn with_http1(builder: Builder, options: Http1Options) -> Builder {
   Builder(..builder, http1: options)
 }
 
-/// Replaces the limits and timeouts applied to HTTP/2 connections.
+/// Set the limits and timeouts applied to every HTTP/2 connection.
 pub fn with_http2(builder: Builder, options: Http2Options) -> Builder {
   Builder(..builder, http2: options)
 }
 
-/// Requires clients to present a certificate signed by the given authority,
-/// refusing those that do not. Needs TLS which `with_tls` configures.
+/// Require clients to present a certificate signed by the given authority.
+/// Clients that do not are refused.
+///
+/// This needs TLS which `with_tls` sets up.
 pub fn with_client_verification(
   builder: Builder,
   ca_cert: ClientVerification,
@@ -724,7 +851,10 @@ fn to_internal_body(body: Body) -> connection.Body {
   }
 }
 
-/// Starts the server with the provided configuration.
+/// Start the server, running the `on_start` function once it is listening.
+///
+/// The supervisor returned holds the acceptor pool. To put the server under a
+/// supervision tree use `supervised` instead.
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
@@ -802,7 +932,8 @@ pub fn start(
   started
 }
 
-/// Returns a child specification for use in a supervision tree.
+/// Create a child specification for the server so that it can be added to a
+/// supervision tree.
 pub fn supervised(
   builder: Builder,
 ) -> supervision.ChildSpecification(supervisor.Supervisor) {
@@ -810,12 +941,19 @@ pub fn supervised(
   |> supervision.supervisor
 }
 
+/// The reason a file could not be prepared by the `file` function.
 pub type FileError {
+  /// There is nothing at the given path.
   NotFound
+  /// The path is a directory.
   IsDirectory
+  /// The server is not permitted to read the file.
   AccessDenied
+  /// The file could not be opened or measured for a reason ewe does not name.
   UnknownError
+  /// The offset is negative or past the end of the file.
   InvalidOffset
+  /// The limit is negative.
   InvalidLimit
 }
 
@@ -830,13 +968,32 @@ fn from_internal_file_error(error: file.FileError) -> FileError {
   }
 }
 
-/// Prepares a file to be streamed as a response body. `offset` and `limit` in
-/// bytes let you serve a byte range from the file. leave either as `None` to
-/// serve from the start or through the end.
+/// Create a response body from a file on the disc. Large files are safe to
+/// send this way as they are never held in memory whole.
 ///
-/// On HTTP/1 this opens the file, and the returned body holds it open until the
-/// response is written. Put it on a response you go on to return. A body that
-/// is built and then discarded keeps its file open until it is collected.
+/// The offset and limit are in bytes and serve a range of the file. Leave
+/// either as `None` to start at the beginning or to run to the end.
+///
+/// How the file reaches the client depends on the protocol. HTTP/1 lets the 
+/// kernel copy it straight to the socket and falls back to reading it in 64kb 
+/// pieces when TLS is in the way. HTTP/2 reads a file at or below the 
+/// `file_read_threshold` of `Http2Options` into memory and frames it like any 
+/// other body, and streams anything larger from the disc.
+///
+/// On HTTP/1 the file is opened here and stays open until the response has been
+/// written so only create a body you go on to return. One that is created and
+/// then thrown away holds its file open until it is garbage collected.
+///
+/// # Examples
+///
+/// ```gleam
+/// let assert Ok(body) =
+///   ewe.file(request.body, "/tmp/report.pdf", offset: None, limit: None)
+///
+/// response.new(200)
+/// |> response.set_header("content-type", "application/pdf")
+/// |> response.set_body(body)
+/// ```
 pub fn file(
   connection: Connection,
   path: String,
@@ -849,11 +1006,12 @@ pub fn file(
   }
 }
 
+/// The reason a request body could not be read.
 pub type BodyError {
-  /// The declared body is bigger than the `limit` passed to `read_body`.
+  /// The body is larger than the limit that was given.
   BodyTooLarge
-  /// The body couldn't be fully read: the connection dropped, timed out, or
-  /// the chunked framing was malformed.
+  /// The body could not be read to the end. The connection dropped, the read
+  /// timed out or the chunked framing was malformed.
   InvalidBody
 }
 
@@ -864,9 +1022,21 @@ fn from_internal_http1_body_error(error: http1_body.BodyError) -> BodyError {
   }
 }
 
-/// Reads the entire request body into memory, up to `limit` bytes. For a 
-/// chunked request, any trailer fields are appended to the returned request's 
-/// `headers`.
+/// Read the entire request body into memory up to the given limit in bytes.
+///
+/// Any trailer fields a chunked request ends with are appended to the returned
+/// request's headers.
+///
+/// Use `read_body_chunk` instead if the body may be too large to hold in memory.
+///
+/// # Examples
+///
+/// ```gleam
+/// case ewe.read_body(request, limit: 1_048_576) {
+///   Ok(request) -> handle(request.body)
+///   Error(_body_error) -> response.new(400) |> response.set_body(ewe.Empty)
+/// }
+/// ```
 pub fn read_body(
   req: request.Request(Connection),
   limit limit: Int,
@@ -900,18 +1070,36 @@ fn from_internal_http2_body_error(error: http2_body.BodyError) -> BodyError {
   }
 }
 
-/// The result of one `read_body_chunk` call.
+/// The result of a single call to `read_body_chunk`.
 pub type ReadEvent {
-  /// Up to `max_chunk_bytes` of body data. Feed `request` into the next call.
+  /// A piece of the body along with the request to pass to the next call.
   Chunk(data: BitArray, request: request.Request(Connection))
-  /// The body is fully consumed. Any chunked trailer fields have been appended 
-  /// to the returned request's `headers`.
+  /// The body has been read to the end.
+  ///
+  /// Any trailer fields are appended to the request's headers and the request
+  /// no longer carries a connection as there is nothing left to read from it.
   Done(request: request.Request(Nil))
 }
 
-/// Pulls up to `max_chunk_bytes` of body per call instead of buffering the
-/// whole body, capped overall at `limit`. Feed the request carried by `Chunk` 
-/// into the next call.
+/// Read the request body a chunk at a time rather than holding all of it in
+/// memory taking up to `max_chunk_bytes` per call and refusing a body larger
+/// than `limit` bytes in total.
+///
+/// Each `Chunk` carries the request to use for the next call. Keep going until
+/// you get `Done`.
+///
+/// # Examples
+///
+/// ```gleam
+/// fn count(request: request.Request(ewe.Connection), total: Int) -> Int {
+///   case ewe.read_body_chunk(request, max_chunk_bytes: 4096, limit: 10_000_000) {
+///     Ok(ewe.Chunk(data:, request:)) ->
+///       count(request, total + bit_array.byte_size(data))
+///     Ok(ewe.Done(_request)) -> total
+///     Error(_body_error) -> total
+///   }
+/// }
+/// ```
 pub fn read_body_chunk(
   req: request.Request(Connection),
   max_chunk_bytes max_chunk_bytes: Int,
@@ -947,17 +1135,90 @@ pub fn read_body_chunk(
   }
 }
 
-// TODO: remove String reason
-/// Why a write to the client did not go through.
+/// The reason a write to the client did not go through.
 pub type SendError {
   /// The client is gone so nothing further can be written.
   ConnectionClosed
   /// The client cancelled this HTTP/2 stream while the rest of the connection
-  /// carries on. Never returned on HTTP/1.
+  /// carries on.
   StreamReset
-  /// The write failed for a reason the socket reported that does not amount to
-  /// the client having gone.
-  SocketError(reason: String)
+  /// The client stopped reading for long enough that the write gave up which
+  /// takes the connection with it.
+  SendTimedOut
+  /// The socket refused the write for a reason of its own.
+  SocketError(reason: SocketReason)
+}
+
+/// What the socket said when it refused a write, carried by the `SocketError`
+/// variant of `SendError`.
+pub type SocketReason {
+  /// The kernel has no socket buffer space or memory left to take the write.
+  OutOfBuffers
+  /// The node is at its file descriptor limit or the whole host is.
+  TooManyOpenFiles
+  /// The interface the connection runs over is down.
+  NetworkDown
+  /// There is no route to the client's network.
+  NetworkUnreachable
+  /// The client's network is reachable but the client's host is not.
+  HostUnreachable
+  /// The write is larger than the socket will send in one piece.
+  MessageTooLarge
+  /// The socket refused the write on permission grounds.
+  PermissionDenied
+  /// The write would have blocked and the socket is not willing to.
+  WouldBlock
+  /// A signal arrived mid write. Nothing was sent.
+  Interrupted
+  /// The socket does not support the write as it was made.
+  NotSupported
+  /// The write failed below the socket in the network stack or the device.
+  IoError
+  /// The socket reported something ewe does not classify.
+  UnknownReason
+}
+
+/// Describe a `SendError` in a form that reads inside a log line.
+///
+/// # Examples
+///
+/// ```gleam
+/// send_error_to_string(ConnectionClosed)
+/// // -> "the client is gone"
+/// ```
+pub fn send_error_to_string(error: SendError) -> String {
+  case error {
+    ConnectionClosed -> "the client is gone"
+    StreamReset -> "the client cancelled the stream"
+    SendTimedOut -> "the client stopped reading and the write gave up"
+    SocketError(reason:) ->
+      "the socket refused the write, " <> socket_reason_to_string(reason)
+  }
+}
+
+/// Describe a `SocketReason` in a form that reads inside a log line.
+///
+/// # Examples
+///
+/// ```gleam
+/// socket_reason_to_string(NetworkDown)
+/// // -> "the network is down"
+/// ```
+pub fn socket_reason_to_string(reason: SocketReason) -> String {
+  case reason {
+    OutOfBuffers -> "no socket buffer space or memory is left"
+    TooManyOpenFiles -> "the file descriptor limit is reached"
+    NetworkDown -> "the network is down"
+    NetworkUnreachable -> "the client's network is unreachable"
+    HostUnreachable -> "the client's host is unreachable"
+    MessageTooLarge -> "the write is too large to send in one piece"
+    PermissionDenied -> "permission was denied"
+    WouldBlock -> "the write would have blocked"
+    Interrupted -> "a signal arrived mid write"
+    NotSupported -> "the socket does not support the write"
+    IoError -> "the network stack or the device failed"
+    UnknownReason -> "for a reason ewe does not classify"
+  }
 }
 
 fn from_interrupted(interrupted: http2.Interrupted) -> SendError {
@@ -975,23 +1236,57 @@ fn to_send_error(reason: socket.SocketReason) -> SendError {
     | socket.Econnaborted
     | socket.Econnreset
     | socket.Enotconn
-    | socket.Epipe -> ConnectionClosed
-    reason -> SocketError(socket.reason_to_string(reason))
+    | socket.Epipe
+    | socket.Etimedout
+    | socket.Einval
+    | socket.Ebadf
+    | socket.Terminated -> ConnectionClosed
+    socket.Timeout -> SendTimedOut
+    socket.Enobufs | socket.Enomem -> SocketError(OutOfBuffers)
+    socket.Emfile | socket.Enfile -> SocketError(TooManyOpenFiles)
+    socket.Enetdown -> SocketError(NetworkDown)
+    socket.Enetunreach -> SocketError(NetworkUnreachable)
+    socket.Ehostunreach | socket.Ehostdown -> SocketError(HostUnreachable)
+    socket.Emsgsize -> SocketError(MessageTooLarge)
+    socket.Eacces | socket.Eperm -> SocketError(PermissionDenied)
+    socket.Eagain | socket.Ewouldblock -> SocketError(WouldBlock)
+    socket.Eintr -> SocketError(Interrupted)
+    socket.Enotsup | socket.Eopnotsupp -> SocketError(NotSupported)
+    socket.Eio -> SocketError(IoError)
+    reason -> {
+      logging.log(
+        logging.Warning,
+        "The socket refused a write: " <> socket.reason_to_string(reason),
+      )
+
+      SocketError(UnknownReason)
+    }
   }
 }
 
-/// A handle for writing a streamed response's body, obtained from
-/// `stream_response`.
+/// A handle for writing the body of a streamed response, given to the handler
+/// by `stream_response`.
 pub type ResponseWriter =
   connection.ResponseWriter
 
-/// Starts a streamed response. `handler` must end by calling `finish_chunk` or
-/// `finish_response` on it, since that's what closes the stream.
+/// Set the body of a response to one written a chunk at a time so that each
+/// chunk reaches the client as it is produced.
 ///
-/// A send to a client that has gone ends the handler there and then, rather
-/// than letting it carry on producing a body with nowhere to go. Nothing after
-/// that send runs, so hold anything that needs releasing in a way that survives
-/// on the process ending rather than in code after the write.
+/// The handler is given a writer to send through and must finish the body with
+/// `finish_chunk` or `finish_response`. A handler that returns without calling
+/// either still has its body closed off but the connection is dropped instead
+/// of being reused for the next request.
+///
+/// # Examples
+///
+/// ```gleam
+/// response.new(200)
+/// |> response.set_header("content-type", "text/plain")
+/// |> ewe.stream_response(fn(writer) {
+///   use writer <- result.try(ewe.send_chunk(writer, <<"Hello, ":utf8>>))
+///   ewe.finish_chunk(writer, <<"Joe!":utf8>>)
+/// })
+/// ```
 pub fn stream_response(
   response: response.Response(a),
   handler: fn(ResponseWriter) -> Result(Nil, SendError),
@@ -1006,9 +1301,11 @@ pub fn stream_response(
   response.set_body(response, Streaming(connection.StreamingMetadata(stream)))
 }
 
-/// Sends one response body chunk, threading the writer through so it can be
-/// piped. For the last chunk use `finish_chunk` instead, it closes the
-/// stream in the same round trip.
+/// Send one chunk of a streamed response body. The writer is handed back so
+/// that it can be threaded into the next call.
+///
+/// For the last chunk use `finish_chunk` instead, which closes the body off in
+/// the same write.
 pub fn send_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
@@ -1025,7 +1322,7 @@ pub fn send_chunk(
   }
 }
 
-/// Sends `chunk` as the final response body chunk and closes the stream.
+/// Send the last chunk of a streamed response body and close the body off.
 pub fn finish_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
@@ -1039,8 +1336,8 @@ pub fn finish_chunk(
   }
 }
 
-/// Closes the stream with no further data. Use `finish_chunk` instead if
-/// there's one last chunk to send.
+/// Close off a streamed response body without sending any more data. Use
+/// `finish_chunk` instead if there is one last chunk to send.
 pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   case writer {
     connection.Http1Writer(writer) ->
@@ -1050,67 +1347,84 @@ pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   }
 }
 
-/// A handle for writing to an open Server-Sent Events stream.
+/// A handle for sending on an open Server-Sent Events stream.
 pub type SseConnection =
   connection.SseConnection
 
-/// Server-Sent Events message. Build it with `event` or `comment`, then set 
-/// the remaining fields with `event_name`, `event_id` and `event_retry`.
+/// A message on a Server-Sent Events stream.
+///
+/// Create one with `event` or `comment`, then set the rest of its fields with
+/// `event_name`, `event_id` and `event_retry`.
 pub type SseEvent =
   sse.Event
 
-/// What an SSE stream does after the handler has dealt with the message. Build
-/// it with `sse_continue`, `sse_stop` or `sse_stop_abnormal`.
+/// What a Server-Sent Events stream does once the handler has dealt with a
+/// message.
+///
+/// Create one with `sse_continue`, `sse_stop` or `sse_stop_abnormal`.
 pub opaque type SseNext(user_state) {
   SseContinue(user_state)
   SseStop
   SseStopAbnormal(reason: String)
 }
 
-/// Carries on with the stream, handling further messages with `user_state`.
+/// Carry on with the stream, handling further messages with the given state.
 pub fn sse_continue(user_state: user_state) -> SseNext(user_state) {
   SseContinue(user_state)
 }
 
-/// Ends the stream.
+/// End the stream.
 pub fn sse_stop() -> SseNext(user_state) {
   SseStop
 }
 
-/// Ends the stream, reporting `reason` as the cause.
+/// End the stream and exit the connection process abnormally with the given
+/// reason.
 pub fn sse_stop_abnormal(reason: String) -> SseNext(user_state) {
   SseStopAbnormal(reason)
 }
 
-/// Creates an event carrying `data`. Data spanning several lines is sent as
-/// the repeated `data:` fields the client rejoins.
+/// Create an event carrying the given data.
+///
+/// Data spanning several lines is sent as the repeated `data:` fields that the
+/// client joins back together.
+///
+/// # Examples
+///
+/// ```gleam
+/// event("Hello, Joe!")
+/// |> event_name("greeting")
+/// |> event_id("1")
+/// ```
 pub fn event(data: String) -> SseEvent {
   sse.Event(..sse.new(), data: Some(data))
 }
 
-/// Creates a comment, which clients ignore. Sending one periodically is the
-/// conventional way to stop an idle stream being closed by a proxy.
+/// Create a comment, which clients ignore.
+///
+/// Sending one every so often is the usual way to keep an idle stream from
+/// being closed by a proxy in between.
 pub fn comment(text: String) -> SseEvent {
   sse.Event(..sse.new(), comment: Some(text))
 }
 
-/// Sets the name of the event.
+/// Set the name of an event which clients use to route it to a listener.
 pub fn event_name(event: SseEvent, name: String) -> SseEvent {
   sse.Event(..event, name: Some(name))
 }
 
-/// Sets the ID of the event.
+/// Set the ID of an event. A reconnecting client sends the last ID it saw back
+/// in the `last-event-id` header.
 pub fn event_id(event: SseEvent, id: String) -> SseEvent {
   sse.Event(..event, id: Some(id))
 }
 
-/// Sets how long, in milliseconds, the client waits before reconnecting.
+/// Set how long, in milliseconds, the client waits before reconnecting.
 pub fn event_retry(event: SseEvent, retry: Int) -> SseEvent {
   sse.Event(..event, retry: Some(retry))
 }
 
-/// Sends event to the client. If the client has gone the stream ends here:
-/// `on_close` runs and the handler is not called again.
+/// Send an event to the client of a Server-Sent Events stream.
 pub fn send_event(
   conn: SseConnection,
   event: SseEvent,
@@ -1123,15 +1437,38 @@ pub fn send_event(
   }
 }
 
-/// Turns the response into a Server-Sent Events stream, which runs until the
-/// handler stops it or the client goes away. The HTTP/1.1 connection is 
-/// reusable afterwards as long as the handler ended the stream itself and the 
-/// client sent nothing during it.
+/// Set the body of a response to a Server-Sent Events stream which runs until
+/// the handler stops it or the client goes away.
 ///
-/// - `on_init` is called once, with a subject the rest of your program uses to
-/// push messages at the client, and returns the starting state. 
-/// - `handler` is called for each message sent to that subject. 
-/// - `on_close` is called once however the stream ended.
+/// - `on_init` is called once, with a subject that the rest of your program
+///   sends messages to, and returns the starting state.
+/// - `handler` is called for each message that arrives on that subject.
+/// - `on_close` is called once, however the stream ended.
+///
+/// The `content-type` and `cache-control` headers the stream needs are set by
+/// ewe.
+///
+/// On HTTP/1.1 the connection can carry another request afterwards as long as 
+/// the handler ended the stream itself and the client sent nothing during it.
+///
+/// # Examples
+///
+/// ```gleam
+/// response.new(200)
+/// |> ewe.sse(
+///   on_init: fn(subject) {
+///     pubsub.subscribe(pubsub, subject)
+///     0
+///   },
+///   handler: fn(conn, sent, message) {
+///     case ewe.send_event(conn, ewe.event(message)) {
+///       Ok(Nil) -> ewe.sse_continue(sent + 1)
+///       Error(_send_error) -> ewe.sse_stop()
+///     }
+///   },
+///   on_close: fn(_conn, _sent) { Nil },
+/// )
+/// ```
 pub fn sse(
   response: response.Response(a),
   on_init on_init: fn(process.Subject(user_message)) -> user_state,
@@ -1161,12 +1498,17 @@ pub fn sse(
 pub type WebsocketConnection =
   connection.WebsocketConnection
 
-/// What the client sent or what the rest of your program sent to the subject
-/// given to `on_init`. Ping and pong frames are answered by the server and do
-/// not reach the handler.
+/// A message reaching a WebSocket handler either from the client or from the
+/// rest of your program.
+///
+/// Ping and pong frames are answered by the server and never reach the handler.
 pub type WebsocketMessage(user_message) {
+  /// A text frame from the client with the valid UTF-8 payload.
   TextFrame(text: String)
+  /// A binary frame from the client.
   BinaryFrame(data: BitArray)
+  /// A message picked up by the selector given to `on_init`, sent by the rest
+  /// of your program.
   UserMessage(message: user_message)
 }
 
@@ -1180,24 +1522,26 @@ fn from_internal_websocket_message(
   }
 }
 
-/// What a WebSocket does after the handler has dealt with a message. Build it
-/// with `websocket_continue`, `websocket_stop` or `websocket_stop_abnormal`.
+/// What a WebSocket does once the handler has dealt with a message.
+///
+/// Create one with `websocket_continue`, `websocket_continue_with_selector`,
+/// `websocket_stop` or `websocket_stop_abnormal`.
 pub opaque type WebsocketNext(user_state, user_message) {
   WebsocketContinue(user_state, Option(process.Selector(user_message)))
   WebsocketStop
   WebsocketStopAbnormal(reason: String)
 }
 
-/// Carries on handling further messages with `user_state` and the selector the
-/// connection already has.
+/// Carry on with the WebSocket handling further messages with the given state
+/// and the selector the connection already has.
 pub fn websocket_continue(
   user_state: user_state,
 ) -> WebsocketNext(user_state, user_message) {
   WebsocketContinue(user_state, None)
 }
 
-/// Carries on listening on `selector` from here on instead of the one the
-/// connection was started with.
+/// Carry on with the WebSockets listening on the given selector from here on
+/// instead of the one the connection was started with.
 pub fn websocket_continue_with_selector(
   user_state: user_state,
   selector: process.Selector(user_message),
@@ -1205,19 +1549,21 @@ pub fn websocket_continue_with_selector(
   WebsocketContinue(user_state, Some(selector))
 }
 
-/// Ends the WebSocket.
+/// End the WebSocket. To tell the client why first, use `send_close_frame`.
 pub fn websocket_stop() -> WebsocketNext(user_state, user_message) {
   WebsocketStop
 }
 
-/// Ends the WebSocket reporting `reason` as the cause.
+/// End the WebSocket and exit the connection process abnormally with the given
+/// reason.
 pub fn websocket_stop_abnormal(
   reason: String,
 ) -> WebsocketNext(user_state, user_message) {
   WebsocketStopAbnormal(reason)
 }
 
-/// Why a WebSocket is being closed, sent to the client in the close frame.
+/// The reason a WebSocket is being closed, sent to the client in the close
+/// frame.
 pub type CloseReason {
   /// Close without saying why.
   NoCloseReason
@@ -1225,9 +1571,10 @@ pub type CloseReason {
   CloseReason(code: CloseCode, reason: String)
 }
 
-/// The status code a close frame carries. The codes that exist only to be
-/// reported locally such as 1005 and 1006 are absent. Sending one is a
-/// protocol violation.
+/// The status code a close frame carries.
+///
+/// The codes that exist only to be reported locally, such as 1005 and 1006,
+/// are absent, as sending one is a protocol violation.
 pub type CloseCode {
   /// The connection did what it was for and is closing normally (1000).
   NormalClosure
@@ -1238,10 +1585,10 @@ pub type CloseCode {
   ProtocolError
   /// Data arrived that this endpoint cannot accept (1003).
   UnsupportedData
-  /// A message did not match the type it declared, such as a text frame that
+  /// A message did not match the type it declared such as a text frame that
   /// is not UTF-8 (1007).
   InvalidPayloadData
-  /// The other end broke your rules, when no more specific code applies (1008).
+  /// The other end broke your rules when no more specific code applies (1008).
   PolicyViolation
   /// A message was larger than this endpoint will handle (1009).
   MessageTooBig
@@ -1249,13 +1596,13 @@ pub type CloseCode {
   MandatoryExtension
   /// Something went wrong on this side (1011).
   InternalError
-  /// The server is restarting, and clients may reconnect shortly (1012).
+  /// The server is restarting and clients may reconnect shortly (1012).
   ServiceRestart
   /// The server is overloaded and the client should retry later (1013).
   TryAgainLater
   /// An upstream server answered badly (1014).
   BadGateway
-  /// An application specific code, which must be between 3000 and 4999.
+  /// An application specific code which must be between 3000 and 4999.
   ApplicationCode(code: Int)
 }
 
@@ -1285,7 +1632,7 @@ fn to_internal_close_code(code: CloseCode) -> websocks.CloseCode {
   }
 }
 
-/// Sends a text frame. If the client has gone the WebSocket ends here.
+/// Send a text frame to the client.
 pub fn send_text_frame(
   conn: WebsocketConnection,
   text: String,
@@ -1296,7 +1643,7 @@ pub fn send_text_frame(
   }
 }
 
-/// Sends a binary frame. If the client has gone the WebSocket ends here.
+/// Send a binary frame to the client.
 pub fn send_binary_frame(
   conn: WebsocketConnection,
   data: BitArray,
@@ -1307,8 +1654,16 @@ pub fn send_binary_frame(
   }
 }
 
-/// Starts the closing handshake and ends the WebSocket. Return the value this
-/// gives back from your handler, no frame can be sent after it.
+/// Start the closing handshake and end the WebSocket.
+///
+/// Return the value this gives back from your handler. No frame can be sent
+/// after it.
+///
+/// # Examples
+///
+/// ```gleam
+/// ewe.send_close_frame(conn, ewe.CloseReason(ewe.GoingAway, "shutting down"))
+/// ```
 pub fn send_close_frame(
   conn: WebsocketConnection,
   reason: CloseReason,
@@ -1321,19 +1676,43 @@ pub fn send_close_frame(
   WebsocketStop
 }
 
-/// Turns the response into a WebSocket which runs until the handler stops it
-/// or the client goes away. The connection stops being HTTP once the handshake
-/// is written so it never carries another request.
+/// Upgrade the request to a WebSocket which runs until the handler stops it or
+/// the client goes away.
 ///
-/// A request that is not a valid handshake is answered with a 400 and the
-/// handler is never run.
+/// - `on_init` is called once, with an empty selector to add whatever the rest
+///   of your program sends this connection to, and returns the starting state
+///   along with that selector.
+/// - `handler` is called for each frame from the client and each message the
+///   selector picks up.
+/// - `on_close` is called once, however the WebSocket ended.
 ///
-/// - `on_init` is called once with an empty selector to add whatever the rest 
-/// of your program sends this connection to and returns the starting state 
-/// along with that selector. 
-/// - `handler` is called for each frame from the client and each message the 
-/// selector picks up. 
-/// - `on_close` is called once however the WebSocket ended.
+/// A request that is not a valid handshake is answered with status code 400:
+/// Bad Request, and the handler is never run. WebSockets travel over extended
+/// CONNECT on HTTP/2, which ewe does not negotiate yet, so a request on an
+/// HTTP/2 connection is answered with status code 501: Not Implemented.
+///
+/// The connection stops being HTTP once the handshake has been sent so it will
+/// never carry another request.
+///
+/// # Examples
+///
+/// ```gleam
+/// ewe.websocket(
+///   request:,
+///   on_init: fn(_conn, selector) { #(0, selector) },
+///   handler: fn(conn, count, message) {
+///     case message {
+///       ewe.TextFrame(text) -> {
+///         let assert Ok(Nil) = ewe.send_text_frame(conn, text)
+///         ewe.websocket_continue(count + 1)
+///       }
+///       ewe.BinaryFrame(_data) | ewe.UserMessage(_message) ->
+///         ewe.websocket_continue(count)
+///     }
+///   },
+///   on_close: fn(_conn, _count) { Nil },
+/// )
+/// ```
 pub fn websocket(
   request request: request.Request(Connection),
   on_init on_init: fn(WebsocketConnection, process.Selector(user_message)) ->
@@ -1386,7 +1765,7 @@ pub fn websocket(
           response.set_body(response.new(400), Empty)
         }
       }
-    // WebSockets ride on extended CONNECT over HTTP/2 which ewe does not 
+    // WebSockets ride on extended CONNECT over HTTP/2 which ewe does not
     // negotiate yet!
     connection.Http2(_connection) -> {
       logging.log(
