@@ -1,4 +1,4 @@
-![ewe](https://raw.githubusercontent.com/vshakitskiy/ewe/mistress/public/banner.jpg)
+![ewe](https://raw.githubusercontent.com/vshakitskiy/ewe/v5/public/banner.jpg)
 
 # 🐑 ewe
 
@@ -11,7 +11,7 @@ ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
 
 - [Installation](#installation)
 - [Getting Started](#getting-started)
-- Usage
+- [Usage](#usage)
   - [HTTPS](#https)
   - [HTTP/2](#http2)
   - [Sending a Response](#sending-a-response)
