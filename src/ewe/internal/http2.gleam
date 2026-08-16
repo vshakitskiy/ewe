@@ -115,6 +115,7 @@ pub type Stream {
     content_length: Option(Int),
     body_bytes_received: Int,
     trailers: List(#(String, String)),
+    method: http.Method,
   )
 }
 
@@ -949,7 +950,16 @@ fn spawn_stream(
     False -> {
       let pid =
         stream.start(state.reply_subject, stream_id, request, state.handler)
-      Proceed(track_stream(state, stream_id, pid, end_stream, content_length))
+
+      track_stream(
+        state,
+        stream_id,
+        pid,
+        end_stream,
+        content_length,
+        request.method,
+      )
+      |> Proceed
     }
   }
 }
@@ -960,10 +970,12 @@ fn track_stream(
   pid: process.Pid,
   end_stream: Bool,
   content_length: Option(Int),
+  method: http.Method,
 ) -> State {
   let entry =
     Stream(
       status: Computing(pid),
+      method:,
       send_window: state.peer_settings.initial_window_size,
       pending: PendingBytes(<<>>),
       pending_end_stream: True,
@@ -1619,29 +1631,54 @@ fn respond(
   response: Response(connection.Body),
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  case open_pending(response.body, state.options.file_read_threshold) {
-    Ok(pending) ->
+  case entry.method {
+    http.Head ->
       send_response(
         state,
         stream_id,
         entry,
         response.status,
         response.headers,
-        response_body_size(response.body),
-        pending,
-        connection,
-      )
-    Error(_error) ->
-      send_response(
-        state,
-        stream_id,
-        entry,
-        500,
-        [],
-        0,
+        head_content_length(response.body),
         PendingBytes(<<>>),
         connection,
       )
+    _method ->
+      case open_pending(response.body, state.options.file_read_threshold) {
+        Ok(pending) ->
+          send_response(
+            state,
+            stream_id,
+            entry,
+            response.status,
+            response.headers,
+            Some(response_body_size(response.body)),
+            pending,
+            connection,
+          )
+        Error(_error) ->
+          send_response(
+            state,
+            stream_id,
+            entry,
+            500,
+            [],
+            Some(0),
+            PendingBytes(<<>>),
+            connection,
+          )
+      }
+  }
+}
+
+fn head_content_length(body: connection.Body) -> Option(Int) {
+  case body {
+    connection.Streaming(_metadata) | connection.Sse(_metadata) -> None
+    connection.Bytes(_tree)
+    | connection.Text(_text)
+    | connection.Empty
+    | connection.File(_file)
+    | connection.Websocket(_metadata) -> Some(response_body_size(body))
   }
 }
 
@@ -1651,18 +1688,19 @@ fn send_response(
   entry: Stream,
   status: Int,
   headers: List(#(String, String)),
-  body_size: Int,
+  content_length: Option(Int),
   pending: Pending,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
   let fields = build_response_headers(headers, state.patterns.forbidden)
 
-  let content_length_fields = case status {
-    status if status == 204 || { status >= 100 && status < 200 } -> []
-    _status -> [
+  let content_length_fields = case status, content_length {
+    status, _length if status == 204 || { status >= 100 && status < 200 } -> []
+    _status, None -> []
+    _status, Some(length) -> [
       alpacki.HeaderField(
         <<"content-length":utf8>>,
-        <<int.to_string(body_size):utf8>>,
+        <<int.to_string(length):utf8>>,
         alpacki.WithoutIndexing,
       ),
     ]
@@ -1683,7 +1721,7 @@ fn send_response(
 
   let state = State(..state, hpack_encoder:)
 
-  let has_body = body_size != 0
+  let has_body = pending_has_bytes(pending)
   let out =
     bytes_tree.new()
     |> append_header_frames(
@@ -2144,7 +2182,11 @@ pub fn flush_stream(
 }
 
 fn has_pending(entry: Stream) -> Bool {
-  case entry.pending {
+  pending_has_bytes(entry.pending)
+}
+
+fn pending_has_bytes(pending: Pending) -> Bool {
+  case pending {
     PendingBytes(<<>>) -> False
     PendingFile(_descriptor, _offset, 0) -> False
     _pending -> True

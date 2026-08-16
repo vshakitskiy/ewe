@@ -25,6 +25,7 @@ fn pending_stream(send_window: Int, pending: BitArray) -> connection.Stream {
     content_length: None,
     body_bytes_received: 0,
     trailers: [],
+    method: http.Get,
   )
 }
 
@@ -45,6 +46,7 @@ fn inbound_stream(
     content_length: None,
     body_bytes_received: 0,
     trailers: [],
+    method: http.Get,
   )
 }
 

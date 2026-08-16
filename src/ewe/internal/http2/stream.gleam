@@ -3,6 +3,7 @@ import ewe/internal/http2/connection as http2
 import ewe/internal/rescue
 import gleam/erlang/process
 import gleam/erlang/reference
+import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/result
@@ -20,7 +21,7 @@ pub fn start(
   process.trap_exits(True)
 
   case rescue.handler(fn() { handler(request) }) {
-    Ok(response) -> deliver(reply_to, stream_id, response)
+    Ok(response) -> deliver(reply_to, stream_id, response, request.method)
     Error(details) -> crashed(reply_to, stream_id, details)
   }
 }
@@ -49,14 +50,25 @@ fn deliver(
   reply_to: process.Subject(http2.Reply(connection.Body)),
   stream_id: Int,
   response: response.Response(connection.Body),
+  method: http.Method,
 ) -> Nil {
-  case response.body {
-    connection.Streaming(connection.StreamingMetadata(handler:)) ->
+  case response.body, method {
+    connection.Websocket(_metadata), _method -> {
+      logging.log(
+        logging.Error,
+        "Discarded a WebSocket response: HTTP/2 connections do not carry them",
+      )
+
+      internal_error(reply_to, stream_id)
+    }
+    _body, http.Head ->
+      process.send(reply_to, http2.Respond(stream_id, response))
+    connection.Streaming(connection.StreamingMetadata(handler:)), _method ->
       case begin(reply_to, stream_id, response, http2.Nothing) {
         Error(_interrupted) -> Nil
         Ok(writer) -> handler(connection.Http2Writer(writer))
       }
-    connection.Sse(connection.SseMetadata(handler:)) ->
+    connection.Sse(connection.SseMetadata(handler:)), _method ->
       case begin(reply_to, stream_id, response, http2.SseHeaders) {
         Error(_interrupted) -> Nil
         Ok(writer) ->
@@ -65,19 +77,11 @@ fn deliver(
             connection.StoppedAbnormal(reason) -> abort(reason)
           }
       }
-    connection.Websocket(_metadata) -> {
-      logging.log(
-        logging.Error,
-        "Discarded a WebSocket response: HTTP/2 connections do not carry them",
-      )
-
-      internal_error(reply_to, stream_id)
-    }
-    connection.Bytes(_tree)
-    | connection.Text(_text)
-    | connection.Empty
-    | connection.File(_file) ->
-      process.send(reply_to, http2.Respond(stream_id, response))
+    connection.Bytes(_tree), _method
+    | connection.Text(_text), _method
+    | connection.Empty, _method
+    | connection.File(_file), _method
+    -> process.send(reply_to, http2.Respond(stream_id, response))
   }
 }
 
