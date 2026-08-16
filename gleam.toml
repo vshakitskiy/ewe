@@ -7,6 +7,11 @@ licences = ["Apache-2.0"]
 repository = { type = "github", user = "vshakitskiy", repo = "ewe" }
 links = [{ title = "Gleam", href = "https://gleam.run" }]
 
+[documentation]
+pages = [
+    { title = "Migrating from v4", path = "migration.html", source = "./MIGRATING.md" },
+]
+
 [dependencies]
 alpacki = ">= 3.0.1 and < 4.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
