@@ -33,8 +33,6 @@ pub fn handshake_error_to_string(error: HandshakeError) -> String {
   }
 }
 
-/// What the handshake settled on. The key the client checks the reply against
-/// and the compression it asked for.
 pub type Handshake {
   Handshake(
     accept: String,
@@ -42,8 +40,6 @@ pub type Handshake {
   )
 }
 
-/// Everything this needs was picked up while the headers were parsed so the
-/// request is not walked again here.
 pub fn handshake(
   method: http.Method,
   conn: http1.Connection,
@@ -99,8 +95,6 @@ pub fn run(
   }
 }
 
-/// Every way a socket ends runs the handler's `on_close` and then frees the
-/// compression resources the context holds.
 fn ended(
   conn: http1.WebsocketConnection,
   state: user_state,
@@ -108,10 +102,7 @@ fn ended(
   outcome: connection.Outcome,
 ) -> connection.Outcome {
   let handle = connection.Http1Websocket(conn)
-  // A bug in `on_close` is still a bug but it must not take the connection
-  // down on the way out of a socket that has already ended.
-  // TODO: log for the user?
-  let _crashed = rescue.handler(fn() { on_close(handle, state) })
+  rescue.logged("websocket close handler", fn() { on_close(handle, state) })
 
   websocks.close_context(conn.context)
   outcome
@@ -125,8 +116,6 @@ fn stopped(
   ended(conn, state, on_close, connection.Stopped)
 }
 
-/// A handler that crashed cannot be asked what to do next so the socket is
-/// ended for it rather than the crash taking the whole process with it.
 fn crashed(
   conn: http1.WebsocketConnection,
   state: user_state,
@@ -146,7 +135,6 @@ fn crashed(
   )
 }
 
-/// The socket gave out which ends the connection whatever it was doing.
 fn socket_failed(
   conn: http1.WebsocketConnection,
   state: user_state,
@@ -158,7 +146,6 @@ fn socket_failed(
   |> ended(conn, state, on_close, _)
 }
 
-/// Where the loop carries on once the handler has seen a message.
 type Resume {
   DrainBuffer
   AwaitSocket
@@ -188,15 +175,12 @@ fn loop(
       websocks.push_data(conn.context, data)
       |> with_context(conn, _)
       |> drain(selector, state, step, on_close)
-    // Nothing reached the socket, so there is nothing new to decode.
     Received(message) ->
       websocket.UserMessage(message)
       |> deliver(conn, selector, state, step, on_close, AwaitSocket, _)
   }
 }
 
-/// One read can carry several frames so the buffer is drained before the loop
-/// waits on the socket again.
 fn drain(
   conn: http1.WebsocketConnection,
   selector: process.Selector(Received(user_message)),
@@ -219,8 +203,6 @@ fn drain(
       let conn = with_context(conn, context)
 
       case frame {
-        // Answered here rather than handed on since a peer's keepalive is not
-        // the handler's business.
         websocks.Control(websocks.Ping(payload)) ->
           case
             write(
@@ -233,8 +215,6 @@ fn drain(
           }
         websocks.Control(websocks.Pong(_payload)) ->
           drain(conn, selector, state, step, on_close)
-        // The peer started the closing handshake so it is echoed back and the
-        // socket is done.
         websocks.Control(websocks.Close(reason)) ->
           close(conn, reason) |> resolve(conn, state, on_close, _)
         websocks.Text(payload) ->
@@ -243,7 +223,6 @@ fn drain(
         websocks.Binary(payload) ->
           websocket.BinaryFrame(payload)
           |> deliver(conn, selector, state, step, on_close, DrainBuffer, _)
-        // Fragments are reassembled by the decoder so one never surfaces.
         websocks.Continuation(_payload) ->
           drain(conn, selector, state, step, on_close)
       }
@@ -283,8 +262,6 @@ fn deliver(
   }
 }
 
-/// A close the server sends ends the socket either way, so only whether the
-/// frame reached the peer decides how it is reported.
 fn resolve(
   conn: http1.WebsocketConnection,
   state: user_state,
@@ -351,8 +328,6 @@ fn write(
   |> transport.send(conn.transport, conn.socket, _)
 }
 
-/// glisten rearms the socket only once its loop callback returns and a socket
-/// does not return until it is over, so the frames have to be asked for here.
 fn activate(
   conn: http1.WebsocketConnection,
 ) -> Result(Nil, socket.SocketReason) {

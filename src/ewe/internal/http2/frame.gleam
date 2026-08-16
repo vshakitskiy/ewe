@@ -144,8 +144,6 @@ fn decode_payload(
     0x2 ->
       case payload {
         <<_exclusive:1, stream_dependency:31, _weight:8>> ->
-          // Stream 0 can't be prioritized and a stream depending on itself
-          // is a cycle of one which both are protocol errors.
           case stream_id == 0, stream_dependency == stream_id {
             True, _self_dependent | _on_stream_zero, True ->
               Error(Violation(ProtocolError))
@@ -161,7 +159,6 @@ fn decode_payload(
         False, _payload -> Error(Violation(FrameSizeError))
       }
     0x4 ->
-      // SETTINGS ACKs never carry params.
       case end_stream_or_ack, payload {
         True, <<>> -> Ok(Settings(stream_id, True, []))
         True, _payload -> Error(Violation(FrameSizeError))
@@ -215,7 +212,6 @@ fn strip_padding(
       case payload {
         <<pad_length:8, remaining:bits>> -> {
           let content_length = bit_array.byte_size(remaining) - pad_length
-          // A client can claim more padding than bytes actually follow
           case content_length >= 0 {
             True ->
               case remaining {
@@ -382,8 +378,6 @@ fn encode_flags(end_stream_or_ack: Bool, end_headers: Bool) -> BitArray {
   <<0:5, bit(end_headers):1, 0:1, bit(end_stream_or_ack):1>>
 }
 
-/// Frames a DATA payload without copying it into the header, so a body already
-/// held as a `BytesTree` can be written straight after this.
 pub fn encode_data_header(
   stream_id: Int,
   end_stream: Bool,

@@ -72,7 +72,6 @@ skip_ascii(<<A:56, B:56, C:56, D:56, Rest/binary>>) when
   skip_ascii(Rest);
 skip_ascii(<<Word:56, Rest/binary>>) when Word band ?HIGH_BITS =:= 0 ->
   skip_ascii(Rest);
-%% Tails shorter than a word, each masked to its own width.
 skip_ascii(<<Word:48>>) when Word band 16#808080808080 =:= 0 -> <<>>;
 skip_ascii(<<Word:40>>) when Word band 16#8080808080 =:= 0 -> <<>>;
 skip_ascii(<<Word:32>>) when Word band 16#80808080 =:= 0 -> <<>>;

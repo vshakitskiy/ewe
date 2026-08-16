@@ -9,8 +9,6 @@ import gleam/erlang/reference
 import gleam/result
 import logging
 
-/// Runs a Server-Sent Events stream. The response head is already written by
-/// the time this is reached so there is nothing to negotiate.
 pub fn run(
   conn: http2.SseConnection(connection.Body),
   on_init: fn(process.Subject(user_message)) -> user_state,
@@ -35,7 +33,6 @@ fn loop(
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case http2.receive_reply(tag) {
-    // The stream was reset or the connection went.
     Error(_interrupted) -> ended(handle, state, on_close, connection.Stopped)
     Ok(message) ->
       case rescue.handler(fn() { step(handle, state, message) }) {
@@ -44,8 +41,6 @@ fn loop(
         Ok(sse.Halt(outcome)) -> {
           let outcome = ended(handle, state, on_close, outcome)
 
-          // A stream the handler ended gets a clean close. An abnormal one
-          // resets.
           case outcome {
             connection.Stopped -> {
               let _sent = stream.finish_response(conn.writer)
@@ -60,22 +55,18 @@ fn loop(
   }
 }
 
-/// Every ending runs `on_close` and reports the outcome.
 fn ended(
   handle: connection.SseConnection,
   state: user_state,
   on_close: fn(connection.SseConnection, user_state) -> Nil,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  // A bug in `on_close` is still a bug. It just must not kill the process on
-  // the way out of a stream that already ended.
-  // TODO: logging here?
-  let _crashed = rescue.handler(fn() { on_close(handle, state) })
+  rescue.logged("server-sent events close handler", fn() {
+    on_close(handle, state)
+  })
   outcome
 }
 
-/// A crashed handler cannot say what to do next. End the stream for it and
-/// reset.
 fn crashed(
   handle: connection.SseConnection,
   state: user_state,

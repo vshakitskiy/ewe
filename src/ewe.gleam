@@ -371,6 +371,9 @@ fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
 /// Sizes are in bytes and timeouts in milliseconds. Build one by updating
 /// `default_http1_options` so you only state the ones you care about.
 ///
+/// A value outside the range a field accepts is replaced with the default and
+/// logged as a warning when the server starts.
+///
 /// # Examples
 ///
 /// ```gleam
@@ -406,7 +409,7 @@ pub type Http1Options {
 /// Get the default HTTP/1 limits and timeouts to be adjusted and given to
 /// `with_http1`.
 pub fn default_http1_options() -> Http1Options {
-  let http1.Config(
+  let http1.Options(
     max_request_line:,
     max_header_line:,
     max_headers:,
@@ -415,7 +418,7 @@ pub fn default_http1_options() -> Http1Options {
     body_read_timeout:,
     auto_drain_limit:,
     auto_drain_chunk_bytes:,
-  ) = http1.default_config()
+  ) = http1.default_options()
 
   Http1Options(
     max_request_line:,
@@ -429,27 +432,113 @@ pub fn default_http1_options() -> Http1Options {
   )
 }
 
-fn to_internal_http1_options(options: Http1Options) -> http1.Config {
-  let Http1Options(
-    max_request_line:,
-    max_header_line:,
-    max_headers:,
-    max_chunk_size_line:,
-    idle_timeout:,
-    body_read_timeout:,
-    auto_drain_limit:,
-    auto_drain_chunk_bytes:,
-  ) = options
+fn out_of_range(field: String, value: String, default: String) -> Nil {
+  logging.log(
+    logging.Warning,
+    field <> " of " <> value <> " is out of range, using " <> default,
+  )
+}
 
-  http1.Config(
-    max_request_line:,
-    max_header_line:,
-    max_headers:,
-    max_chunk_size_line:,
-    idle_timeout:,
-    body_read_timeout:,
-    auto_drain_limit:,
-    auto_drain_chunk_bytes:,
+fn at_least(value: Int, minimum: Int, default: Int, field: String) -> Int {
+  case value >= minimum {
+    True -> value
+    False -> {
+      out_of_range(field, int.to_string(value), int.to_string(default))
+      default
+    }
+  }
+}
+
+fn within(
+  value: Int,
+  minimum: Int,
+  maximum: Int,
+  default: Int,
+  field: String,
+) -> Int {
+  case value >= minimum && value <= maximum {
+    True -> value
+    False -> {
+      out_of_range(field, int.to_string(value), int.to_string(default))
+      default
+    }
+  }
+}
+
+fn optional_at_least(
+  value: Option(Int),
+  minimum: Int,
+  default: Option(Int),
+  field: String,
+) -> Option(Int) {
+  case value {
+    Some(limit) if limit < minimum -> {
+      out_of_range(field, int.to_string(limit), limit_to_string(default))
+      default
+    }
+    _value -> value
+  }
+}
+
+fn limit_to_string(limit: Option(Int)) -> String {
+  case limit {
+    Some(limit) -> int.to_string(limit)
+    None -> "no limit"
+  }
+}
+
+fn to_internal_http1_options(options: Http1Options) -> http1.Options {
+  let defaults = http1.default_options()
+
+  http1.Options(
+    max_request_line: at_least(
+      options.max_request_line,
+      1,
+      defaults.max_request_line,
+      "max_request_line",
+    ),
+    max_header_line: at_least(
+      options.max_header_line,
+      1,
+      defaults.max_header_line,
+      "max_header_line",
+    ),
+    max_headers: at_least(
+      options.max_headers,
+      1,
+      defaults.max_headers,
+      "max_headers",
+    ),
+    max_chunk_size_line: at_least(
+      options.max_chunk_size_line,
+      1,
+      defaults.max_chunk_size_line,
+      "max_chunk_size_line",
+    ),
+    idle_timeout: at_least(
+      options.idle_timeout,
+      1,
+      defaults.idle_timeout,
+      "idle_timeout",
+    ),
+    body_read_timeout: at_least(
+      options.body_read_timeout,
+      1,
+      defaults.body_read_timeout,
+      "body_read_timeout",
+    ),
+    auto_drain_limit: at_least(
+      options.auto_drain_limit,
+      0,
+      defaults.auto_drain_limit,
+      "auto_drain_limit",
+    ),
+    auto_drain_chunk_bytes: at_least(
+      options.auto_drain_chunk_bytes,
+      1,
+      defaults.auto_drain_chunk_bytes,
+      "auto_drain_chunk_bytes",
+    ),
   )
 }
 
@@ -458,9 +547,10 @@ const max_window_size = 2_147_483_647
 /// The limits and timeouts applied to every HTTP/2 connection.
 ///
 /// Sizes are in bytes and timeouts in milliseconds. Build one by updating
-/// `default_http2_options` so you only state the ones you care about. A value
-/// the protocol does not allow is replaced with the default rather than being
-/// sent to a peer.
+/// `default_http2_options` so you only state the ones you care about.
+///
+/// A value outside the range a field accepts is replaced with the default and 
+/// logged as a warning when the server starts.
 ///
 /// # Examples
 ///
@@ -514,7 +604,7 @@ pub type Http2Options {
 /// Get the default HTTP/2 limits and timeouts to be adjusted and given to
 /// `with_http2`.
 pub fn default_http2_options() -> Http2Options {
-  let http2.Config(
+  let http2.Options(
     max_concurrent_streams:,
     initial_window_size:,
     max_frame_size:,
@@ -530,7 +620,7 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
-  ) = http2.default_config()
+  ) = http2.default_options()
 
   Http2Options(
     max_concurrent_streams:,
@@ -551,64 +641,113 @@ pub fn default_http2_options() -> Http2Options {
   )
 }
 
-/// Anything the protocol rules out would break connections so it is dropped
-/// for the default here instead of reaching a peer.
-fn to_internal_http2_options(options: Http2Options) -> http2.Config {
-  let defaults = http2.default_config()
+fn to_internal_http2_options(options: Http2Options) -> http2.Options {
+  let defaults = http2.default_options()
 
-  let max_concurrent_streams = case options.max_concurrent_streams {
-    Some(limit) if limit <= 0 -> None
-    limit -> limit
-  }
-
-  let initial_window_size = case options.initial_window_size {
-    size if size < 0 || size > max_window_size -> defaults.initial_window_size
-    size -> size
-  }
-
-  let max_frame_size = case options.max_frame_size {
-    size if size < 16_384 || size > 16_777_215 -> defaults.max_frame_size
-    size -> size
-  }
-
-  let drain_timeout_ms = case options.drain_timeout {
-    timeout if timeout <= 0 -> defaults.drain_timeout_ms
-    timeout -> timeout
-  }
-
-  let file_read_threshold = case options.file_read_threshold {
-    threshold if threshold < 0 -> defaults.file_read_threshold
-    threshold -> threshold
-  }
-
-  // The marks only mean anything as a pair so a bad one replaces both.
   let #(recv_window_low_water_mark, recv_window_high_water_mark) = case
     options.recv_window_low_water_mark,
     options.recv_window_high_water_mark
   {
     low, high if low > 0 && low < high && high <= max_window_size -> #(low, high)
-    _low, _high -> #(
-      defaults.recv_window_low_water_mark,
-      defaults.recv_window_high_water_mark,
-    )
+    low, high -> {
+      out_of_range(
+        "recv window water marks",
+        int.to_string(low) <> " and " <> int.to_string(high),
+        int.to_string(defaults.recv_window_low_water_mark)
+          <> " and "
+          <> int.to_string(defaults.recv_window_high_water_mark),
+      )
+
+      #(
+        defaults.recv_window_low_water_mark,
+        defaults.recv_window_high_water_mark,
+      )
+    }
   }
 
-  http2.Config(
-    max_concurrent_streams:,
-    initial_window_size:,
-    max_frame_size:,
-    max_header_list_size: options.max_header_list_size,
-    header_table_size: options.header_table_size,
-    max_continuation_frames: options.max_continuation_frames,
-    max_header_block_bytes: options.max_header_block_bytes,
-    rapid_reset_window_ms: options.rapid_reset_window,
-    rapid_reset_threshold: options.rapid_reset_threshold,
-    handshake_timeout_ms: options.handshake_timeout,
-    drain_timeout_ms:,
+  http2.Options(
+    max_concurrent_streams: optional_at_least(
+      options.max_concurrent_streams,
+      1,
+      defaults.max_concurrent_streams,
+      "max_concurrent_streams",
+    ),
+    initial_window_size: within(
+      options.initial_window_size,
+      0,
+      max_window_size,
+      defaults.initial_window_size,
+      "initial_window_size",
+    ),
+    max_frame_size: within(
+      options.max_frame_size,
+      16_384,
+      16_777_215,
+      defaults.max_frame_size,
+      "max_frame_size",
+    ),
+    max_header_list_size: optional_at_least(
+      options.max_header_list_size,
+      1,
+      defaults.max_header_list_size,
+      "max_header_list_size",
+    ),
+    header_table_size: at_least(
+      options.header_table_size,
+      0,
+      defaults.header_table_size,
+      "header_table_size",
+    ),
+    max_continuation_frames: at_least(
+      options.max_continuation_frames,
+      1,
+      defaults.max_continuation_frames,
+      "max_continuation_frames",
+    ),
+    max_header_block_bytes: at_least(
+      options.max_header_block_bytes,
+      1,
+      defaults.max_header_block_bytes,
+      "max_header_block_bytes",
+    ),
+    rapid_reset_window_ms: at_least(
+      options.rapid_reset_window,
+      1,
+      defaults.rapid_reset_window_ms,
+      "rapid_reset_window",
+    ),
+    rapid_reset_threshold: at_least(
+      options.rapid_reset_threshold,
+      1,
+      defaults.rapid_reset_threshold,
+      "rapid_reset_threshold",
+    ),
+    handshake_timeout_ms: at_least(
+      options.handshake_timeout,
+      1,
+      defaults.handshake_timeout_ms,
+      "handshake_timeout",
+    ),
+    drain_timeout_ms: at_least(
+      options.drain_timeout,
+      1,
+      defaults.drain_timeout_ms,
+      "drain_timeout",
+    ),
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
-    file_read_threshold:,
-    body_read_timeout: options.body_read_timeout,
+    file_read_threshold: at_least(
+      options.file_read_threshold,
+      0,
+      defaults.file_read_threshold,
+      "file_read_threshold",
+    ),
+    body_read_timeout: at_least(
+      options.body_read_timeout,
+      1,
+      defaults.body_read_timeout,
+      "body_read_timeout",
+    ),
   )
 }
 
@@ -874,6 +1013,7 @@ pub fn start(
       ),
       loop: handler_.loop,
     )
+    |> glisten.with_http2
 
   let pool = case builder.tls {
     Some(Disk(cert:, key:)) ->
@@ -886,13 +1026,6 @@ pub fn start(
         key_type: to_internal_tls_key_type(key_type),
         key:,
       )
-    None -> pool
-  }
-
-  // h2c needs nothing announced but over TLS a client only knows HTTP/2 is on
-  // offer if ALPN says so.
-  let pool = case builder.tls {
-    Some(_tls) -> glisten.with_http2(pool)
     None -> pool
   }
 
@@ -1105,6 +1238,8 @@ pub fn read_body_chunk(
   max_chunk_bytes max_chunk_bytes: Int,
   limit limit: Int,
 ) -> Result(ReadEvent, BodyError) {
+  let max_chunk_bytes = int.max(max_chunk_bytes, 1)
+
   case req.body {
     connection.Http1(connection) -> {
       case http1_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
@@ -1224,8 +1359,6 @@ pub fn socket_reason_to_string(reason: SocketReason) -> String {
 fn from_interrupted(interrupted: http2.Interrupted) -> SendError {
   case interrupted {
     http2.StreamReset -> StreamReset
-    // A write is never given a deadline, so the only way one reports a
-    // timeout is the connection having stopped answering at all.
     http2.ConnectionClosed | http2.TimedOut -> ConnectionClosed
   }
 }
@@ -1291,8 +1424,6 @@ pub fn stream_response(
   response: response.Response(a),
   handler: fn(ResponseWriter) -> Result(Nil, SendError),
 ) -> response.Response(Body) {
-  // What the handler was left holding when a write failed is its own business,
-  // ewe already learns whether the stream finished from the writer.
   let stream = fn(writer) {
     let _sent = handler(writer)
     Nil

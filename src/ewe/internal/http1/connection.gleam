@@ -4,9 +4,8 @@ import glisten/socket
 import glisten/transport
 import websocks
 
-/// The limits and timeouts an HTTP/1 connection is held to.
-pub type Config {
-  Config(
+pub type Options {
+  Options(
     max_request_line: Int,
     max_header_line: Int,
     max_headers: Int,
@@ -18,8 +17,8 @@ pub type Config {
   )
 }
 
-pub fn default_config() -> Config {
-  Config(
+pub fn default_options() -> Options {
+  Options(
     max_request_line: 8192,
     max_header_line: 8192,
     max_headers: 100,
@@ -40,26 +39,19 @@ pub type Connection {
     framing: Framing,
     read: Int,
     chunk_remaining: Int,
-    config: Config,
+    options: Options,
     upgrade: option.Option(Upgrade),
   )
 }
 
-/// How many socket messages a stream is delivered before it has to ask for
-/// more. Bounded so a peer that keeps sending cannot grow the mailbox faster
-/// than the loop drains it.
 pub const active_count = 100
 
-/// How the request body declares its length.
 pub type Framing {
   Fixed(length: Int)
   Chunked
   NoBody
 }
 
-/// What a request asked to become instead of HTTP/1, gathered as the headers
-/// go past rather than looked up again afterwards. Whether the fields amount to
-/// a handshake is for whoever answers it to decide.
 pub type Upgrade {
   WebsocketUpgrade(
     key: option.Option(String),
@@ -69,8 +61,6 @@ pub type Upgrade {
   OtherUpgrade(name: String)
 }
 
-/// Handlers run inside the connection process, so they report what they did to
-/// the request body and the response stream by messaging it.
 pub type Signal {
   BodySignal(BodySignal)
   StreamSignal(StreamSignal)
@@ -96,13 +86,11 @@ pub type ResponseWriter {
   )
 }
 
-/// Whether the connection survives the response, or is closed once it is done.
 pub type KeepAlive {
   KeepAlive
   CloseAfterResponse
 }
 
-/// The connection is only reusable when every party to the exchange agrees.
 pub fn and_keep_alive(left: KeepAlive, right: KeepAlive) -> KeepAlive {
   case left {
     KeepAlive -> right
@@ -110,8 +98,6 @@ pub fn and_keep_alive(left: KeepAlive, right: KeepAlive) -> KeepAlive {
   }
 }
 
-/// How a streamed response body delimits itself: `chunked` transfer encoding on
-/// HTTP/1.1, or by closing the connection on HTTP/1.0.
 pub type StreamFraming {
   ChunkedStream
   CloseDelimitedStream
@@ -126,8 +112,6 @@ pub type SseConnection {
   )
 }
 
-/// The connection has stopped being HTTP by this point so there is nothing to
-/// keep alive and nothing to report back about reuse.
 pub type WebsocketConnection {
   WebsocketConnection(
     transport: transport.Transport,

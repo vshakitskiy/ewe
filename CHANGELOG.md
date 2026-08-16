@@ -27,7 +27,8 @@
 - Add `Http1Options`, `default_http1_options` and `with_http1` to set the limits
   and timeouts for every HTTP/1 connection. The request line, header line and
   header count limits, chunk size line limit, idle and body read timeouts, and
-  the auto drain limit and chunk size.
+  the auto drain limit and chunk size. A value outside the range a field accepts
+  is replaced with the default and logged as a warning when the server starts.
 - Move `idle_timeout` from a builder function to a field of `Http1Options`.
 
 ### HTTP/2
@@ -40,7 +41,8 @@
   their refill marks, frame and header list sizes, the HPACK table size, the
   CONTINUATION and header block caps, the Rapid Reset window and threshold, the
   handshake, drain and body read timeouts, and the file read threshold. A value
-  the protocol does not allow is replaced with the default.
+  outside the range a field accepts is replaced with the default and logged as a 
+  warning when the server starts.
 
 ### Requests and responses
 

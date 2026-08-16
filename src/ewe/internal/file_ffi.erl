@@ -44,8 +44,6 @@ pread(Fd, Offset, Length) ->
 
 read_range(_Path, _Offset, 0) ->
   {ok, <<>>};
-%% A short read means the file shrank between being sized and being read which
-%% leaves no correct body to send so it is reported rather than padded over.
 read_range(Path, Offset, Length) ->
   case open(Path) of
     {ok, Fd} ->

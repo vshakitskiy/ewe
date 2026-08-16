@@ -25,8 +25,6 @@ pub fn read_body(
       send_body_signal(self, http1.BodyDrained(leftover:))
       Ok(#(body, trailers))
     }
-    // An oversized fixed body was rejected before reading anything, so the
-    // outer loop can still drain it and reuse the connection.
     http1.Fixed(_length), Error(BodyTooLarge) -> Error(BodyTooLarge)
     _framing, Error(error) -> {
       send_body_signal(self, http1.BodyAbandoned)
@@ -141,7 +139,7 @@ fn pull_fixed_chunk(
         socket,
         buffer,
         want,
-        conn.config.body_read_timeout,
+        conn.options.body_read_timeout,
       ))
       let conn = http1.Connection(..conn, buffer: leftover, read: read + want)
       Ok(PulledChunk(data, conn))
@@ -180,7 +178,7 @@ fn pull_chunked_chunk(
   chunk_remaining: Int,
   max_chunk_bytes: Int,
 ) -> Result(Pulled, parser.ParseError) {
-  let http1.Connection(transport:, socket:, buffer:, config:, ..) = conn
+  let http1.Connection(transport:, socket:, buffer:, options:, ..) = conn
 
   case chunk_remaining {
     0 -> {
@@ -189,8 +187,8 @@ fn pull_chunked_chunk(
           transport,
           socket,
           buffer,
-          config.body_read_timeout,
-          parse_chunk_line(_, config),
+          options.body_read_timeout,
+          parse_chunk_line(_, options),
         ),
       )
 
@@ -201,14 +199,14 @@ fn pull_chunked_chunk(
               transport,
               socket,
               buffer,
-              config.body_read_timeout,
+              options.body_read_timeout,
             )
             parser.parse_headers(
               buffer,
               [],
               0,
               parser.initial_header_state(),
-              config,
+              options,
             )
           })
 
@@ -243,7 +241,7 @@ fn take_chunk_slice(
       transport,
       socket,
       buffer,
-      conn.config.body_read_timeout,
+      conn.options.body_read_timeout,
     )
     take_chunk_prefix(buffer, want, slice)
   })
@@ -285,11 +283,11 @@ fn pull_until(
 
 fn parse_chunk_line(
   buffer: BitArray,
-  config: http1.Config,
+  options: http1.Options,
 ) -> parser.Step(#(Int, BitArray)) {
   use #(line, remaining) <- parser.try_step(parser.extract_line(
     buffer,
-    config.max_chunk_size_line,
+    options.max_chunk_size_line,
     parser.ChunkSizeLineTooLong,
     parser.BadChunkSize,
   ))
@@ -317,8 +315,6 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
   }
 }
 
-/// Whether a slice reaches the end of the current chunk, and so must be 
-/// followed by the chunk's trailing CRLF.
 type Slice {
   LastSlice
   PartialSlice

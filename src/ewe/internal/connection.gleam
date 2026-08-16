@@ -26,8 +26,6 @@ pub type Sse {
   SseMetadata(handler: fn(SseConnection) -> Outcome)
 }
 
-/// The context is built during the handshake where the negotiated extensions
-/// are known and handed to whichever protocol goes on to run the socket.
 pub type Websocket {
   WebsocketMetadata(
     context: websocks.Context,
@@ -39,13 +37,8 @@ pub type Streaming {
   StreamingMetadata(handler: fn(ResponseWriter) -> Nil)
 }
 
-/// A raw descriptor belongs to the process that opened it, so whether the
-/// handler can carry one depends on the protocol. An HTTP/1 handler runs in the
-/// process that writes the socket, an HTTP/2 stream handler does not.
 pub type File {
-  /// Already open, and closed by whoever writes or drops the response.
   OpenFile(handle: FileDescriptor, offset: Int, length: Int)
-  /// Sized but not yet open; the connection process opens it at send time.
   PendingFile(path: String, offset: Int, length: Int)
 }
 
@@ -61,8 +54,6 @@ pub type SseConnection {
   Http2Sse(http2.SseConnection(Body))
 }
 
-/// HTTP/2 carries WebSockets over extended CONNECT (RFC 8441), which ewe does
-/// not negotiate yet.
 pub type WebsocketConnection {
   Http1Websocket(http1.WebsocketConnection)
 }
@@ -78,12 +69,9 @@ pub type Message {
   Http2Stream(http2.Reply(Body))
   Http2Exit(process.ExitMessage)
   Http2Drain
-  /// A stream process that outstayed the grace it was given after a reset.
   Http2StreamClose(pid: process.Pid)
 }
 
-/// Concatenating onto an empty buffer would copy the incoming bytes for
-/// nothing, which is the common case on a connection with no pipelining.
 pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
   case buffer {
     <<>> -> data

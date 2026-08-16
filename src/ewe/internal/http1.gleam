@@ -23,7 +23,7 @@ pub type State {
       response.Response(connection.Body),
     buffer: BitArray,
     idle_timer: option.Option(process.Timer),
-    config: http1.Config,
+    options: http1.Options,
   )
 }
 
@@ -45,7 +45,7 @@ pub fn handle_message(
 ) -> Next {
   connection.cancel_idle_timer(state.idle_timer)
 
-  case parser.parse(state.buffer, state.config) {
+  case parser.parse(state.buffer, state.options) {
     Ok(parser.Complete(head, metadata, remaining)) -> {
       let self = process.new_subject()
 
@@ -58,7 +58,7 @@ pub fn handle_message(
           framing: metadata.framing,
           read: 0,
           chunk_remaining: 0,
-          config: state.config,
+          options: state.options,
           upgrade: metadata.upgrade,
         )
 
@@ -69,7 +69,7 @@ pub fn handle_message(
         Ok(response) -> {
           let drained = drain_messages(self)
           let ResolvedBody(buffer, body_keep_alive) =
-            resolve_body(body_connection, drained.body, state.config)
+            resolve_body(body_connection, drained.body, state.options)
           let keep_alive =
             http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
@@ -115,7 +115,7 @@ pub fn handle_message(
     }
     Ok(parser.Incomplete) -> {
       let idle_timer =
-        connection.start_idle_timer(connection, state.config.idle_timeout)
+        connection.start_idle_timer(connection, state.options.idle_timeout)
       Continue(State(..state, idle_timer:))
     }
     Error(error) -> {
@@ -136,8 +136,6 @@ pub fn handle_message(
   }
 }
 
-/// A handler that crashed has said nothing about what it read or meant to
-/// send so the connection is answered and dropped rather than handed back.
 fn crashed(
   connection: glisten.Connection(connection.Message),
   details: String,
@@ -157,8 +155,6 @@ fn crashed(
   Close
 }
 
-/// A pipelining client sends its next request without waiting for this
-/// response so anything left over has to be handled now.
 fn await_next_request(
   state: State,
   buffer: BitArray,
@@ -167,7 +163,7 @@ fn await_next_request(
   case buffer {
     <<>> -> {
       let idle_timer =
-        connection.start_idle_timer(connection, state.config.idle_timeout)
+        connection.start_idle_timer(connection, state.options.idle_timeout)
       Continue(State(..state, buffer:, idle_timer:))
     }
     _buffer ->
@@ -219,8 +215,6 @@ fn send_response(
       ))
       Ok(to_sent(keep_alive))
     }
-    // `file.send` owns the descriptor once it is reached, so only a head that
-    // never made it to the socket leaves one to hand back.
     encoder.RemainderFile(data) ->
       case transport.send(transport, socket, head) {
         Error(reason) -> {
@@ -245,7 +239,6 @@ fn send_response(
         ))
 
       case rescue.handler(fn() { stream_handler(writer) }) {
-        // The head is already on the wire so no other answer can be given.
         Error(details) -> {
           logging.log(
             logging.Error,
@@ -258,9 +251,6 @@ fn send_response(
           case drained.stream {
             option.Some(http1.StreamFinished(keep_alive:)) ->
               Ok(to_sent(keep_alive))
-            // A handler that returns without finishing left the body 
-            // unterminated, so close it out here and drop a connection we can
-            // no longer reuse.
             option.None -> {
               let _ = encoder.end_stream(transport, socket, framing)
               Ok(SentClose)
@@ -269,8 +259,6 @@ fn send_response(
         }
       }
     }
-    // Once the handshake is written the connection has stopped being HTTP, so
-    // it never goes back to the request loop however the socket ends.
     encoder.RemainderWebsocket(context:, handler: websocket_handler) -> {
       use Nil <- result.try(transport.send(transport, socket, head))
 
@@ -294,8 +282,6 @@ fn send_response(
 
       let _ = encoder.end_stream(transport, socket, framing)
 
-      // The stream reports whether it left the socket at a point another
-      // request could start from.
       let drained = drain_messages(self)
       let stream_keep_alive = case drained.stream {
         option.Some(http1.StreamFinished(keep_alive:)) -> keep_alive
@@ -320,9 +306,6 @@ fn to_sent(keep_alive: http1.KeepAlive) -> Sent {
   }
 }
 
-/// What the request body left behind: the bytes after it, which begin the next
-/// pipelined request, and whether it was consumed cleanly enough to reuse the
-/// connection at all.
 type ResolvedBody {
   ResolvedBody(leftover: BitArray, keep_alive: http1.KeepAlive)
 }
@@ -330,7 +313,7 @@ type ResolvedBody {
 fn resolve_body(
   conn: http1.Connection,
   drained: option.Option(http1.BodySignal),
-  config: http1.Config,
+  options: http1.Options,
 ) -> ResolvedBody {
   case drained {
     option.Some(http1.BodyDrained(leftover)) ->
@@ -339,8 +322,8 @@ fn resolve_body(
       ResolvedBody(<<>>, http1.CloseAfterResponse)
     option.Some(http1.BodyProgress(buffer:, read:, chunk_remaining:)) ->
       http1.Connection(..conn, buffer:, read:, chunk_remaining:)
-      |> drain_remaining(config)
-    option.None -> drain_remaining(conn, config)
+      |> drain_remaining(options)
+    option.None -> drain_remaining(conn, options)
   }
 }
 
@@ -370,19 +353,20 @@ fn do_drain_messages(
 
 fn drain_remaining(
   conn: http1.Connection,
-  config: http1.Config,
+  options: http1.Options,
 ) -> ResolvedBody {
   let http1.Connection(read:, ..) = conn
-  do_drain_remaining(conn, read + config.auto_drain_limit, config)
+  do_drain_remaining(conn, read + options.auto_drain_limit, options)
 }
 
 fn do_drain_remaining(
   conn: http1.Connection,
   limit: Int,
-  config: http1.Config,
+  options: http1.Options,
 ) -> ResolvedBody {
-  case body.pull_chunk(conn, config.auto_drain_chunk_bytes, limit) {
-    Ok(body.PulledChunk(_data, next)) -> do_drain_remaining(next, limit, config)
+  case body.pull_chunk(conn, options.auto_drain_chunk_bytes, limit) {
+    Ok(body.PulledChunk(_data, next)) ->
+      do_drain_remaining(next, limit, options)
     Ok(body.PulledDone(_trailers, leftover)) ->
       ResolvedBody(leftover, http1.KeepAlive)
     Error(_reason) -> ResolvedBody(<<>>, http1.CloseAfterResponse)

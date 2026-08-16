@@ -5,9 +5,8 @@ import gleam/http/response
 import gleam/option
 import glisten/socket
 
-/// The limits and timeouts an HTTP/2 connection is held to.
-pub type Config {
-  Config(
+pub type Options {
+  Options(
     max_concurrent_streams: option.Option(Int),
     initial_window_size: Int,
     max_frame_size: Int,
@@ -26,8 +25,8 @@ pub type Config {
   )
 }
 
-pub fn default_config() -> Config {
-  Config(
+pub fn default_options() -> Options {
+  Options(
     max_concurrent_streams: option.None,
     initial_window_size: 2_097_152,
     max_frame_size: 16_384,
@@ -46,30 +45,19 @@ pub fn default_config() -> Config {
   )
 }
 
-/// What a handler holds for one stream. The handler gets its own process, not
-/// the connection's. Reading the body and writing the response are messages,
-/// not socket writes.
-///
-/// The body type is a parameter to break the import cycle with the module that
-/// defines it.
 pub type Connection(body) {
   Connection(
     connection: process.Subject(Reply(body)),
     stream_id: Int,
     has_body: Bool,
-    /// Body bytes handed over but not yet returned to the caller.
     pending: BitArray,
     pending_trailers: option.Option(List(#(String, String))),
-    /// Body bytes read so far. `read_body_chunk` caps its limit against this.
     read: Int,
     body_read_timeout: Int,
-    /// Resolved once for the connection. A stream process has no socket to
-    /// ask.
     peer: Result(socket.SockName, Nil),
   )
 }
 
-/// What a stream process asks of the connection process.
 pub type Reply(body) {
   Respond(stream_id: Int, response: response.Response(body))
   ReadBody(stream_id: Int, reply_to: process.Subject(BodyEvent))
@@ -88,8 +76,6 @@ pub type Reply(body) {
   )
 }
 
-/// Which headers the connection sets itself for a streamed body. They get
-/// dropped from the handler's list so nothing goes out twice.
 pub type Reserved {
   Nothing
   SseHeaders
@@ -105,8 +91,6 @@ pub type WriteAck {
   WriteAck
 }
 
-/// A handle for writing a response a frame at a time. The connection tags its
-/// acks with the reference so a stream waits on it directly, no selector.
 pub type ResponseWriter(body) {
   ResponseWriter(
     connection: process.Subject(Reply(body)),
@@ -120,16 +104,12 @@ pub type SseConnection(body) {
   SseConnection(writer: ResponseWriter(body))
 }
 
-/// Why a stream process stopped waiting. Only a body read times out. It is the
-/// one wait that hangs on the client.
 pub type Interrupted {
   StreamReset
   ConnectionClosed
   TimedOut
 }
 
-/// Waits for the connection to answer. Gives up if the stream resets or the
-/// connection goes.
 @external(erlang, "http2_ffi", "recv_or_exit")
 pub fn receive_reply(tag: reference.Reference) -> Result(message, Interrupted)
 
@@ -139,8 +119,11 @@ pub fn receive_reply_within(
   timeout: Int,
 ) -> Result(message, Interrupted)
 
-/// `unsafely_create_subject` wants the tag the messages carry and the
-/// connection tags replies with a reference, so the two meet as `Dynamic`.
-/// Waiting on the reference directly saves building a selector per chunk.
 @external(erlang, "ewe_ffi", "identity")
 pub fn tag(reference: reference.Reference) -> dynamic.Dynamic
+
+@external(erlang, "http2_ffi", "parent_pid")
+pub fn parent_pid() -> Result(process.Pid, Nil)
+
+@external(erlang, "http2_ffi", "is_shutdown")
+pub fn is_shutdown(reason: dynamic.Dynamic) -> Bool

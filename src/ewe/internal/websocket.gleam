@@ -2,7 +2,6 @@ import ewe/internal/connection
 import gleam/erlang/process
 import gleam/option
 
-/// What a protocol's socket loop does once the handler has seen a message.
 pub type Step(user_state, user_message) {
   Proceed(
     user_state: user_state,

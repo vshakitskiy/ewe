@@ -11,8 +11,6 @@ import glisten/socket/options
 import glisten/transport
 import logging
 
-/// Runs a Server-Sent Events stream, reporting through `conn.self` whether the
-/// connection can carry another request afterwards.
 pub fn run(
   conn: http1.SseConnection,
   on_init: fn(process.Subject(user_message)) -> user_state,
@@ -31,8 +29,6 @@ pub fn run(
   }
 }
 
-/// Every way a stream ends runs the handler's `on_close`, reports whether the
-/// connection survived it, and answers with the outcome.
 fn ended(
   conn: http1.SseConnection,
   handle: connection.SseConnection,
@@ -41,15 +37,13 @@ fn ended(
   keep_alive: http1.KeepAlive,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  // A bug in `on_close` is still a bug but it must not take the connection
-  // down on the way out of a stream that has already ended.
-  // TODO: log for a user?
-  let _crashed = rescue.handler(fn() { on_close(handle, state) })
+  rescue.logged("server-sent events close handler", fn() {
+    on_close(handle, state)
+  })
   finished(conn, keep_alive)
   outcome
 }
 
-/// A stream the client hung up on or one the handler could no longer write to.
 fn dropped(
   conn: http1.SseConnection,
   handle: connection.SseConnection,
@@ -66,9 +60,6 @@ fn dropped(
   )
 }
 
-/// A handler that crashed cannot be asked what to do next so the stream is
-/// ended for it and the connection given up rather than the crash taking the
-/// whole process with it.
 fn crashed(
   conn: http1.SseConnection,
   handle: connection.SseConnection,
@@ -85,7 +76,6 @@ fn crashed(
   |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
 }
 
-/// The socket gave out, which ends the stream whatever it was doing.
 fn socket_failed(
   conn: http1.SseConnection,
   handle: connection.SseConnection,
@@ -98,8 +88,6 @@ fn socket_failed(
   |> ended(conn, handle, state, on_close, http1.CloseAfterResponse, _)
 }
 
-/// Whether anything happened during the stream that rules out handing the
-/// connection back for another request.
 type Reuse {
   Clean
   Spoiled
@@ -116,8 +104,6 @@ fn loop(
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
-    // Whatever the client sent has been taken off the socket and cannot be put
-    // back, so the connection is no longer safe to reuse.
     ClientData -> loop(conn, handle, selector, state, Spoiled, step, on_close)
     Exhausted ->
       case activate(conn) {
@@ -146,8 +132,6 @@ fn loop(
   }
 }
 
-/// Only a stream the handler ended itself, on a connection nothing else has
-/// touched, leaves the socket sitting exactly at the end of the response.
 fn keep_alive(outcome: connection.Outcome, reuse: Reuse) -> http1.KeepAlive {
   case outcome, reuse {
     connection.Stopped, Clean -> http1.KeepAlive
@@ -171,15 +155,12 @@ pub fn send(
   |> transport.send(conn.transport, conn.socket, _)
 }
 
-/// glisten rearms `{active, once}` only once its loop callback returns and an
-/// SSE stream does not return until it is over.
 fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketReason) {
   transport.set_opts(conn.transport, conn.socket, [
     options.ActiveMode(options.Count(http1.active_count)),
   ])
 }
 
-/// What woke the stream while it was waiting on the handler's subject.
 type Received(user_message) {
   Message(user_message)
   Disconnected
@@ -188,8 +169,6 @@ type Received(user_message) {
   Exhausted
 }
 
-/// glisten handles socket messages in its own loop, which is blocked for the
-/// duration of the stream, so the stream has to match them itself.
 fn selector(
   subject: process.Subject(user_message),
 ) -> process.Selector(Received(user_message)) {
@@ -219,7 +198,6 @@ fn failed(record: dynamic.Dynamic) -> Received(user_message) {
   |> Failed
 }
 
-/// Clients are not expected to send anything once the stream is open.
 fn client_data(_record: dynamic.Dynamic) -> Received(user_message) {
   ClientData
 }

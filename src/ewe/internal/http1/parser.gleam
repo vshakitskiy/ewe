@@ -78,8 +78,6 @@ pub fn error_to_string(error: ParseError) -> String {
   }
 }
 
-/// The status a rejected request is answered with, so the client is told why
-/// rather than left to work it out from a closed socket.
 pub fn error_to_status(error: ParseError) -> Int {
   case error {
     RequestLineTooLong -> 414
@@ -111,12 +109,12 @@ pub type Parsed {
 
 pub fn parse(
   buffer: BitArray,
-  config: http1.Config,
+  options: http1.Options,
 ) -> Result(Parsed, ParseError) {
   let step = {
     use #(method, target, version, remaining) <- try_step(parse_request_line(
       buffer,
-      config,
+      options,
     ))
 
     use #(headers, state, remaining) <- try_step(parse_headers(
@@ -124,7 +122,7 @@ pub fn parse(
       [],
       0,
       initial_header_state(),
-      config,
+      options,
     ))
 
     use #(host, port, path, query) <- try_step(resolve_target(
@@ -166,11 +164,11 @@ pub fn try_step(step: Step(a), next: fn(a) -> Step(b)) -> Step(b) {
 
 fn parse_request_line(
   buffer: BitArray,
-  config: http1.Config,
+  options: http1.Options,
 ) -> Step(#(http.Method, BitArray, Version, BitArray)) {
   use #(line, remaining) <- try_step(extract_line(
     buffer,
-    config.max_request_line,
+    options.max_request_line,
     RequestLineTooLong,
     BadRequestLine,
   ))
@@ -391,17 +389,12 @@ fn parse_decimal_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
   }
 }
 
-/// What the request's `Connection` header asked for, before the version's
-/// default is applied.
 pub type ConnectionIntent {
   RequestedKeepAlive
   RequestedClose
   NothingRequested
 }
 
-/// The final transfer coding the request declared. Only `chunked` delimits a
-/// body, and it is the only coding decoded here, so anything else leaves a
-/// length that cannot be determined.
 pub type TransferEncoding {
   NoTransferEncoding
   ChunkedFinal
@@ -442,8 +435,6 @@ fn resolve_metadata(state: HeaderState, version: Version) -> Step(Metadata) {
     option.Some(_length), ChunkedFinal -> ParseError(AmbiguousFraming)
     option.Some(length), NoTransferEncoding ->
       StepDone(complete_metadata(state, version, http1.Fixed(length)))
-    // HTTP/1.0 has no chunked coding, so a body claiming it has no framing at
-    // all and cannot be told apart from the next request.
     option.None, ChunkedFinal ->
       case version {
         Http11 -> StepDone(complete_metadata(state, version, http1.Chunked))
@@ -468,8 +459,6 @@ fn complete_metadata(
   Metadata(framing:, keep_alive:, upgrade: resolve_upgrade(state))
 }
 
-/// An `Upgrade` header only asks for anything if the `Connection` header named
-/// it, so one without the other is nothing.
 fn resolve_upgrade(state: HeaderState) -> option.Option(http1.Upgrade) {
   case state.connection_upgrade, state.upgrade {
     True, option.Some("websocket") ->
@@ -488,21 +477,21 @@ pub fn parse_headers(
   acc: List(#(String, String)),
   count: Int,
   state: HeaderState,
-  config: http1.Config,
+  options: http1.Options,
 ) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
   use #(line, remaining) <- try_step(extract_line(
     buffer,
-    config.max_header_line,
+    options.max_header_line,
     HeaderLineTooLong,
     BadHeader,
   ))
 
   case line {
     <<>> -> StepDone(#(list.reverse(acc), state, remaining))
-    _line if count >= config.max_headers -> ParseError(TooManyHeaders)
+    _line if count >= options.max_headers -> ParseError(TooManyHeaders)
     _line -> {
       use #(header, state) <- try_step(parse_header_line(line, state))
-      parse_headers(remaining, [header, ..acc], count + 1, state, config)
+      parse_headers(remaining, [header, ..acc], count + 1, state, options)
     }
   }
 }
@@ -550,8 +539,6 @@ fn classify(
             Error(Nil) -> ParseError(BadContentLength)
           }
       }
-    // Repeated headers concatenate into one coding list, so the last one seen
-    // carries the final coding.
     "transfer-encoding" -> {
       let transfer_encoding = case value |> lowercase_ascii |> tokens {
         [<<"chunked":utf8>>] -> ChunkedFinal
@@ -577,8 +564,6 @@ fn classify(
       let lowered = value |> lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, upgrade: option.Some(lowered)))
     }
-    // The key is base64 and is echoed back as sent, so unlike the rest it is
-    // kept with its case.
     "sec-websocket-key" ->
       StepDone(
         HeaderState(
@@ -626,8 +611,6 @@ pub fn extract_line(
         False -> More
       }
     Ok(0) -> ParseError(malformed)
-    // The check above only bounds what is buffered while the line is still
-    // arriving, so a line that turns up whole in one packet is measured here.
     Ok(position) ->
       case position - 1 > max_len {
         True -> ParseError(too_long)
@@ -667,8 +650,6 @@ fn trim_trailing_ows(bits: BitArray) -> BitArray {
   }
 }
 
-/// The comma separated list a header value carries, one trimmed token per
-/// element.
 pub fn tokens(value: BitArray) -> List(BitArray) {
   split_comma(value) |> list.map(trim_ows)
 }

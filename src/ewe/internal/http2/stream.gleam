@@ -53,8 +53,6 @@ fn deliver(
   case response.body {
     connection.Streaming(connection.StreamingMetadata(handler:)) ->
       case begin(reply_to, stream_id, response, http2.Nothing) {
-        // Nothing was written and nothing can be. No stream left to produce
-        // a body for.
         Error(_interrupted) -> Nil
         Ok(writer) -> handler(connection.Http2Writer(writer))
       }
@@ -67,8 +65,6 @@ fn deliver(
             connection.StoppedAbnormal(reason) -> abort(reason)
           }
       }
-    // A WebSocket body never gets here. The handshake needs extended CONNECT
-    // and is refused long before a handler returns one.
     connection.Websocket(_metadata) -> {
       logging.log(
         logging.Error,
@@ -85,8 +81,6 @@ fn deliver(
   }
 }
 
-/// Writes the response head. A handler only gets a writer once the client has
-/// something to hang the body off.
 fn begin(
   reply_to: process.Subject(http2.Reply(connection.Body)),
   stream_id: Int,
@@ -111,8 +105,6 @@ fn begin(
   http2.ResponseWriter(connection: reply_to, stream_id:, ack:, ack_ref:)
 }
 
-/// Sends one body chunk. Returns once the connection has it on the wire. An
-/// empty chunk gets no frame.
 pub fn send_chunk(
   writer: http2.ResponseWriter(connection.Body),
   chunk: BitArray,
@@ -136,9 +128,6 @@ pub fn finish_response(
   finish_chunk(writer, <<>>)
 }
 
-/// Waiting on the ack is how flow control reaches the handler. The connection
-/// answers once the bytes are gone, so a handler outrunning the client blocks
-/// here.
 fn write(
   writer: http2.ResponseWriter(connection.Body),
   chunk: BitArray,

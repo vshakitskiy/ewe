@@ -47,9 +47,9 @@ fn handle_request(
 }
 
 // Behind a proxy this is the proxy's address and not the browser's. The address
-// the proxy puts in `x-forwarded-for` is the one to use there but only when
-// the proxy is yours, since any client can send that header itself.
-//
+// the proxy puts in `x-forwarded-for` is the one to use there. 
+// 
+// See https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For
 fn describe_client(connection: ewe.Connection) -> String {
   case ewe.get_client_info(connection) {
     Ok(ewe.TcpSocketAddress(ip_address:, port:)) -> {

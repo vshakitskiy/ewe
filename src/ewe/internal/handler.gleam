@@ -12,10 +12,8 @@ import glisten/socket/options
 import glisten/transport
 import logging
 
-/// The connection's protocol, still undecided until the HTTP/2 preface has been
-/// ruled in or out.
 pub type State {
-  Initialised(http1.State, http2_connection.Config)
+  Initialised(http1.State, http2_connection.Options)
   Http1(http1.State)
   Http2(http2.State)
 }
@@ -23,8 +21,8 @@ pub type State {
 pub fn on_init(
   handler: fn(request.Request(connection.Connection)) ->
     response.Response(connection.Body),
-  http1_config: http1_connection.Config,
-  http2_config: http2_connection.Config,
+  http1_options: http1_connection.Options,
+  http2_options: http2_connection.Options,
 ) {
   fn(connection: glisten.Connection(connection.Message)) -> #(
     State,
@@ -36,12 +34,12 @@ pub fn on_init(
         buffer: <<>>,
         idle_timer: connection.start_idle_timer(
           connection,
-          http1_config.idle_timeout,
+          http1_options.idle_timeout,
         ),
-        config: http1_config,
+        options: http1_options,
       )
 
-    #(Initialised(state, http2_config), option.None)
+    #(Initialised(state, http2_options), option.None)
   }
 }
 
@@ -51,7 +49,7 @@ pub fn loop(
   connection: glisten.Connection(connection.Message),
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {
   case state, message {
-    Initialised(state, http2_config), glisten.Packet(data) -> {
+    Initialised(state, http2_options), glisten.Packet(data) -> {
       connection.cancel_idle_timer(state.idle_timer)
       let buffer = connection.append_buffer(state.buffer, data)
 
@@ -62,13 +60,13 @@ pub fn loop(
             buffer:,
             idle_timer: connection.start_idle_timer(
               connection,
-              state.config.idle_timeout,
+              state.options.idle_timeout,
             ),
           )
-          |> Initialised(http2_config)
+          |> Initialised(http2_options)
           |> glisten.continue
         Http2Preface(remaining:) ->
-          start_http2(connection, state.handler, http2_config, remaining)
+          start_http2(connection, state.handler, http2_options, remaining)
         NotHttp2(buffer:) ->
           http1.State(..state, buffer:, idle_timer: option.None)
           |> http1.handle_message(connection)
@@ -94,13 +92,11 @@ pub fn loop(
   }
 }
 
-/// Takes the connection over for HTTP/2. The client's already waiting on our
-/// SETTINGS by now, so that goes out first.
 fn start_http2(
   connection: glisten.Connection(connection.Message),
   handler: fn(request.Request(connection.Connection)) ->
     response.Response(connection.Body),
-  config: http2_connection.Config,
+  options: http2_connection.Options,
   remaining: BitArray,
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {
   process.trap_exits(True)
@@ -109,8 +105,9 @@ fn start_http2(
   let replies = process.new_subject()
 
   let peer = transport.peername(connection.transport, connection.socket)
+  let parent = http2_connection.parent_pid()
 
-  let state = http2.init(handler, config, self, replies, peer)
+  let state = http2.init(handler, options, self, replies, peer, parent)
 
   let selector =
     process.new_selector()

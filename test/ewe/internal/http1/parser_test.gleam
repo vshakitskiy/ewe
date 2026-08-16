@@ -4,7 +4,7 @@ import gleam/http
 import gleam/option.{None, Some}
 
 fn parse(buffer: BitArray) -> Result(parser.Parsed, parser.ParseError) {
-  parser.parse(buffer, http1.default_config())
+  parser.parse(buffer, http1.default_options())
 }
 
 pub fn simple_get_test() {
@@ -170,9 +170,9 @@ pub fn configured_max_headers_is_applied_test() {
   let buffer = <<
     "GET / HTTP/1.1\r\nHost: example.com\r\nX-A: 1\r\nX-B: 2\r\n\r\n":utf8,
   >>
-  let config = http1.Config(..http1.default_config(), max_headers: 2)
+  let options = http1.Options(..http1.default_options(), max_headers: 2)
 
-  assert parser.parse(buffer, config) == Error(parser.TooManyHeaders)
+  assert parser.parse(buffer, options) == Error(parser.TooManyHeaders)
   let assert Ok(parser.Complete(..)) = parse(buffer)
     as "the same request is fine under the default limit"
 }
@@ -181,16 +181,16 @@ pub fn configured_max_request_line_is_applied_test() {
   let buffer = <<
     "GET /a/fairly/long/path HTTP/1.1\r\nHost: example.com\r\n":utf8,
   >>
-  let config = http1.Config(..http1.default_config(), max_request_line: 8)
+  let options = http1.Options(..http1.default_options(), max_request_line: 8)
 
-  assert parser.parse(buffer, config) == Error(parser.RequestLineTooLong)
+  assert parser.parse(buffer, options) == Error(parser.RequestLineTooLong)
 }
 
 pub fn configured_max_header_line_is_applied_test() {
   let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n":utf8>>
-  let config = http1.Config(..http1.default_config(), max_header_line: 4)
+  let options = http1.Options(..http1.default_options(), max_header_line: 4)
 
-  assert parser.parse(buffer, config) == Error(parser.HeaderLineTooLong)
+  assert parser.parse(buffer, options) == Error(parser.HeaderLineTooLong)
 }
 
 pub fn rejections_carry_a_status_test() {
@@ -429,7 +429,6 @@ pub fn websocket_handshake_fields_collected_test() {
 
   assert metadata.upgrade
     == Some(http1.WebsocketUpgrade(
-      // Base64 is case sensitive, so the key alone keeps the case it arrived in.
       key: Some("dGhlIHNhbXBsZSBub25jZQ=="),
       version: Some("13"),
       extensions: Some("permessage-deflate; client_max_window_bits"),

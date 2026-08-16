@@ -36,7 +36,6 @@ fn read_all(
   }
 }
 
-/// The result of one `read_body_chunk` call.
 pub type ReadEvent(body) {
   Chunk(data: BitArray, connection: http2.Connection(body))
   Done(trailers: List(#(String, String)))
@@ -58,7 +57,6 @@ pub fn read_body_chunk(
   }
 }
 
-/// Leftovers past `max_chunk_bytes` wait on the connection for the next call.
 fn split(
   connection: http2.Connection(body),
   data: BitArray,
@@ -78,7 +76,6 @@ fn next_chunk(
     False, _pending, _trailers -> Ok(Done([]))
     True, <<>>, option.Some(trailers) -> Ok(Done(trailers))
     True, <<>>, option.None -> pull(connection)
-    // Owed from the last split. Hand these back before asking for more.
     True, pending, _trailers ->
       Ok(Chunk(pending, http2.Connection(..connection, pending: <<>>)))
   }

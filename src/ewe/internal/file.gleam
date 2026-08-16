@@ -64,7 +64,6 @@ fn range(
   }
 }
 
-/// Hands back a descriptor. 
 pub fn release(file: connection.File) -> Nil {
   case file {
     connection.OpenFile(handle:, ..) -> close(handle)
@@ -92,14 +91,11 @@ pub fn send(
   case file {
     connection.OpenFile(handle:, offset:, length:) ->
       send_handle(transport, socket, handle, offset, length)
-    // Only HTTP/2 leaves a file unopened and its connection process opens one
-    // itself rather than writing it through here.
     connection.PendingFile(..) ->
       panic as "an unopened file cannot be written to an HTTP/1 socket"
   }
 }
 
-/// Owns the descriptor from here on so it is closed however the write ends.
 fn send_handle(
   transport: transport.Transport,
   socket: socket.Socket,
@@ -113,9 +109,6 @@ fn send_handle(
   sent
 }
 
-/// Writes one range of an open file leaving the descriptor open. HTTP/2 sizes
-/// each range to the stream's send window and comes back for the next one so
-/// the descriptor has to outlive the individual write.
 pub fn send_chunk(
   transport: transport.Transport,
   socket: socket.Socket,

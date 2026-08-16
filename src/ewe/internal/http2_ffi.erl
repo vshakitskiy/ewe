@@ -14,7 +14,9 @@
     colon_pattern/0,
     exit_self/1,
     recv_or_exit/1,
-    recv_or_exit/2
+    recv_or_exit/2,
+    parent_pid/0,
+    is_shutdown/1
 ]).
 
 
@@ -42,6 +44,15 @@ monotonic_ms() ->
 
 exit_self(Reason) ->
   erlang:exit(Reason).
+
+parent_pid() ->
+  case erlang:process_info(self(), parent) of
+    {parent, Pid} when is_pid(Pid) -> {ok, Pid};
+    _Other -> {error, nil}
+  end.
+
+is_shutdown(shutdown) -> true;
+is_shutdown(_Reason) -> false.
 
 recv_or_exit(Ref) ->
   receive

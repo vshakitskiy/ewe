@@ -228,13 +228,13 @@ pub fn non_continuation_mid_assembly_is_protocol_error_test() {
 pub fn add_fragment_within_limits_test() {
   let assembly = connection.HeaderAssembly(1, True, 1, <<"a":utf8>>, False)
   let assert Ok(updated) =
-    connection.add_fragment(assembly, <<"b":utf8>>, http2.default_config())
+    connection.add_fragment(assembly, <<"b":utf8>>, http2.default_options())
   assert updated == connection.HeaderAssembly(1, True, 2, <<"ab":utf8>>, False)
 }
 
 pub fn add_fragment_over_count_cap_is_enhance_your_calm_test() {
   let assembly = connection.HeaderAssembly(1, True, 100, <<>>, False)
-  let result = connection.add_fragment(assembly, <<>>, http2.default_config())
+  let result = connection.add_fragment(assembly, <<>>, http2.default_options())
   assert result == Error(frame.EnhanceYourCalm)
 }
 
@@ -242,7 +242,7 @@ pub fn add_fragment_over_byte_cap_is_enhance_your_calm_test() {
   let assembly =
     connection.HeaderAssembly(1, True, 1, <<0:size({ 65_536 * 8 })>>, False)
   let result =
-    connection.add_fragment(assembly, <<"x":utf8>>, http2.default_config())
+    connection.add_fragment(assembly, <<"x":utf8>>, http2.default_options())
   assert result == Error(frame.EnhanceYourCalm)
 }
 
@@ -258,9 +258,9 @@ pub fn complete_header_block_oversized_list_is_enhance_your_calm_test() {
   let field =
     alpacki.HeaderField(<<"x":utf8>>, big_value, alpacki.WithoutIndexing)
   let assembly = connection.HeaderAssembly(1, True, 1, encode([field]), False)
-  let config =
-    http2.Config(..http2.default_config(), max_header_list_size: Some(16_384))
-  let state = connection.State(..connection.test_state(), config:)
+  let options =
+    http2.Options(..http2.default_options(), max_header_list_size: Some(16_384))
+  let state = connection.State(..connection.test_state(), options:)
   let result = connection.complete_header_block(state, assembly)
   assert result == connection.Terminate(Some(frame.EnhanceYourCalm))
 }
@@ -811,6 +811,47 @@ pub fn handle_data_sends_done_to_parked_reader_on_empty_end_stream_test() {
   let assert Ok(http2.DoneEvent([])) = process.receive(reply_to, 100)
 }
 
+pub fn handle_data_keeps_reader_parked_on_empty_open_frame_test() {
+  let reply_to = process.new_subject()
+  let entry = inbound_stream(2_097_152, Some(reply_to))
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, entry)]),
+      highest_client_stream_id_seen: 1,
+      conn_recv_window: 2_097_152,
+    )
+
+  let assert connection.Proceed(state) =
+    connection.handle_data(state, 1, False, <<>>, 0)
+
+  assert process.receive(reply_to, 0) == Error(Nil)
+
+  let assert Ok(updated) = dict.get(state.streams, 1)
+  assert updated.parked_reader == Some(reply_to)
+  assert updated.request_half_closed == False
+}
+
+pub fn handle_data_keeps_trailers_left_by_an_earlier_block_test() {
+  let entry =
+    connection.Stream(..inbound_stream(2_097_152, None), trailers: [
+      #("x-checksum", "deadbeef"),
+    ])
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, entry)]),
+      highest_client_stream_id_seen: 1,
+      conn_recv_window: 2_097_152,
+    )
+
+  let assert connection.Proceed(state) =
+    connection.handle_data(state, 1, False, <<"abc":utf8>>, 3)
+
+  let assert Ok(updated) = dict.get(state.streams, 1)
+  assert updated.trailers == [#("x-checksum", "deadbeef")]
+}
+
 pub fn handle_data_stream_window_violation_rejects_stream_test() {
   let entry = inbound_stream(5, None)
   let state =
@@ -938,7 +979,7 @@ pub fn stream_recv_credit_above_low_water_mark_does_not_emit_test() {
   let entry = inbound_stream(300_000, None)
 
   let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_config())
+    connection.stream_recv_credit(entry, http2.default_options())
 
   assert increment == 0
   assert entry.recv_window == 300_000
@@ -948,7 +989,7 @@ pub fn stream_recv_credit_at_low_water_mark_refills_to_high_test() {
   let entry = inbound_stream(262_144, None)
 
   let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_config())
+    connection.stream_recv_credit(entry, http2.default_options())
 
   assert increment == 2_097_152 - 262_144
   assert entry.recv_window == 2_097_152
@@ -958,7 +999,7 @@ pub fn stream_recv_credit_below_low_water_mark_refills_to_high_test() {
   let entry = inbound_stream(1000, None)
 
   let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_config())
+    connection.stream_recv_credit(entry, http2.default_options())
 
   assert increment == 2_097_152 - 1000
   assert entry.recv_window == 2_097_152

@@ -14,7 +14,6 @@ pub type Event {
   )
 }
 
-/// What a protocol's stream loop does once the handler has seen a message.
 pub type Step(user_state) {
   Proceed(user_state)
   Halt(connection.Outcome)
@@ -42,8 +41,6 @@ pub fn encode(event: Event) -> bytes_tree.BytesTree {
 
 const newline = <<"\n":utf8>>
 
-/// A break in a single line field would be read as the start of the next field,
-/// so it is dropped rather than allowed to forge one.
 fn append_field(
   tree: bytes_tree.BytesTree,
   prefix: String,
@@ -58,7 +55,6 @@ fn append_field(
   }
 }
 
-/// A break splits the value over repeated fields, which the client rejoins.
 fn append_lines(
   tree: bytes_tree.BytesTree,
   prefix: String,

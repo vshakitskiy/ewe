@@ -47,12 +47,9 @@ find(Bin, Key) ->
     {Pos, _Len} -> {ok, Pos}
   end.
 
-%% Splits on every comma in one call.
 split_comma(Bin) ->
   binary:split(Bin, persistent_term:get({?MODULE, comma}), [global]).
 
-%% Scans for uppercase natively so an already lowercase binary is returned
-%% untouched, and rewrites in one pass otherwise.
 lowercase_ascii(Bin) ->
   case binary:match(Bin, persistent_term:get({?MODULE, upper})) of
     nomatch -> Bin;
@@ -62,11 +59,9 @@ lowercase_ascii(Bin) ->
 lower(Byte) when Byte >= $A, Byte =< $Z -> Byte + 32;
 lower(Byte) -> Byte.
 
-%% Reason carried by a `{tcp_error, Socket, Reason}` message.
 socket_error_reason({_Tag, _Socket, Reason}) ->
   Reason.
 
-%% Validates UTF-8 and returns the bytes unchanged.
 bit_array_to_string(Bin) ->
   case ewe_ffi:is_valid_utf8(Bin) of
     true -> {ok, Bin};

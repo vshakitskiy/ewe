@@ -61,7 +61,6 @@ fn apply_setting(
   }
 }
 
-/// What the connection does with the socket once a message has been handled.
 pub type Next {
   Continue(State)
   Close
@@ -119,8 +118,6 @@ pub type Stream {
   )
 }
 
-// Opaque handle to a `binary:compile_pattern/1` result. Compiled once per
-// node and fetched once per connection.
 type Pattern
 
 pub opaque type HeaderPatterns {
@@ -176,10 +173,11 @@ pub type State {
     draining: Bool,
     drain_subject: process.Subject(connection.Message),
     drain_timer: Option(process.Timer),
-    config: http2.Config,
+    options: http2.Options,
     settings_frame: bytes_tree.BytesTree,
     patterns: HeaderPatterns,
     peer: Result(socket.SockName, Nil),
+    parent: Result(process.Pid, Nil),
   )
 }
 
@@ -187,32 +185,30 @@ const default_send_window = 65_535
 
 const max_window_size = 2_147_483_647
 
-/// How many socket messages arrive before the connection has to ask for more.
-/// Caps how fast a peer can grow the mailbox.
 pub const socket_active_batch_size = 32
 
-fn build_settings_frame(config: http2.Config) -> bytes_tree.BytesTree {
-  let params = case config.header_table_size {
+fn build_settings_frame(options: http2.Options) -> bytes_tree.BytesTree {
+  let params = case options.header_table_size {
     4096 -> []
-    _size -> [frame.HeaderTableSize(config.header_table_size)]
+    _size -> [frame.HeaderTableSize(options.header_table_size)]
   }
 
-  let params = case config.initial_window_size {
+  let params = case options.initial_window_size {
     65_535 -> params
-    _size -> [frame.InitialWindowSize(config.initial_window_size), ..params]
+    _size -> [frame.InitialWindowSize(options.initial_window_size), ..params]
   }
 
-  let params = case config.max_frame_size {
+  let params = case options.max_frame_size {
     16_384 -> params
-    _size -> [frame.MaxFrameSize(config.max_frame_size), ..params]
+    _size -> [frame.MaxFrameSize(options.max_frame_size), ..params]
   }
 
-  let params = case config.max_concurrent_streams {
+  let params = case options.max_concurrent_streams {
     Some(value) -> [frame.MaxConcurrentStreams(value), ..params]
     None -> params
   }
 
-  let params = case config.max_header_list_size {
+  let params = case options.max_header_list_size {
     Some(value) -> [frame.MaxHeaderListSize(value), ..params]
     None -> params
   }
@@ -222,8 +218,6 @@ fn build_settings_frame(config: http2.Config) -> bytes_tree.BytesTree {
   |> bytes_tree.from_bit_array
 }
 
-/// Wired to glisten's close callback so a connection dropped underneath its
-/// streams still releases what they were holding.
 pub fn kill_live_workers(state: State) -> Nil {
   use _stream_id, entry <- dict.each(state.streams)
 
@@ -238,21 +232,20 @@ pub fn kill_live_workers(state: State) -> Nil {
   }
 }
 
-/// Builds the state for a connection whose preface is already read. The caller
-/// makes the subjects because the caller is what selects on them.
 pub fn init(
   handler: fn(Request(connection.Connection)) -> Response(connection.Body),
-  config: http2.Config,
+  options: http2.Options,
   self: process.Subject(connection.Message),
   reply_subject: process.Subject(http2.Reply(connection.Body)),
   peer: Result(socket.SockName, Nil),
+  parent: Result(process.Pid, Nil),
 ) -> State {
-  let table = alpacki.new_dynamic(config.header_table_size)
+  let table = alpacki.new_dynamic(options.header_table_size)
 
   let timer =
     process.send_after(
       self,
-      config.handshake_timeout_ms,
+      options.handshake_timeout_ms,
       connection.Http2Handshake,
     )
 
@@ -276,10 +269,11 @@ pub fn init(
     draining: False,
     drain_subject: self,
     drain_timer: None,
-    config:,
-    settings_frame: build_settings_frame(config),
+    options:,
+    settings_frame: build_settings_frame(options),
     patterns: header_patterns(),
     peer:,
+    parent:,
   )
 }
 
@@ -299,8 +293,6 @@ pub fn handle_message(
     glisten.User(connection.Http2Drain) -> stop_connection(state)
     glisten.User(connection.Http2StreamClose(pid)) ->
       finish_or_continue(handle_stream_close_timeout(state, pid))
-    // HTTP/1's idle timer is cancelled before a connection becomes HTTP/2
-    // which has its own handshake and drain deadlines instead.
     glisten.User(connection.Timeout) -> Continue(state)
   }
 }
@@ -335,7 +327,7 @@ fn process_frames(
   state: State,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  case frame.decode(state.buffer, state.config.max_frame_size) {
+  case frame.decode(state.buffer, state.options.max_frame_size) {
     Ok(#(frame, remaining)) ->
       case handle_frame(State(..state, buffer: remaining), frame, connection) {
         Proceed(state) -> process_frames(state, connection)
@@ -380,8 +372,6 @@ fn reset_and_remove_stream(
   case entry.status {
     Computing(pid) -> {
       process.send_abnormal_exit(pid, "stream_reset")
-      // Backstop for a long-lived handler that doesn't react to the exit 
-      // signal promptly
       process.send_after(
         state.drain_subject,
         stream_close_grace_ms,
@@ -406,7 +396,7 @@ fn handle_stream_close_timeout(state: State, pid: process.Pid) -> State {
     Error(Nil) -> state
     Ok(_stream_id) -> {
       process.kill(pid)
-      clear_stream_pid(state, pid)
+      state
     }
   }
 }
@@ -492,8 +482,6 @@ fn handle_ping(
   }
 }
 
-/// A client cancelling a stream. Enough of them in one window means Rapid Reset
-/// (CVE-2023-44487), not ordinary cancelling, and the connection goes.
 @internal
 pub fn handle_client_reset(state: State, stream_id: Int) -> FrameResult {
   let #(state, tripped) = record_reset(state)
@@ -517,7 +505,7 @@ fn record_reset(state: State) -> #(State, Bool) {
 
   let new_window =
     state.reset_count == 0
-    || now - state.reset_window_start > state.config.rapid_reset_window_ms
+    || now - state.reset_window_start > state.options.rapid_reset_window_ms
 
   let #(reset_window_start, reset_count) = case new_window {
     True -> #(now, 1)
@@ -526,7 +514,7 @@ fn record_reset(state: State) -> #(State, Bool) {
 
   #(
     State(..state, reset_window_start:, reset_count:),
-    reset_count > state.config.rapid_reset_threshold,
+    reset_count > state.options.rapid_reset_threshold,
   )
 }
 
@@ -601,7 +589,7 @@ fn start_header_assembly(
     )
 
   let oversized =
-    bit_array.byte_size(payload) > state.config.max_header_block_bytes
+    bit_array.byte_size(payload) > state.options.max_header_block_bytes
 
   case oversized, end_headers, trailers {
     True, _end_headers, _trailers -> Terminate(Some(frame.EnhanceYourCalm))
@@ -612,7 +600,6 @@ fn start_header_assembly(
   }
 }
 
-// Clients only ever open odd-numbered streams and always in increasing order.
 fn is_new_client_stream_id(state: State, stream_id: Int) -> Bool {
   stream_id % 2 == 1 && stream_id > state.highest_client_stream_id_seen
 }
@@ -640,10 +627,6 @@ pub fn handle_data(
   }
 }
 
-// The client sent this DATA frame before finding out the stream is closed on 
-// our end so it still counts against the connection window. Flow control has 
-// to be here even though the stream itself is already gone otherwise our view 
-// of the window drifts from the client's.
 fn reject_closed_stream_data(state: State, size: Int) -> FrameResult {
   case state.conn_recv_window - size < 0 {
     True -> Terminate(Some(frame.FlowControlError))
@@ -651,8 +634,6 @@ fn reject_closed_stream_data(state: State, size: Int) -> FrameResult {
   }
 }
 
-// Same here, still gotta debit the connection window before we can reject the 
-// stream.
 fn reject_data_after_half_close(
   state: State,
   stream_id: Int,
@@ -695,7 +676,7 @@ fn apply_data(
             |> deliver_data(payload, end_stream, [])
 
           let #(entry, stream_increment) = case delivered_to_reader {
-            True -> stream_recv_credit(entry, state.config)
+            True -> stream_recv_credit(entry, state.options)
             False -> #(entry, 0)
           }
 
@@ -739,18 +720,27 @@ fn deliver_data(
   let request_half_closed = entry.request_half_closed || end_stream
   let entry = Stream(..entry, request_half_closed:)
 
-  case entry.parked_reader {
-    Some(reply_to) -> {
-      case payload, end_stream {
-        <<>>, _half_closed -> process.send(reply_to, http2.DoneEvent(trailers))
-        _payload, True ->
-          process.send(reply_to, http2.LastChunkEvent(payload, trailers))
-        _payload, False -> process.send(reply_to, http2.ChunkEvent(payload))
-      }
+  case entry.parked_reader, payload, end_stream {
+    _reader, <<>>, False -> #(entry, False)
+    Some(reply_to), <<>>, True -> {
+      process.send(reply_to, http2.DoneEvent(trailers))
       #(Stream(..entry, parked_reader: None), True)
     }
-    None -> {
+    Some(reply_to), _payload, True -> {
+      process.send(reply_to, http2.LastChunkEvent(payload, trailers))
+      #(Stream(..entry, parked_reader: None), True)
+    }
+    Some(reply_to), _payload, False -> {
+      process.send(reply_to, http2.ChunkEvent(payload))
+      #(Stream(..entry, parked_reader: None), True)
+    }
+    None, _payload, _end_stream -> {
       let recv_buffer = bytes_tree.append(entry.recv_buffer, payload)
+      let trailers = case trailers {
+        [] -> entry.trailers
+        _received -> trailers
+      }
+
       #(Stream(..entry, recv_buffer:, trailers:), False)
     }
   }
@@ -766,7 +756,7 @@ pub fn handle_continuation(
     frame.Continuation(stream_id, end_headers, payload)
       if stream_id == assembly.stream_id
     ->
-      case add_fragment(assembly, payload, state.config), end_headers {
+      case add_fragment(assembly, payload, state.options), end_headers {
         Error(code), _end_headers -> Terminate(Some(code))
         Ok(updated), False ->
           Proceed(State(..state, header_assembly: Some(updated)))
@@ -783,14 +773,14 @@ pub fn handle_continuation(
 pub fn add_fragment(
   assembly: HeaderAssembly,
   fragment: BitArray,
-  config: http2.Config,
+  options: http2.Options,
 ) -> Result(HeaderAssembly, frame.ErrorCode) {
   let fragment_count = assembly.fragment_count + 1
   let block = <<assembly.block:bits, fragment:bits>>
 
   case
-    fragment_count > config.max_continuation_frames
-    || bit_array.byte_size(block) > config.max_header_block_bytes
+    fragment_count > options.max_continuation_frames
+    || bit_array.byte_size(block) > options.max_header_block_bytes
   {
     True -> Error(frame.EnhanceYourCalm)
     False -> Ok(HeaderAssembly(..assembly, fragment_count:, block:))
@@ -809,7 +799,7 @@ fn decode_and_validate_header_block(
       dynamic_table:,
       remaining:,
     )) -> {
-      let header_list_size_exceeded = case state.config.max_header_list_size {
+      let header_list_size_exceeded = case state.options.max_header_list_size {
         None -> False
         Some(limit) -> decoded_size > limit
       }
@@ -817,7 +807,7 @@ fn decode_and_validate_header_block(
       case
         remaining != <<>>
         || alpacki.dynamic_max_size(dynamic_table)
-        > state.config.header_table_size,
+        > state.options.header_table_size,
         header_list_size_exceeded
       {
         True, _header_list_size_exceeded ->
@@ -849,7 +839,7 @@ pub fn complete_header_block(
           pending: <<>>,
           pending_trailers: None,
           read: 0,
-          body_read_timeout: state.config.body_read_timeout,
+          body_read_timeout: state.options.body_read_timeout,
           peer: state.peer,
         ))
 
@@ -949,7 +939,7 @@ fn spawn_stream(
   end_stream: Bool,
   content_length: Option(Int),
 ) -> FrameResult {
-  let concurrent_streams_exceeded = case state.config.max_concurrent_streams {
+  let concurrent_streams_exceeded = case state.options.max_concurrent_streams {
     None -> False
     Some(limit) -> dict.size(state.streams) >= limit
   }
@@ -978,7 +968,7 @@ fn track_stream(
       pending: PendingBytes(<<>>),
       pending_end_stream: True,
       write_ack: None,
-      recv_window: state.config.initial_window_size,
+      recv_window: state.options.initial_window_size,
       recv_buffer: bytes_tree.new(),
       request_half_closed: end_stream,
       parked_reader: None,
@@ -1320,8 +1310,6 @@ fn handle_client_settings(
   }
 }
 
-/// SETTINGS_INITIAL_WINDOW_SIZE applies retroactively, so every stream already
-/// open gets the delta too.
 @internal
 pub fn adjust_stream_windows(state: State, delta: Int) -> State {
   case delta {
@@ -1354,7 +1342,11 @@ fn terminate(
 ) -> Next {
   case code {
     Some(error_code) -> {
-      let _sent = send_frame(connection, frame.Goaway(0, 0, error_code, <<>>))
+      let _sent =
+        send_frame(
+          connection,
+          frame.Goaway(0, state.highest_client_stream_id_seen, error_code, <<>>),
+        )
       Nil
     }
     None -> Nil
@@ -1382,7 +1374,7 @@ fn begin_drain(
       let timer =
         process.send_after(
           state.drain_subject,
-          state.config.drain_timeout_ms,
+          state.options.drain_timeout_ms,
           connection.Http2Drain,
         )
 
@@ -1471,7 +1463,7 @@ fn handle_read_body(
           process.send(reply_to, http2.ChunkEvent(buffered))
           let drained_entry = Stream(..entry, recv_buffer: bytes_tree.new())
           let #(drained_entry, stream_increment) =
-            stream_recv_credit(drained_entry, state.config)
+            stream_recv_credit(drained_entry, state.options)
 
           let streams = dict.insert(state.streams, stream_id, drained_entry)
           let state = State(..state, streams:)
@@ -1494,19 +1486,17 @@ fn handle_read_body(
   }
 }
 
-/// Tops a stream's receive window back up once it's fallen far enough to be
-/// worth a frame. Beats trickling out an update per chunk read.
 @internal
 pub fn stream_recv_credit(
   entry: Stream,
-  config: http2.Config,
+  options: http2.Options,
 ) -> #(Stream, Int) {
-  case entry.recv_window <= config.recv_window_low_water_mark {
+  case entry.recv_window <= options.recv_window_low_water_mark {
     True -> {
-      let increment = config.recv_window_high_water_mark - entry.recv_window
+      let increment = options.recv_window_high_water_mark - entry.recv_window
 
       #(
-        Stream(..entry, recv_window: config.recv_window_high_water_mark),
+        Stream(..entry, recv_window: options.recv_window_high_water_mark),
         increment,
       )
     }
@@ -1514,18 +1504,17 @@ pub fn stream_recv_credit(
   }
 }
 
-/// The same for the connection's own window which every stream draws from.
 @internal
 pub fn conn_recv_credit(state: State) -> #(State, Int) {
-  case state.conn_recv_window <= state.config.recv_window_low_water_mark {
+  case state.conn_recv_window <= state.options.recv_window_low_water_mark {
     True -> {
       let increment =
-        state.config.recv_window_high_water_mark - state.conn_recv_window
+        state.options.recv_window_high_water_mark - state.conn_recv_window
 
       #(
         State(
           ..state,
-          conn_recv_window: state.config.recv_window_high_water_mark,
+          conn_recv_window: state.options.recv_window_high_water_mark,
         ),
         increment,
       )
@@ -1591,8 +1580,6 @@ fn response_body_size(body: connection.Body) -> Int {
     connection.Empty -> 0
     connection.File(connection.OpenFile(length:, ..))
     | connection.File(connection.PendingFile(length:, ..)) -> length
-    // A streamed body never reaches here as its stream process writes the
-    // response itself
     connection.Streaming(_metadata)
     | connection.Sse(_metadata)
     | connection.Websocket(_metadata) ->
@@ -1613,7 +1600,6 @@ fn open_pending(
     connection.Empty -> Ok(PendingBytes(<<>>))
     connection.File(connection.OpenFile(handle:, offset:, length:)) ->
       Ok(PendingFile(handle, offset, length))
-    // Small enough to answer from memory.
     connection.File(connection.PendingFile(path:, offset:, length:))
       if length <= file_read_threshold
     -> file.read_range(path, offset, length) |> result.map(PendingBytes)
@@ -1633,7 +1619,7 @@ fn respond(
   response: Response(connection.Body),
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  case open_pending(response.body, state.config.file_read_threshold) {
+  case open_pending(response.body, state.options.file_read_threshold) {
     Ok(pending) ->
       send_response(
         state,
@@ -1724,9 +1710,6 @@ fn send_response(
   }
 }
 
-/// A stream sets these itself, so the handler's copies get dropped. HTTP/1
-/// reserves `transfer-encoding` too, which HTTP/2 has no use for and must
-/// never send.
 fn drop_sse_headers(
   headers: List(#(String, String)),
 ) -> List(#(String, String)) {
@@ -1854,8 +1837,6 @@ fn resolve_frame_result(
   }
 }
 
-/// Frames a header block, splitting into CONTINUATION frames when it's longer
-/// than the peer takes in one.
 @internal
 pub fn append_header_frames(
   acc: bytes_tree.BytesTree,
@@ -2151,8 +2132,6 @@ fn send_file_chunk(
   }
 }
 
-/// Writes what a stream has pending as far as its window and the connection's
-/// allow.
 @internal
 pub fn flush_stream(
   state: State,
@@ -2260,33 +2239,47 @@ fn handle_stream_exit(
   exit: process.ExitMessage,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  case dict.get(state.stream_pids, exit.pid) {
-    // Not a stream this connection started so it is the parent asking it to
-    // shut down.
-    Error(Nil) -> begin_drain(state, connection)
+  case state.parent == Ok(exit.pid), exit.reason {
+    True, process.Abnormal(reason) ->
+      case http2.is_shutdown(reason) {
+        True -> begin_drain(state, connection)
+        False -> stop_connection(state)
+      }
+    True, process.Normal | True, process.Killed -> stop_connection(state)
+    False, _reason -> handle_child_exit(state, exit.pid, connection)
+  }
+}
+
+fn handle_child_exit(
+  state: State,
+  pid: process.Pid,
+  connection: glisten.Connection(connection.Message),
+) -> Next {
+  case dict.get(state.stream_pids, pid) {
+    Error(Nil) -> finish_or_continue(state)
     Ok(stream_id) ->
       case dict.get(state.streams, stream_id) {
-        // Still computing when its process ended means the handler returned
-        // without a response being completed.
-        Ok(Stream(status: Computing(pid), ..) as entry) if pid == exit.pid ->
+        Ok(Stream(status: Computing(stream_pid), ..) as entry)
+          if stream_pid == pid
+        ->
           remove_stream(state, stream_id, entry)
           |> reject_stream(connection, _, stream_id, frame.InternalError)
-        _entry -> finish_or_continue(clear_stream_pid(state, exit.pid))
+        _entry -> finish_or_continue(clear_stream_pid(state, pid))
       }
   }
 }
 
 @internal
 pub fn test_state() -> State {
-  let config = http2.default_config()
+  let options = http2.default_options()
 
   State(
     buffer: <<>>,
     handshake: Connected,
     peer_settings: default_peer_settings,
     timer: None,
-    hpack_decoder: alpacki.new_dynamic(config.header_table_size),
-    hpack_encoder: alpacki.new_dynamic(config.header_table_size),
+    hpack_decoder: alpacki.new_dynamic(options.header_table_size),
+    hpack_encoder: alpacki.new_dynamic(options.header_table_size),
     header_assembly: None,
     reply_subject: process.new_subject(),
     handler: fn(_request) {
@@ -2302,9 +2295,10 @@ pub fn test_state() -> State {
     draining: False,
     drain_subject: process.new_subject(),
     drain_timer: None,
-    config:,
-    settings_frame: build_settings_frame(config),
+    options:,
+    settings_frame: build_settings_frame(options),
     patterns: header_patterns(),
     peer: Error(Nil),
+    parent: Error(Nil),
   )
 }

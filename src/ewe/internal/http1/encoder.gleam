@@ -24,7 +24,6 @@ type EncodeState {
   EncodeState(tree: bytes_tree.BytesTree, keep_alive: http1.KeepAlive)
 }
 
-/// Whatever still has to reach the socket once the head has been written.
 pub type Remainder {
   NoRemainder
   RemainderInline(bytes_tree.BytesTree)
@@ -72,15 +71,12 @@ pub fn encode_response(
     body, False -> encode_body(state, status, keep_alive, version, body)
   }
 
-  // A HEAD response keeps the framing headers it would have had minus the body.
   Ok(case method {
     http.Head -> drop_body(encoded)
     _method -> encoded
   })
 }
 
-/// These statuses are defined as carrying no body so they get neither one nor
-/// a framing header for the client to wait on.
 fn is_bodyless(status: Int) -> Bool {
   status == 204 || status == 304 || { status >= 100 && status < 200 }
 }
@@ -95,9 +91,6 @@ fn bodyless(
   Encoded(build_head(state, status, keep_alive, <<>>), keep_alive, NoRemainder)
 }
 
-/// The handshake's own `connection` and `upgrade` headers are the whole point
-/// of the response so no framing header is written and the head is closed off
-/// without one.
 fn switching_protocols(
   state: EncodeState,
   status: Int,
@@ -151,7 +144,6 @@ fn encode_body(
   }
 }
 
-/// Anything the body was holding is let go here.
 fn drop_body(encoded: Encoded) -> Encoded {
   case encoded.remainder {
     RemainderFile(data) -> file.release(data)
@@ -197,7 +189,6 @@ fn encode_stream(
         keep_alive,
         RemainderStream(handler:, framing: http1.ChunkedStream),
       )
-    // HTTP/1.0 has no chunked encoding, so the close delimits the body instead.
     parser.Http10 ->
       close_delimited(
         state,
@@ -207,16 +198,6 @@ fn encode_stream(
   }
 }
 
-/// On HTTP/1.1 the stream is framed as chunked, which proxies handle far better
-/// than one delimited only by the close, and which leaves the socket sitting at
-/// a known point afterwards. The connection is advertised as reusable on that
-/// basis; whether it is handed back is settled once the stream ends. HTTP/1.0
-/// has no chunked encoding, so there the close is the framing and the
-/// connection cannot survive it.
-///
-/// The content type is fixed by the format and the no-cache is what keeps
-/// intermediaries from buffering the stream, so both are written from constants
-/// here rather than built into the handler's header list.
 fn encode_sse(
   state: EncodeState,
   status: Int,
@@ -274,7 +255,6 @@ pub type ResponseWriter =
 
 const last_chunk = <<"0\r\n\r\n":utf8>>
 
-/// Wraps one piece of a streamed body in whatever delimits it on the wire.
 pub fn frame(
   chunk: bytes_tree.BytesTree,
   framing: http1.StreamFraming,
@@ -303,7 +283,6 @@ pub fn finish_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
 ) -> Result(Nil, socket.SocketReason) {
-  // The terminator rides along with the last chunk to save a write.
   let bytes = case writer.framing {
     http1.ChunkedStream ->
       bytes_tree.append(
@@ -342,9 +321,6 @@ pub fn end_stream(
   }
 }
 
-/// The stream is over either way so the connection process is told so even
-/// when the last write never landed. One that ended on a failed write leaves
-/// nothing to hand back.
 fn finished(
   writer: ResponseWriter,
   sent: Result(Nil, socket.SocketReason),
@@ -361,8 +337,6 @@ fn finished(
   sent
 }
 
-/// Which headers the encoder writes itself for a body, and so drops from the
-/// handler's list rather than emitting twice.
 type Reserved {
   Framing
   FramingAndSse
@@ -388,7 +362,6 @@ fn encode_headers(
   let initial = EncodeState(bytes_tree.new(), http1.KeepAlive)
   use state, #(name, value) <- list.try_fold(headers, initial)
 
-  // TODO: just trust the handler?
   case name, reserved {
     "date", _reserved -> Ok(state)
     _name, Handshake -> append_header(state, name, value)
@@ -514,8 +487,6 @@ fn status_line(status: Int) -> BitArray {
   }
 }
 
-/// A bare response for a request that never reached a handler, sent on a
-/// connection that is closed straight after.
 pub fn error_response(status: Int) -> bytes_tree.BytesTree {
   EncodeState(bytes_tree.new(), http1.CloseAfterResponse)
   |> build_head(status, http1.CloseAfterResponse, <<
