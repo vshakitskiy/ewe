@@ -7,7 +7,7 @@ ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
 [![Package Version](https://img.shields.io/hexpm/v/ewe)](https://hex.pm/packages/ewe)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/ewe/)
 
-## Contents {#contents}
+## Contents
 
 - [Installation](#installation)
 - [Usage](#usage)
@@ -30,15 +30,15 @@ ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
 Most section headings are links, each one opening the runnable example it is
 based on.
 
-## Installation {#installation}
+<h2 id="installation">Installation</h2>
 
 ```sh
 gleam add ewe@5 gleam_erlang gleam_otp gleam_http logging
 ```
 
-## Usage {#usage}
+<h2 id="usage">Usage</h2>
 
-### [Getting Started](examples/src/getting_started.gleam) {#getting-started}
+<h3 id="getting-started"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/getting_started.gleam">Getting Started</a></h3>
 
 A handler takes a [`request.Request(ewe.Connection)`](https://hexdocs.pm/ewe/ewe.html#Connection)
 and returns a [`response.Response(ewe.Body)`](https://hexdocs.pm/ewe/ewe.html#Body).
@@ -91,7 +91,7 @@ fn handle_request(
 }
 ```
 
-### [HTTPS](examples/src/https.gleam) {#https}
+<h3 id="https"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/https.gleam">HTTPS</a></h3>
 
 Enable TLS with [`ewe.with_tls`](https://hexdocs.pm/ewe/ewe.html#with_tls), which
 takes the certificate source as a [`ewe.Tls`](https://hexdocs.pm/ewe/ewe.html#Tls)
@@ -118,7 +118,7 @@ It needs TLS to be configured.
 |> ewe.with_client_verification(ewe.CaCertFile("priv/ca.crt"))
 ```
 
-### HTTP/2 {#http2}
+<h3 id="http2">HTTP/2</h3>
 
 HTTP/2 is always enabled on ewe. Over TLS ewe offers it through ALPN and a plain
 connection is served as HTTP/2 when it opens with the HTTP/2 preface which is
@@ -129,7 +129,7 @@ negotiated, it is answered as HTTP/1.1.
 > Extended CONNECT is not negotiated yet, so WebSockets over HTTP/2 are not
 > supported.
 
-### [Sending a Response](examples/src/sending_response.gleam) {#sending-a-response}
+<h3 id="sending-a-response"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/sending_response.gleam">Sending a Response</a></h3>
 
 A response body is one of the [`ewe.Body`](https://hexdocs.pm/ewe/ewe.html#Body)
 variants. `Text`, `Bytes` and `Empty` are built by hand, the rest come from
@@ -178,7 +178,7 @@ fn handle_request(
 }
 ```
 
-### [Reading the Request Body](examples/src/reading_body.gleam) {#reading-the-request-body}
+<h3 id="reading-the-request-body"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/reading_body.gleam">Reading the Request Body</a></h3>
 
 [`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body) reads the whole body
 into memory up to `limit` bytes. Trailer fields of a chunked request are appended
@@ -212,7 +212,7 @@ fn handle_request(
 A body the handler never read is drained by the server so the connection can be
 reused. One larger than `auto_drain_limit` closes the connection instead.
 
-### [Streaming Bodies](examples/src/streaming_bodies.gleam) {#streaming-bodies}
+<h3 id="streaming-bodies"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/streaming_bodies.gleam">Streaming Bodies</a></h3>
 
 [`ewe.read_body_chunk`](https://hexdocs.pm/ewe/ewe.html#read_body_chunk) pulls up
 to `max_chunk_bytes` per call rather than buffering everything. Each
@@ -258,7 +258,7 @@ fn echo_body(
 }
 ```
 
-### [Serving Files](examples/src/serving_files.gleam) {#serving-files}
+<h3 id="serving-files"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/serving_files.gleam">Serving Files</a></h3>
 
 [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) prepares a file as a response
 body so you never read one in yourself. `offset` and `limit` serve a byte range,
@@ -275,7 +275,7 @@ case ewe.file(request.body, resolved, offset: None, limit: None) {
 }
 ```
 
-### [Client Address](examples/src/client_info.gleam) {#client-address}
+<h3 id="client-address"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/client_info.gleam">Client Address</a></h3>
 
 [`ewe.get_client_info`](https://hexdocs.pm/ewe/ewe.html#get_client_info) reads the
 address a request came from off its connection as a
@@ -308,7 +308,7 @@ proxy puts in `x-forwarded-for` is the address to use there. MDN's
 is worth a read before you rely on it for anything since an address taken on
 trust is an address anyone can choose.
 
-### [WebSocket](examples/src/websocket.gleam) {#websocket}
+<h3 id="websocket"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/websocket.gleam">WebSocket</a></h3>
 
 [`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket) turns a request into
 a WebSocket. A request that is not a valid handshake is answered with a 400 and
@@ -385,7 +385,7 @@ start the closing handshake yourself, return
 [`ewe.CloseReason`](https://hexdocs.pm/ewe/ewe.html#CloseReason). No frame can be
 sent after it!
 
-### [Server-Sent Events](examples/src/sse.gleam) {#server-sent-events}
+<h3 id="server-sent-events"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/sse.gleam">Server-Sent Events</a></h3>
 
 [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) turns a response into an SSE
 stream which runs until the handler stops it or the client disconnects. `on_init`
@@ -422,7 +422,7 @@ can carry a name, an id and a reconnection delay through
 ignore which is the usual way to keep an idle stream from being closed by a
 proxy.
 
-### Connection Limits and Timeouts {#connection-limits-and-timeouts}
+<h3 id="connection-limits-and-timeouts">Connection Limits and Timeouts</h3>
 
 Every connection is held to a set of limits and timeouts. Start with
 [`ewe.default_http1_options`](https://hexdocs.pm/ewe/ewe.html#default_http1_options)
@@ -492,7 +492,7 @@ peer:
 | `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
 | `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
 
-### Running Under Supervision {#running-under-supervision}
+<h3 id="running-under-supervision">Running Under Supervision</h3>
 
 [`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start) runs the server on its own.
 When it belongs to a supervision tree next to the rest of your program use
@@ -515,7 +515,7 @@ The line printed on startup comes from [`ewe.on_start`](https://hexdocs.pm/ewe/e
 which receives the scheme and the address the server bound to. Replace it to log
 it your own way or silence it with [`ewe.quiet`](https://hexdocs.pm/ewe/ewe.html#quiet).
 
-### Running as an OTP Application {#running-as-an-otp-application}
+<h3 id="running-as-an-otp-application">Running as an OTP Application</h3>
 
 The examples start the server straight from `main` with a `let assert`, which is
 the shortest thing that works while you are trying ewe out. A service is better
@@ -577,11 +577,11 @@ pub fn main() {
 > `main` still has to sleep. `gleam run` boots the application and then calls it,
 > so without it the node exits as soon as it returns.
 
-## Examples {#examples}
+<h2 id="examples">Examples</h2>
 
 Most sections above link to a runnable example. They live in
 [examples](examples/), see [its README](examples/README.md) for how to run them.
 
-## API Reference {#api-reference}
+<h2 id="api-reference">API Reference</h2>
 
 For detailed API documentation, see [hexdocs.pm/ewe](https://hexdocs.pm/ewe/ewe.html).
