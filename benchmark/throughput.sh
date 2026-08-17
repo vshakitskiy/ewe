@@ -27,7 +27,7 @@ command -v h2load > /dev/null || { echo "h2load not found (install nghttp2)" >&2
 ensure_fixtures
 new_results_dir throughput
 CSV="$RESULTS_DIR/throughput.csv"
-echo "server,profile,protocol,connections,streams,case,repeat,requests_per_sec,messages,messages_per_sec,mb_per_sec,succeeded,failed,non_2xx" > "$CSV"
+echo "server,profile,protocol,connections,streams,case,repeat,requests_per_sec,messages,messages_per_sec,mib_per_sec,succeeded,failed,non_2xx,status" > "$CSV"
 
 {
   echo "date        $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -40,6 +40,7 @@ echo "server,profile,protocol,connections,streams,case,repeat,requests_per_sec,m
   done
   echo "duration    ${DURATION}s measured, ${WARMUP}s warmup, ${REPEATS} repeats per cell"
   echo "cpu         server on ${SERVER_CPUS}, load generator on ${LOAD_CPUS}"
+  record_versions
 } | tee "$RESULTS_DIR/run.txt"
 echo
 
@@ -52,20 +53,30 @@ set_protocol_args() {
 }
 
 parse_h2load() {
-  awk '
-    /^finished in/   { gsub(",", ""); rate = $4; mb = $6; sub("MB/s", "", mb); finished = 1 }
+  awk -v connections="$1" '
+    function to_mib(value,   number) {
+      number = value + 0
+      if (value ~ /GB\/s/) return number * 1024
+      if (value ~ /MB\/s/) return number
+      if (value ~ /KB\/s/) return number / 1024
+      return number / 1048576
+    }
+    /^finished in/   { gsub(",", ""); rate = $4; mib = to_mib($6); finished = 1 }
     /^requests:/     { gsub(",", ""); succeeded = $8; failed = $10 + $12 + $14 }
     /^status codes:/ { gsub(",", ""); non2xx = $5 + $7 + $9 }
     END {
       if (!finished) exit 1
-      printf "%s|%s|%s|%s|%s\n", rate + 0, mb + 0, succeeded + 0, failed + 0, non2xx + 0
+      status = "ok"
+      if (failed > 0 || non2xx > 0) status = "errors"
+      if (succeeded <= connections) status = "stalled"
+      printf "%s|%.3f|%s|%s|%s|%s\n", rate + 0, mib, succeeded + 0, failed + 0, non2xx + 0, status
     }
   '
 }
 
 run_case() {
   local repeat="$1" body_path raw parsed
-  local rate mb succeeded failed non2xx messages_per_sec
+  local rate mib succeeded failed non2xx status messages_per_sec
 
   set_protocol_args "$protocol"
   local args=("${PROTOCOL_ARGS[@]}" -c "$connections" -m "$streams" -t "$THREADS" -D "$DURATION")
@@ -76,16 +87,17 @@ run_case() {
 
   raw="$RESULTS_DIR/${server}__${profile}__${case_name}__${repeat}.txt"
   if ! parsed="$("${PIN_LOAD[@]}" h2load "${args[@]}" "http://127.0.0.1:$port$path" 2>&1 \
-    | tee "$raw" | parse_h2load)"; then
+    | tee "$raw" | parse_h2load "$connections")"; then
     printf 'failed '
     return 1
   fi
 
-  IFS='|' read -r rate mb succeeded failed non2xx <<< "$parsed"
+  IFS='|' read -r rate mib succeeded failed non2xx status <<< "$parsed"
   messages_per_sec="$(awk -v r="$rate" -v m="$messages" 'BEGIN { printf "%.0f", r * m }')"
 
-  echo "$server,$profile,$protocol,$connections,$streams,$case_name,$repeat,$rate,$messages,$messages_per_sec,$mb,$succeeded,$failed,$non2xx" >> "$CSV"
+  echo "$server,$profile,$protocol,$connections,$streams,$case_name,$repeat,$rate,$messages,$messages_per_sec,$mib,$succeeded,$failed,$non2xx,$status" >> "$CSV"
   printf '%s ' "$rate"
+  [ "$status" = ok ] || printf '(%s) ' "$status"
 }
 
 for server_entry in "${SERVERS[@]}"; do

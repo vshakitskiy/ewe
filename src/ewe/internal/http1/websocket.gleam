@@ -334,6 +334,7 @@ fn activate(
   transport.set_opts(conn.transport, conn.socket, [
     options.ActiveMode(options.Count(http1.active_count)),
   ])
+  |> result.replace_error(socket.Closed)
 }
 
 type Received(user_message) {

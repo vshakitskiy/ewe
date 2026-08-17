@@ -14,10 +14,12 @@ stat(Path) ->
   end.
 
 sendfile(Fd, Socket, Offset, Bytes) ->
-  case file:sendfile(Fd, Socket, Offset, Bytes, []) of
+  try file:sendfile(Fd, Socket, Offset, Bytes, []) of
     {ok, Bytes} -> {ok, nil};
     {ok, _Short} -> {error, closed};
     {error, Reason} -> {error, Reason}
+  catch
+    error:{badmatch, undefined} -> {error, closed}
   end.
 
 open(Path) ->

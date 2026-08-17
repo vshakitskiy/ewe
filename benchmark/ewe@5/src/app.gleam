@@ -147,7 +147,7 @@ fn sse_burst(data: String, count: Int) -> response.Response(ewe.Body) {
       let Tick(n) = message
 
       case ewe.send_event(conn, ewe.event(data) |> ewe.event_name("tick")) {
-        Error(_reason) -> ewe.sse_stop_abnormal("failed to send event")
+        Error(_reason) -> ewe.sse_stop()
         Ok(Nil) if n >= count -> ewe.sse_stop()
         Ok(Nil) -> {
           process.send(subject, Tick(n + 1))

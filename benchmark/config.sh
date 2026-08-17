@@ -80,6 +80,14 @@ latency_rates() {
   esac
 }
 
+server_package() {
+  case "$1" in
+    ewe@5 | httpd) echo "-" ;;
+    ewe@4) echo "ewe" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 wrk_script() {
   case "$1" in
     hello_headers) echo "get_headers.lua" ;;

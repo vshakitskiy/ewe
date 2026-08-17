@@ -36,6 +36,40 @@ body_file() {
   esac
 }
 
+package_version() {
+  local dir="$1" package="$2"
+
+  [ "$package" = "-" ] && return 0
+  if [ -f "$ROOT/$dir/manifest.toml" ]; then
+    grep -oP "name = \"$package\", version = \"\K[^\"]+" "$ROOT/$dir/manifest.toml"
+  elif [ -f "$ROOT/$dir/mix.lock" ]; then
+    grep -oP "\"$package\": \{:hex, :$package, \"\K[^\"]+" "$ROOT/$dir/mix.lock"
+  elif [ -f "$ROOT/$dir/rebar.lock" ]; then
+    grep -oP "<<\"$package\">>,\{pkg,<<\"[^\"]+\">>,<<\"\K[^\"]+" "$ROOT/$dir/rebar.lock"
+  fi
+}
+
+record_versions() {
+  local entry server dir version
+
+  printf 'toolchain   gleam %s, OTP %s, elixir %s\n' \
+    "$(gleam --version 2>/dev/null | awk '{print $2}')" \
+    "$(erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' 2>/dev/null)" \
+    "$(elixir --version 2>/dev/null | awk '/^Elixir/ { print $2 }')"
+  printf 'tools       %s, wrk2 %s\n' \
+    "$(h2load --version 2>/dev/null | tr '/' ' ' | awk '{print $2 " " $3}')" \
+    "$(git -C "$ROOT/.wrk2/src" rev-parse --short HEAD 2>/dev/null)"
+
+  local label="packages"
+  for entry in "${SERVERS[@]}"; do
+    IFS='|' read -r server dir _cmd _h1_port _h2_port <<< "$entry"
+    version="$(package_version "$dir" "$(server_package "$server")")"
+    [ -z "$version" ] && continue
+    printf '%-12s%-12s%s\n' "$label" "$server" "$version"
+    label=""
+  done
+}
+
 new_results_dir() {
   RESULTS_DIR="$ROOT/results/$(date +%Y%m%d-%H%M%S)-$1"
   mkdir -p "$RESULTS_DIR"

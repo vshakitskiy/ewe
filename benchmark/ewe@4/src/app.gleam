@@ -167,7 +167,7 @@ fn stream_burst(
       let Tick(n) = message
 
       case ewe.send_chunk(conn, chunk) {
-        Error(_reason) -> ewe.chunked_stop_abnormal("failed to send chunk")
+        Error(_reason) -> ewe.chunked_stop()
         Ok(Nil) if n >= count -> ewe.chunked_stop()
         Ok(Nil) -> {
           process.send(subject, Tick(n + 1))
@@ -194,7 +194,7 @@ fn sse_burst(
       let Tick(n) = message
 
       case ewe.send_event(conn, ewe.event(data) |> ewe.event_name("tick")) {
-        Error(_reason) -> ewe.sse_stop_abnormal("failed to send event")
+        Error(_reason) -> ewe.sse_stop()
         Ok(Nil) if n >= count -> ewe.sse_stop()
         Ok(Nil) -> {
           process.send(subject, Tick(n + 1))

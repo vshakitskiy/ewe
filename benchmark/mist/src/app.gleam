@@ -169,7 +169,7 @@ fn stream_burst(
       let Tick(n) = message
 
       case mist.send_chunk(connection, chunk) {
-        Error(Nil) -> mist.chunk_stop_abnormal("failed to send chunk")
+        Error(Nil) -> mist.chunk_stop()
         Ok(Nil) if n >= count -> mist.chunk_stop()
         Ok(Nil) -> {
           process.send(subject, Tick(n + 1))

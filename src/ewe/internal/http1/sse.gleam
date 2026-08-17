@@ -6,6 +6,7 @@ import ewe/internal/sse
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/result
 import glisten/socket
 import glisten/socket/options
 import glisten/transport
@@ -159,6 +160,7 @@ fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketReason) {
   transport.set_opts(conn.transport, conn.socket, [
     options.ActiveMode(options.Count(http1.active_count)),
   ])
+  |> result.replace_error(socket.Closed)
 }
 
 type Received(user_message) {

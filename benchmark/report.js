@@ -4,6 +4,12 @@ const COLUMN = 12;
 const COLLAPSED = 20;
 const NOISE = 0.05;
 
+const REASON = {
+  stalled: "no connection completed more than one request",
+  overload: "generator could not hold the target rate, server is past capacity",
+  errors: "failed or non-2xx responses",
+};
+
 function readCsv(path) {
   const text = Deno.readTextFileSync(path);
   const [header, ...lines] = text.trim().split("\n");
@@ -54,6 +60,23 @@ function spread(numbers) {
   return middle ? (Math.max(...numbers) - Math.min(...numbers)) / middle : 0;
 }
 
+const measured = (row) => row.status === "ok";
+
+function formatUs(value) {
+  const microseconds = Number(value);
+  if (!microseconds) return "-";
+  if (microseconds >= 1000000) return `${(microseconds / 1000000).toFixed(2)}s`;
+  if (microseconds >= 1000) return `${(microseconds / 1000).toFixed(2)}ms`;
+  return `${microseconds}us`;
+}
+
+function notMeasured(rows, nameOf) {
+  return [...groupBy(rows.filter((row) => !measured(row)), nameOf)].map(([name, group]) => {
+    const status = unique(group.map((row) => row.status)).join(", ");
+    return `  ${name}: ${status}`;
+  });
+}
+
 const caseProfile = (row) => `${row.case}|${row.profile}`;
 const cellName = (row) => `${row.server} ${row.profile} ${row.case}`;
 const rateOf = (row) => Number(row.requests_per_sec);
@@ -72,6 +95,7 @@ function throughputTable(rows, field) {
 }
 
 function throughput(rows) {
+  const good = rows.filter(measured);
   const servers = unique(rows.map((row) => row.server)).sort();
   const widths = [20, 11];
 
@@ -82,39 +106,29 @@ function throughput(rows) {
   }
 
   console.log("\nthroughput req/s\n");
-  table(["case", "profile"], widths, servers, throughputTable(rows, "requests_per_sec"));
+  table(["case", "profile"], widths, servers, throughputTable(good, "requests_per_sec"));
 
-  const streaming = rows.filter((row) => Number(row.messages) > 1);
+  const streaming = good.filter((row) => Number(row.messages) > 1);
   if (streaming.length) {
     console.log("\nmessages/s\n");
     table(["case", "profile"], widths, servers, throughputTable(streaming, "messages_per_sec"));
   }
 
-  warnings(rows);
-}
-
-function warnings(rows) {
   const noisy = [];
-  const broken = [];
   const collapsed = [];
-
   const peers = new Map(
-    [...groupBy(rows, caseProfile)].map(([key, group]) => [key, median(group.map(rateOf))]),
+    [...groupBy(good, caseProfile)].map(([key, group]) => [key, median(group.map(rateOf))]),
   );
 
-  for (const [name, group] of groupBy(rows, cellName)) {
-    const measured = group.map(rateOf);
-    const disagreement = spread(measured);
+  for (const [name, group] of groupBy(good, cellName)) {
+    const rates = group.map(rateOf);
+    const disagreement = spread(rates);
     if (disagreement > NOISE) {
       noisy.push(`  ${name}: ${(disagreement * 100).toFixed(0)}% apart across repeats`);
     }
 
-    const failed = group.reduce((total, row) => total + Number(row.failed), 0);
-    const non2xx = group.reduce((total, row) => total + Number(row.non_2xx), 0);
-    if (failed || non2xx) broken.push(`  ${name}: ${failed} failed, ${non2xx} non-2xx`);
-
     const peer = peers.get(caseProfile(group[0]));
-    const rate = median(measured);
+    const rate = median(rates);
     if (peer && rate * COLLAPSED < peer) {
       collapsed.push(
         `  ${name}: ${Math.round(rate).toLocaleString()} req/s against a ` +
@@ -123,19 +137,9 @@ function warnings(rows) {
     }
   }
 
-  section("not answering the case correctly", broken);
+  section("excluded from the tables", notMeasured(rows, cellName));
   section("collapsed against peers", collapsed);
   section("repeats disagreed by over 5%", noisy);
-}
-
-function micros(value) {
-  const match = String(value).match(/^([\d.]+)(us|ms|s)?$/);
-  if (!match) return 0;
-  return Number(match[1]) * ({ us: 1, ms: 1000, s: 1000000 }[match[2]] ?? 1);
-}
-
-function latencyOf(value) {
-  return micros(value) === 0 ? "-" : value;
 }
 
 function hardestRates(rows) {
@@ -148,37 +152,63 @@ function hardestRates(rows) {
 }
 
 function latency(rows) {
+  const good = rows.filter(measured);
   const servers = unique(rows.map((row) => row.server)).sort();
 
   console.log("p99 at a fixed offered rate for http1\n");
-  for (const [name, forCase] of groupBy(rows, (row) => row.case)) {
+  for (const [name, forCase] of groupBy(good, (row) => row.case)) {
     console.log(name);
     table(
       ["target req/s"],
       [14],
       servers,
-      [...groupBy(forCase, (row) => row.target_rate)].map(([rate, group]) => ({
-        labels: [Number(rate).toLocaleString()],
-        values: new Map(group.map((row) => [row.server, latencyOf(row.p99)])),
-      })),
+      [...groupBy(forCase, (row) => row.target_rate)]
+        .sort(([a], [b]) => Number(a) - Number(b))
+        .map(([rate, group]) => ({
+          labels: [Number(rate).toLocaleString()],
+          values: new Map(group.map((row) => [row.server, formatUs(row.p99_us)])),
+        })),
     );
     console.log();
   }
 
-  console.log("CO gap at the highest rate\n");
+  console.log("highest rung held, req/s\n");
   table(
     ["case"],
     [20],
     servers,
-    [...groupBy(hardestRates(rows), (row) => row.case)].map(([name, group]) => ({
+    [...groupBy(rows, (row) => row.case)].map(([name, forCase]) => ({
+      labels: [name],
+      values: new Map(
+        [...groupBy(forCase.filter(measured), (row) => row.server)].map((
+          [server, group],
+        ) => [
+            server,
+            Math.max(...group.map((row) => Number(row.target_rate))).toLocaleString(),
+          ]),
+      ),
+    })),
+  );
+
+  console.log("\nCO gap at the highest rung held\n");
+  table(
+    ["case"],
+    [20],
+    servers,
+    [...groupBy(hardestRates(good), (row) => row.case)].map(([name, group]) => ({
       labels: [name],
       values: new Map(
         group.map((row) => {
-          const raw = micros(row.p99_raw);
-          return [row.server, raw ? `${(micros(row.p99) / raw).toFixed(1)}x` : "-"];
+          const raw = Number(row.p99_raw_us);
+          return [row.server, raw ? `${(Number(row.p99_us) / raw).toFixed(1)}x` : "-"];
         }),
       ),
     })),
+  );
+
+  section(
+    "excluded from the tables",
+    notMeasured(rows, (row) => `${row.server} ${row.case} @ ${Number(row.target_rate).toLocaleString()}`),
   );
 }
 
@@ -200,6 +230,11 @@ function main() {
 
     if (rows.length === 0) {
       console.error(`no results in ${path}`);
+      Deno.exit(1);
+    }
+
+    if (!("status" in rows[0])) {
+      console.error(`${path} predates the status column, rerun the benchmark`);
       Deno.exit(1);
     }
 
