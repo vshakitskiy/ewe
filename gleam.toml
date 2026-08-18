@@ -10,6 +10,7 @@ links = [{ title = "Gleam", href = "https://gleam.run" }]
 [documentation]
 pages = [
     { title = "Migrating from v4", path = "migration.html", source = "./MIGRATING.md" },
+    { title = "Benchmarks", path = "benchmarks.html", source = "benchmark/RESULTS.md" },
 ]
 
 [dependencies]
