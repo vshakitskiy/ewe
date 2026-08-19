@@ -7,3 +7,9 @@ CLAUDE.md
 autobahn/server
 # examples
 /bench
+/dev/priv/file_1gb.bin
+/dev/priv/file_100kb.bin
+/benchmark/priv/*.bin
+/benchmark/results
+/benchmark/.wrk2
+NOTE.md

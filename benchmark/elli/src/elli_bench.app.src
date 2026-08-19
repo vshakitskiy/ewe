@@ -1,0 +1,16 @@
+{application, elli_bench,
+ [{description, "elli benchmark server"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {elli_bench_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    elli
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.

@@ -1,88 +1,180 @@
-import ewe/internal/http1.{type Connection, type ResponseBody} as ewe_http
-import ewe/internal/http1/handler as http1_handler
-import gleam/bytes_tree
+import ewe/internal/connection
+import ewe/internal/http1
+import ewe/internal/http1/connection as http1_connection
+import ewe/internal/http2
+import ewe/internal/http2/connection as http2_connection
 import gleam/erlang/process
-import gleam/http/request.{type Request}
-import gleam/http/response.{type Response}
-import gleam/option.{type Option, Some}
-import gleam/otp/actor
-import gleam/otp/factory_supervisor as factory
+import gleam/http/request
+import gleam/http/response
+import gleam/option
 import glisten
+import glisten/socket/options
 import glisten/transport
 import logging
 
-/// State of the request handler.
-///
-pub type Handler {
-  Http1(state: http1_handler.Http1Handler, self: process.Subject(Nil))
+pub type State {
+  Initialised(http1.State, http2_connection.Options)
+  Http1(http1.State)
+  Http2(http2.State)
 }
 
-/// Initializes the request handler state.
-///
-pub fn init(_) -> #(Handler, Option(process.Selector(Nil))) {
-  let subject = process.new_subject()
+pub fn on_init(
+  handler: fn(request.Request(connection.Connection)) ->
+    response.Response(connection.Body),
+  http1_options: http1_connection.Options,
+  http2_options: http2_connection.Options,
+) {
+  fn(connection: glisten.Connection(connection.Message)) -> #(
+    State,
+    option.Option(process.Selector(connection.Message)),
+  ) {
+    let state =
+      http1.State(
+        handler:,
+        buffer: <<>>,
+        idle_timer: connection.start_idle_timer(
+          connection,
+          http1_options.idle_timeout,
+        ),
+        options: http1_options,
+      )
+
+    #(Initialised(state, http2_options), option.None)
+  }
+}
+
+pub fn loop(
+  state: State,
+  message: glisten.Message(connection.Message),
+  connection: glisten.Connection(connection.Message),
+) -> glisten.Next(State, glisten.Message(connection.Message)) {
+  case state, message {
+    Initialised(state, http2_options), glisten.Packet(data) -> {
+      connection.cancel_idle_timer(state.idle_timer)
+      let buffer = connection.append_buffer(state.buffer, data)
+
+      case sniff_preface(buffer) {
+        NeedMoreData ->
+          http1.State(
+            ..state,
+            buffer:,
+            idle_timer: connection.start_idle_timer(
+              connection,
+              state.options.idle_timeout,
+            ),
+          )
+          |> Initialised(http2_options)
+          |> glisten.continue
+        Http2Preface(remaining:) ->
+          start_http2(connection, state.handler, http2_options, remaining)
+        NotHttp2(buffer:) ->
+          http1.State(..state, buffer:, idle_timer: option.None)
+          |> http1.handle_message(connection)
+          |> from_http1
+      }
+    }
+    Http1(state), glisten.Packet(data) ->
+      http1.State(..state, buffer: connection.append_buffer(state.buffer, data))
+      |> http1.handle_message(connection)
+      |> from_http1
+    Http2(state), message ->
+      http2.handle_message(state, message, connection)
+      |> from_http2
+    Initialised(..), glisten.User(connection.Timeout)
+    | Http1(..), glisten.User(connection.Timeout)
+    -> {
+      logging.log(logging.Debug, "Connection idled for too long, closing.")
+      glisten.stop()
+    }
+    Initialised(..), glisten.User(_message)
+    | Http1(..), glisten.User(_message)
+    -> glisten.continue(state)
+  }
+}
+
+fn start_http2(
+  connection: glisten.Connection(connection.Message),
+  handler: fn(request.Request(connection.Connection)) ->
+    response.Response(connection.Body),
+  options: http2_connection.Options,
+  remaining: BitArray,
+) -> glisten.Next(State, glisten.Message(connection.Message)) {
+  process.trap_exits(True)
+
+  let self = process.new_subject()
+  let replies = process.new_subject()
+
+  let peer = transport.peername(connection.transport, connection.socket)
+  let parent = http2_connection.parent_pid()
+
+  let state = http2.init(handler, options, self, replies, peer, parent)
+
   let selector =
     process.new_selector()
-    |> process.select(subject)
+    |> process.select_map(self, glisten.User)
+    |> process.select_map(replies, fn(reply) {
+      glisten.User(connection.Http2Stream(reply))
+    })
+    |> process.select_trapped_exits(fn(exit) {
+      glisten.User(connection.Http2Exit(exit))
+    })
 
-  #(Http1(http1_handler.init(), self: subject), Some(selector))
+  case glisten.send(connection, state.settings_frame) {
+    Error(_reason) -> glisten.stop()
+    Ok(Nil) ->
+      http2.handle_message(state, glisten.Packet(remaining), connection)
+      |> from_http2
+      |> glisten.with_selector(selector)
+      |> glisten.set_active_state(options.Count(http2.socket_active_batch_size))
+  }
 }
 
-/// Main loop that processes incoming messages.
-///
-pub fn loop(
-  handler: fn(Request(Connection)) -> Response(ResponseBody),
-  on_crash: Response(ResponseBody),
-  factory_name: process.Name(
-    factory.Message(fn() -> Result(actor.Started(Nil), actor.StartError), Nil),
-  ),
-  idle_timeout: Int,
-) -> glisten.Loop(Handler, Nil) {
-  fn(
-    state: Handler,
-    message: glisten.Message(Nil),
-    conn: glisten.Connection(Nil),
-  ) -> glisten.Next(Handler, glisten.Message(Nil)) {
-    let sender = conn.subject
-    let conn = ewe_http.transform_connection(conn, factory_name)
+fn from_http1(
+  next: http1.Next,
+) -> glisten.Next(State, glisten.Message(connection.Message)) {
+  case next {
+    http1.Continue(state) -> glisten.continue(Http1(state))
+    http1.Close -> glisten.stop()
+    http1.CloseAbnormal(reason:) -> glisten.stop_abnormal(reason)
+  }
+}
 
-    case state, message {
-      Http1(state, self), glisten.Packet(message) -> {
-        let result =
-          http1_handler.handle_packet(
-            state,
-            conn,
-            message,
-            sender,
-            handler,
-            on_crash,
-            idle_timeout,
-          )
+fn from_http2(
+  next: http2.Next,
+) -> glisten.Next(State, glisten.Message(connection.Message)) {
+  case next {
+    http2.Continue(state) -> glisten.continue(Http2(state))
+    http2.Close -> glisten.stop()
+    http2.CloseAbnormal(reason:) -> glisten.stop_abnormal(reason)
+  }
+}
 
-        case result {
-          http1_handler.Continue(state) -> glisten.continue(Http1(state, self))
-          http1_handler.Http2Upgrade(http1_handler.Direct(_data)) -> {
-            logging.log(logging.Notice, "HTTP/2 upgrade; sending goaway")
-            let goaway = <<
-              0:size(24), 4, 0, 0:size(32), 8:size(24), 7, 0, 0:size(32),
-              0:size(32), 13:size(32),
-            >>
+pub type Sniff {
+  NeedMoreData
+  Http2Preface(remaining: BitArray)
+  NotHttp2(buffer: BitArray)
+}
 
-            let _ =
-              transport.send(
-                conn.transport,
-                conn.socket,
-                bytes_tree.from_bit_array(goaway),
-              )
+const preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8>>
 
-            glisten.stop()
-          }
-          http1_handler.Stop
-          | http1_handler.Http2Upgrade(http1_handler.Upgrade(..)) ->
-            glisten.stop()
-        }
+pub fn sniff_preface(buffer: BitArray) -> Sniff {
+  case buffer {
+    <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8, remaining:bits>> ->
+      Http2Preface(remaining:)
+    _buffer ->
+      case is_partial_preface(buffer, preface) {
+        True -> NeedMoreData
+        False -> NotHttp2(buffer:)
       }
-      _, _ -> glisten.stop()
+  }
+}
+
+fn is_partial_preface(buffer: BitArray, expected: BitArray) -> Bool {
+  case buffer, expected {
+    <<byte, buffer:bits>>, <<wanted, expected:bits>> if byte == wanted -> {
+      is_partial_preface(buffer, expected)
     }
+    <<>>, _expected -> True
+    _buffer, _expected -> False
   }
 }

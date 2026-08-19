@@ -1,0 +1,5 @@
+wrk.headers["cookie"] = "session=abc123def456; theme=dark; locale=en-US"
+wrk.headers["x-request-id"] = "9f86d081-b1bb-4c2e-8f21-9c7b1f2a0e3e"
+wrk.headers["x-client-version"] = "4.2.1"
+wrk.headers["accept-language"] = "en-US,en;q=0.9"
+wrk.headers["x-forwarded-for"] = "203.0.113.42"

@@ -1,0 +1,110 @@
+import ewe/internal/connection
+import ewe/internal/http1/connection as http1
+import ewe/internal/http1/encoder
+import ewe/internal/http1/parser
+import gleam/bit_array
+import gleam/bytes_tree
+import gleam/http
+import gleam/http/response
+import gleam/list
+import gleam/string
+
+fn head(headers: List(#(String, String)), body: connection.Body) -> String {
+  encode(200, headers, body).0
+}
+
+fn encode(
+  status: Int,
+  headers: List(#(String, String)),
+  body: connection.Body,
+) -> #(String, encoder.Remainder) {
+  let response = response.Response(status:, headers:, body:)
+  let assert Ok(encoded) =
+    encoder.encode_response(response, http.Get, parser.Http11, http1.KeepAlive)
+
+  let assert Ok(text) =
+    bytes_tree.to_bit_array(encoded.head)
+    |> bit_array.to_string
+
+  #(text, encoded.remainder)
+}
+
+fn occurrences(haystack: String, needle: String) -> Int {
+  list.length(string.split(haystack, needle)) - 1
+}
+
+pub fn computed_content_length_is_the_only_one_test() {
+  let out = head([], connection.Text("hello"))
+
+  assert occurrences(out, "content-length:") == 1
+  assert string.contains(out, "content-length: 5")
+}
+
+pub fn handler_content_length_is_dropped_test() {
+  let out = head([#("content-length", "999")], connection.Text("hello"))
+
+  assert occurrences(out, "content-length:") == 1
+  assert string.contains(out, "content-length: 5")
+}
+
+pub fn uppercase_content_length_is_dropped() {
+  let out = head([#("Content-Length", "999")], connection.Text("hello"))
+
+  assert occurrences(out, "999") == 0
+    as "a differently cased content-length is still a content-length, and two on one response is a framing bug"
+}
+
+pub fn mixed_case_transfer_encoding_is_dropped() {
+  let out = head([#("Transfer-Encoding", "chunked")], connection.Text("hi"))
+
+  assert occurrences(out, "chunked") == 0
+}
+
+pub fn uppercase_connection_close_is_honoured() {
+  let out = head([#("Connection", "close")], connection.Text("hi"))
+
+  assert string.contains(out, "connection: close")
+  assert occurrences(out, "connection:") == 1
+    as "the handler's connection header must drive the real one, not sit beside it"
+}
+
+pub fn header_names_are_normalised_to_lowercase() {
+  let out = head([#("X-Request-Id", "abc")], connection.Text("hi"))
+
+  assert string.contains(out, "x-request-id: abc")
+  assert occurrences(out, "X-Request-Id") == 0
+}
+
+pub fn ordinary_headers_are_kept_test() {
+  let out = head([#("x-trace", "1")], connection.Text("hi"))
+
+  assert string.contains(out, "x-trace: 1")
+}
+
+pub fn no_content_carries_no_framing_or_body_test() {
+  let #(out, remainder) = encode(204, [], connection.Text("hi"))
+
+  assert occurrences(out, "content-length:") == 0
+    as "content-length is forbidden on 204, and a client that reads one waits for a body that never comes"
+  assert remainder == encoder.NoRemainder
+}
+
+pub fn not_modified_carries_no_body_test() {
+  let #(out, remainder) = encode(304, [], connection.Text("hi"))
+
+  assert occurrences(out, "content-length:") == 0
+  assert remainder == encoder.NoRemainder
+}
+
+pub fn informational_status_carries_no_framing_test() {
+  let #(out, remainder) = encode(100, [], connection.Empty)
+
+  assert occurrences(out, "content-length:") == 0
+  assert remainder == encoder.NoRemainder
+}
+
+pub fn ordinary_status_still_carries_framing_test() {
+  let #(out, _remainder) = encode(200, [], connection.Text("hi"))
+
+  assert string.contains(out, "content-length: 2")
+}

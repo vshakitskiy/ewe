@@ -1,28 +1,32 @@
 name = "ewe"
-version = "4.0.1"
+version = "5.0.0"
 
-description = "🐑 a fluffy Gleam web server"
+description = "🐑 a fluffy HTTP/1 and HTTP/2 web server for Gleam"
 target = "erlang"
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "vshakitskiy", repo = "ewe" }
 links = [{ title = "Gleam", href = "https://gleam.run" }]
 
+[documentation]
+pages = [
+    { title = "Migrating from v4", path = "migration.html", source = "./MIGRATING.md" },
+    { title = "Benchmarks", path = "benchmarks.html", source = "benchmark/RESULTS.md" },
+]
+
 [dependencies]
+alpacki = ">= 3.0.1 and < 4.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
-glisten = ">= 9.0.0 and < 10.0.0"
+# glisten = ">= 9.0.0 and < 10.0.0"
+glisten = { git = "https://github.com/vshakitskiy/glisten.git", ref = "81a6b00" }
 gleam_otp = ">= 1.1.0 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
 logging = ">= 1.3.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
-compresso = "0.1.0"
-websocks = ">= 3.0.0 and < 4.0.0"
-exception = ">= 2.1.0 and < 3.0.0"
+websocks = ">= 4.0.1 and < 5.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
 gleam_httpc = ">= 5.0.0 and < 6.0.0"
-gleam_json = ">= 3.0.2 and < 4.0.0"
-gleam_crypto = ">= 1.5.1 and < 2.0.0"
 
 [erlang]
 application_start_module = "ewe@internal@clock"

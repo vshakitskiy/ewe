@@ -1,0 +1,16 @@
+{application, httpd_bench,
+ [{description, "inets httpd benchmark server"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {httpd_bench_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    inets
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.

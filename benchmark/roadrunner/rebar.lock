@@ -1,0 +1,11 @@
+{"1.2.0",
+[{<<"roadrunner">>,{pkg,<<"roadrunner">>,<<"0.8.0">>},0},
+ {<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.2">>},1}]}.
+[
+{pkg_hash,[
+ {<<"roadrunner">>, <<"7BBC9DA8E2085EA94FE0A06DB51DBAD762AA016E70972F2A533C3914438C96F6">>},
+ {<<"telemetry">>, <<"A0CB522801DFFB1C49FE6E30561BADFFC7B6D0E180DB1300DF759FAA22062855">>}]},
+{pkg_hash_ext,[
+ {<<"roadrunner">>, <<"76F3389A27CE084FF380F80C6DE73C2448A6702017A2C22ACF34DE606C8239D1">>},
+ {<<"telemetry">>, <<"928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1">>}]}
+].

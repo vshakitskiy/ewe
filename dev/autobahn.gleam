@@ -1,42 +1,54 @@
+//// Echo server for the Autobahn test suite. Run `make autobahn_test`.
+
 import ewe
 import gleam/erlang/process
-import gleam/otp/static_supervisor as supervisor
+import gleam/http/request
+import gleam/http/response
 import logging
 
 pub fn main() -> Nil {
   logging.configure()
-  logging.set_level(logging.Info)
+  logging.set_level(logging.Warning)
 
-  let ewe_server =
-    ewe.new(fn(req) {
-      ewe.upgrade_websocket(
-        req,
-        on_init: fn(_conn, selector) { #(Nil, selector) },
-        handler: fn(conn, state, msg) {
-          case msg {
-            ewe.Text(text_frame) -> {
-              let _ = ewe.send_text_frame(conn, text_frame)
-              ewe.websocket_continue(state)
-            }
-            ewe.Binary(binary_frame) -> {
-              let _ = ewe.send_binary_frame(conn, binary_frame)
-              ewe.websocket_continue(state)
-            }
-            _ -> ewe.websocket_continue(state)
-          }
-        },
-        on_close: fn(_conn, _state) { Nil },
-      )
-    })
+  let listener_name = process.new_name("autobahn_listener")
+  let connection_factory_name = process.new_name("autobahn_factory")
+
+  let assert Ok(_started) =
+    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
     |> ewe.bind("0.0.0.0")
-    |> ewe.listening(port: 8080)
-    |> ewe.supervised()
-
-  let assert Ok(_) =
-    supervisor.new(supervisor.OneForAll)
-    |> supervisor.add(ewe_server)
-    |> supervisor.restart_tolerance(intensity: 1_000_000, period: 1_000_000)
-    |> supervisor.start()
+    |> ewe.listening(on: 8080)
+    |> ewe.start
 
   process.sleep_forever()
+}
+
+fn handle_request(
+  request: request.Request(ewe.Connection),
+) -> response.Response(ewe.Body) {
+  ewe.websocket(
+    request:,
+    on_init: fn(_conn, messages) { #(Nil, messages) },
+    handler: echo_message,
+    on_close: fn(_conn, _state) { Nil },
+  )
+}
+
+fn echo_message(
+  conn: ewe.WebsocketConnection,
+  state: Nil,
+  message: ewe.WebsocketMessage(Nil),
+) -> ewe.WebsocketNext(Nil, Nil) {
+  case message {
+    ewe.TextFrame(text) ->
+      case ewe.send_text_frame(conn, text) {
+        Ok(Nil) -> ewe.websocket_continue(state)
+        Error(_send) -> ewe.websocket_stop()
+      }
+    ewe.BinaryFrame(data) ->
+      case ewe.send_binary_frame(conn, data) {
+        Ok(Nil) -> ewe.websocket_continue(state)
+        Error(_send) -> ewe.websocket_stop()
+      }
+    ewe.UserMessage(_message) -> ewe.websocket_continue(state)
+  }
 }
