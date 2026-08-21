@@ -7,7 +7,7 @@ licences = ["Apache-2.0"]
 repository = { type = "github", user = "vshakitskiy", repo = "ewe" }
 links = [{ title = "Gleam", href = "https://gleam.run" }]
 
-internal_modules = ["ewe/internal/*", "ewe/glisten/*", "ewe/glisten.gleam"]
+internal_modules = ["ewe/internal/*", "ewe/glisten/*", "ewe/glisten"]
 
 [documentation]
 pages = [
