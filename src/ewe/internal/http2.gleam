@@ -1,4 +1,6 @@
 import alpacki
+import ewe/glisten
+import ewe/glisten/socket
 import ewe/internal/clock
 import ewe/internal/connection
 import ewe/internal/file
@@ -16,8 +18,6 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import glisten
-import glisten/socket
 
 @internal
 pub type PeerSettings {

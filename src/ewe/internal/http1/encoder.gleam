@@ -1,3 +1,5 @@
+import ewe/glisten/socket
+import ewe/glisten/transport
 import ewe/internal/clock
 import ewe/internal/connection
 import ewe/internal/file
@@ -12,8 +14,6 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
-import glisten/socket
-import glisten/transport
 import websocks
 
 pub type EncodeError {

@@ -1,3 +1,6 @@
+import ewe/glisten
+import ewe/glisten/socket
+import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http1/body
@@ -12,9 +15,6 @@ import gleam/http/request
 import gleam/http/response
 import gleam/option
 import gleam/result
-import glisten
-import glisten/socket
-import glisten/transport
 import logging
 
 pub type State {

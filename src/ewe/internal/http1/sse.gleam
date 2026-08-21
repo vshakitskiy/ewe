@@ -1,3 +1,6 @@
+import ewe/glisten/socket
+import ewe/glisten/socket/options
+import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
@@ -7,9 +10,6 @@ import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/result
-import glisten/socket
-import glisten/socket/options
-import glisten/transport
 import logging
 
 pub fn run(

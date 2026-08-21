@@ -1,9 +1,9 @@
+import ewe/glisten/socket
 import gleam/dynamic
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/http/response
 import gleam/option
-import glisten/socket
 
 pub type Options {
   Options(

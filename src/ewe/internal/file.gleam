@@ -1,10 +1,10 @@
+import ewe/glisten/socket
+import ewe/glisten/transport
 import ewe/internal/connection
 import gleam/bytes_tree
 import gleam/int
 import gleam/option
 import gleam/result
-import glisten/socket
-import glisten/transport
 
 pub type FileError {
   NotFound

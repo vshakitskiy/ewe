@@ -1,7 +1,7 @@
+import ewe/glisten/socket
+import ewe/glisten/transport
 import gleam/erlang/process
 import gleam/option
-import glisten/socket
-import glisten/transport
 import websocks
 
 pub type Options {

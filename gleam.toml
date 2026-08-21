@@ -7,6 +7,8 @@ licences = ["Apache-2.0"]
 repository = { type = "github", user = "vshakitskiy", repo = "ewe" }
 links = [{ title = "Gleam", href = "https://gleam.run" }]
 
+internal_modules = ["ewe/internal/*", "ewe/glisten/*", "ewe/glisten.gleam"]
+
 [documentation]
 pages = [
     { title = "Migrating from v4", path = "migration.html", source = "./MIGRATING.md" },
@@ -16,8 +18,6 @@ pages = [
 [dependencies]
 alpacki = ">= 3.0.1 and < 4.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
-# glisten = ">= 9.0.0 and < 10.0.0"
-glisten = { git = "https://github.com/vshakitskiy/glisten.git", ref = "81a6b00" }
 gleam_otp = ">= 1.1.0 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
 logging = ">= 1.3.0 and < 2.0.0"

@@ -1,10 +1,10 @@
+import ewe/glisten
+import ewe/glisten/internal/handler
 import ewe/internal/http1/connection as http1
 import ewe/internal/http2/connection as http2
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/option
-import glisten
-import glisten/internal/handler
 import websocks
 
 pub type Connection {

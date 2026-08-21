@@ -145,6 +145,12 @@
 ////   )
 //// </script>
 
+import ewe/glisten
+import ewe/glisten/internal/handler
+import ewe/glisten/internal/listener
+import ewe/glisten/socket
+import ewe/glisten/socket/options
+import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
@@ -174,12 +180,6 @@ import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
-import glisten
-import glisten/internal/handler
-import glisten/internal/listener
-import glisten/socket
-import glisten/socket/options
-import glisten/transport
 import logging
 import websocks
 

@@ -1,3 +1,6 @@
+import ewe/glisten
+import ewe/glisten/socket/options
+import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/http1
 import ewe/internal/http1/connection as http1_connection
@@ -7,9 +10,6 @@ import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
 import gleam/option
-import glisten
-import glisten/socket/options
-import glisten/transport
 import logging
 
 pub type State {
