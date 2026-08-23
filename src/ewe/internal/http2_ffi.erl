@@ -20,7 +20,6 @@
 ]).
 
 
-%% Compiles and caches match patterns once at module load.
 init() ->
   persistent_term:put(
     {?MODULE, name},
@@ -81,8 +80,6 @@ validate_header_name(Pattern, Bin) when is_binary(Bin) ->
 validate_header_name(_Pattern, _Bits) ->
   {error, invalid_utf8}.
 
-%% We do one scan for both `has an uppercase letter` and `has a forbidden byte`.
-%% We only need to know which kind of bad byte it was once we've found one.
 classify_name_match(nomatch, Bin) ->
   {ok, Bin};
 classify_name_match({Pos, _Len}, Bin) ->

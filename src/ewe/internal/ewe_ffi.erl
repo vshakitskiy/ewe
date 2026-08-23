@@ -61,8 +61,6 @@ is_valid_utf8(Bin) when is_binary(Bin) ->
 is_valid_utf8(_Bits) ->
   false.
 
-%% Tests seven bytes per word rather than eight since 56 bits is the widest that
-%% still fits an immediate integer on a 64-bit VM so no word allocates.
 skip_ascii(<<A:56, B:56, C:56, D:56, Rest/binary>>) when
     A band ?HIGH_BITS =:= 0,
     B band ?HIGH_BITS =:= 0,

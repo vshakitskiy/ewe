@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v5.0.0
 
 ### Server
 

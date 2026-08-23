@@ -16,7 +16,6 @@
 ]).
 
 
-%% Compiles and caches match patterns once at module load.
 init() ->
   persistent_term:put({?MODULE, lf}, binary:compile_pattern(<<"\n">>)),
   persistent_term:put({?MODULE, colon}, binary:compile_pattern(<<":">>)),
