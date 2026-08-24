@@ -7,7 +7,7 @@ import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
 import gleam/list
 
-@external(erlang, "glisten_tcp_ffi", "controlling_process")
+@external(erlang, "ewe_glisten_tcp_ffi", "controlling_process")
 pub fn controlling_process(socket: Socket, pid: Pid) -> Result(Nil, Atom)
 
 @external(erlang, "gen_tcp", "listen")
@@ -35,23 +35,23 @@ pub fn receive_timeout(
 @external(erlang, "gen_tcp", "recv")
 pub fn receive(socket: Socket, length: Int) -> Result(BitArray, SocketReason)
 
-@external(erlang, "glisten_tcp_ffi", "send")
+@external(erlang, "ewe_glisten_tcp_ffi", "send")
 pub fn send(socket: Socket, packet: BytesTree) -> Result(Nil, SocketReason)
 
 @external(erlang, "socket", "info")
 pub fn socket_info(socket: Socket) -> Dict(a, b)
 
-@external(erlang, "glisten_tcp_ffi", "close")
+@external(erlang, "ewe_glisten_tcp_ffi", "close")
 pub fn close(socket: a) -> Result(Nil, SocketReason)
 
-@external(erlang, "glisten_tcp_ffi", "shutdown")
+@external(erlang, "ewe_glisten_tcp_ffi", "shutdown")
 pub fn do_shutdown(socket: Socket, write: Atom) -> Result(Nil, SocketReason)
 
 pub fn shutdown(socket: Socket) -> Result(Nil, SocketReason) {
   do_shutdown(socket, atom.create("write"))
 }
 
-@external(erlang, "glisten_tcp_ffi", "set_opts")
+@external(erlang, "ewe_glisten_tcp_ffi", "set_opts")
 fn do_set_opts(
   socket: Socket,
   opts: List(options.ErlangTcpOption),
@@ -96,7 +96,7 @@ pub fn handshake(socket: Socket) -> Result(Socket, Nil) {
 @external(erlang, "tcp", "negotiated_protocol")
 pub fn negotiated_protocol(socket: Socket) -> a
 
-@external(erlang, "glisten_tcp_ffi", "peername")
+@external(erlang, "ewe_glisten_tcp_ffi", "peername")
 pub fn peername(socket: Socket) -> Result(socket.SockName, SocketReason)
 
 @external(erlang, "inet", "getopts")
@@ -105,5 +105,5 @@ pub fn get_socket_opts(
   opts: List(Atom),
 ) -> Result(List(#(Atom, Dynamic)), SocketReason)
 
-@external(erlang, "glisten_tcp_ffi", "sockname")
+@external(erlang, "ewe_glisten_tcp_ffi", "sockname")
 pub fn sockname(socket: ListenSocket) -> Result(socket.SockName, SocketReason)

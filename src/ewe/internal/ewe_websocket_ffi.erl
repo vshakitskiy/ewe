@@ -1,4 +1,4 @@
--module(websocket_ffi).
+-module(ewe_websocket_ffi).
 
 -export([socket_payload/1]).
 

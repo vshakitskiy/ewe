@@ -5,7 +5,7 @@ import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
 
-@external(erlang, "glisten_ssl_ffi", "controlling_process")
+@external(erlang, "ewe_glisten_ssl_ffi", "controlling_process")
 pub fn controlling_process(socket: Socket, pid: Pid) -> Result(Nil, Atom)
 
 @external(erlang, "ssl", "listen")
@@ -33,20 +33,20 @@ pub fn receive_timeout(
 @external(erlang, "ssl", "recv")
 pub fn receive(socket: Socket, length: Int) -> Result(BitArray, SocketReason)
 
-@external(erlang, "glisten_ssl_ffi", "send")
+@external(erlang, "ewe_glisten_ssl_ffi", "send")
 pub fn send(socket: Socket, packet: BytesTree) -> Result(Nil, SocketReason)
 
-@external(erlang, "glisten_ssl_ffi", "close")
+@external(erlang, "ewe_glisten_ssl_ffi", "close")
 pub fn close(socket: Socket) -> Result(Nil, SocketReason)
 
-@external(erlang, "glisten_ssl_ffi", "shutdown")
+@external(erlang, "ewe_glisten_ssl_ffi", "shutdown")
 pub fn do_shutdown(socket: Socket, write: Atom) -> Result(Nil, SocketReason)
 
 pub fn shutdown(socket: Socket) -> Result(Nil, SocketReason) {
   do_shutdown(socket, atom.create("write"))
 }
 
-@external(erlang, "glisten_ssl_ffi", "set_opts")
+@external(erlang, "ewe_glisten_ssl_ffi", "set_opts")
 fn do_set_opts(
   socket: Socket,
   opts: List(options.ErlangTcpOption),
@@ -76,13 +76,13 @@ pub fn listen(
   |> do_listen(port, _)
 }
 
-@external(erlang, "glisten_ssl_ffi", "negotiated_protocol")
+@external(erlang, "ewe_glisten_ssl_ffi", "negotiated_protocol")
 pub fn negotiated_protocol(socket: Socket) -> Result(String, String)
 
-@external(erlang, "glisten_ssl_ffi", "peername")
+@external(erlang, "ewe_glisten_ssl_ffi", "peername")
 pub fn peername(socket: Socket) -> Result(socket.SockName, SocketReason)
 
-@external(erlang, "glisten_ssl_ffi", "sockname")
+@external(erlang, "ewe_glisten_ssl_ffi", "sockname")
 pub fn sockname(socket: ListenSocket) -> Result(socket.SockName, SocketReason)
 
 @external(erlang, "ssl", "getopts")

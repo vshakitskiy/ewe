@@ -110,10 +110,10 @@ pub type Interrupted {
   TimedOut
 }
 
-@external(erlang, "http2_ffi", "recv_or_exit")
+@external(erlang, "ewe_http2_ffi", "recv_or_exit")
 pub fn receive_reply(tag: reference.Reference) -> Result(message, Interrupted)
 
-@external(erlang, "http2_ffi", "recv_or_exit")
+@external(erlang, "ewe_http2_ffi", "recv_or_exit")
 pub fn receive_reply_within(
   tag: reference.Reference,
   timeout: Int,
@@ -122,8 +122,8 @@ pub fn receive_reply_within(
 @external(erlang, "ewe_ffi", "identity")
 pub fn tag(reference: reference.Reference) -> dynamic.Dynamic
 
-@external(erlang, "http2_ffi", "parent_pid")
+@external(erlang, "ewe_http2_ffi", "parent_pid")
 pub fn parent_pid() -> Result(process.Pid, Nil)
 
-@external(erlang, "http2_ffi", "is_shutdown")
+@external(erlang, "ewe_http2_ffi", "is_shutdown")
 pub fn is_shutdown(reason: dynamic.Dynamic) -> Bool

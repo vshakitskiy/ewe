@@ -658,31 +658,31 @@ pub fn has_token(value: BitArray, token: BitArray) -> Bool {
   value == token || list.contains(tokens(value), token)
 }
 
-@external(erlang, "http1_ffi", "find_lf")
+@external(erlang, "ewe_http1_ffi", "find_lf")
 fn find_lf(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "find_colon")
+@external(erlang, "ewe_http1_ffi", "find_colon")
 fn find_colon(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "find_space")
+@external(erlang, "ewe_http1_ffi", "find_space")
 fn find_space(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "find_question")
+@external(erlang, "ewe_http1_ffi", "find_question")
 fn find_question(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "find_close_bracket")
+@external(erlang, "ewe_http1_ffi", "find_close_bracket")
 fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "find_unsafe_header_byte")
+@external(erlang, "ewe_http1_ffi", "find_unsafe_header_byte")
 pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
 
-@external(erlang, "http1_ffi", "split_comma")
+@external(erlang, "ewe_http1_ffi", "split_comma")
 fn split_comma(bits: BitArray) -> List(BitArray)
 
-@external(erlang, "http1_ffi", "lowercase_ascii")
+@external(erlang, "ewe_http1_ffi", "lowercase_ascii")
 pub fn lowercase_ascii(bits: BitArray) -> BitArray
 
-@external(erlang, "http1_ffi", "bit_array_to_string")
+@external(erlang, "ewe_http1_ffi", "bit_array_to_string")
 fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
 
 @external(erlang, "ewe_ffi", "identity")

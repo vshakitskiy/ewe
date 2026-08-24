@@ -1,4 +1,4 @@
--module(glisten_ffi).
+-module(ewe_glisten_ffi).
 
 -export([parse_address/1, rescue/1, to_erl_tcp_options/1,
   merge_type_list/2, socket_data/1, delete_file/1]).

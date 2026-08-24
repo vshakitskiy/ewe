@@ -573,7 +573,7 @@ pub fn start(
   |> acceptor.start_pool(transport, port, options, listener_name)
 }
 
-@external(erlang, "glisten_ffi", "delete_file")
+@external(erlang, "ewe_glisten_ffi", "delete_file")
 fn delete_socket_file(path: String) -> Result(Nil, dynamic.Dynamic)
 
 pub fn start_unix(
@@ -621,7 +621,7 @@ pub fn start_unix(
   |> acceptor.start_pool(transport, 0, options, listener_name)
 }
 
-@external(erlang, "glisten_ffi", "parse_address")
+@external(erlang, "ewe_glisten_ffi", "parse_address")
 fn parse_address(value: Charlist) -> Result(ip_address, Nil)
 
 /// Helper method for building a child specification for use in a supervision

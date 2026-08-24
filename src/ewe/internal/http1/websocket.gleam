@@ -382,10 +382,10 @@ fn exhausted(_record: dynamic.Dynamic) -> Received(user_message) {
   Exhausted
 }
 
-@external(erlang, "http1_ffi", "socket_error_reason")
+@external(erlang, "ewe_http1_ffi", "socket_error_reason")
 fn socket_error_reason(record: dynamic.Dynamic) -> socket.SocketReason
 
-@external(erlang, "websocket_ffi", "socket_payload")
+@external(erlang, "ewe_websocket_ffi", "socket_payload")
 fn socket_payload(record: dynamic.Dynamic) -> BitArray
 
 @external(erlang, "ewe_ffi", "identity")

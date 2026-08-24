@@ -1,4 +1,4 @@
--module(file_ffi).
+-module(ewe_file_ffi).
 
 -include_lib("kernel/include/file.hrl").
 

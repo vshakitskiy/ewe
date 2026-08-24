@@ -130,16 +130,16 @@ pub opaque type HeaderPatterns {
   )
 }
 
-@external(erlang, "http2_ffi", "name_pattern")
+@external(erlang, "ewe_http2_ffi", "name_pattern")
 fn name_pattern() -> Pattern
 
-@external(erlang, "http2_ffi", "forbidden_header_pattern")
+@external(erlang, "ewe_http2_ffi", "forbidden_header_pattern")
 fn forbidden_header_pattern() -> Pattern
 
-@external(erlang, "http2_ffi", "query_pattern")
+@external(erlang, "ewe_http2_ffi", "query_pattern")
 fn query_pattern() -> Pattern
 
-@external(erlang, "http2_ffi", "colon_pattern")
+@external(erlang, "ewe_http2_ffi", "colon_pattern")
 fn colon_pattern() -> Pattern
 
 @internal
@@ -519,7 +519,7 @@ fn record_reset(state: State) -> #(State, Bool) {
   )
 }
 
-@external(erlang, "http2_ffi", "monotonic_ms")
+@external(erlang, "ewe_http2_ffi", "monotonic_ms")
 fn monotonic_ms() -> Int
 
 fn remove_stream(state: State, stream_id: Int, entry: Stream) -> State {
@@ -1226,13 +1226,13 @@ fn parse_scheme(value: BitArray) -> Result(http.Scheme, RequestError) {
   }
 }
 
-@external(erlang, "http2_ffi", "validate_header_name")
+@external(erlang, "ewe_http2_ffi", "validate_header_name")
 fn validate_header_name(
   pattern: Pattern,
   name: BitArray,
 ) -> Result(String, RequestError)
 
-@external(erlang, "http2_ffi", "validate_header_value")
+@external(erlang, "ewe_http2_ffi", "validate_header_value")
 fn validate_header_value(
   pattern: Pattern,
   value: BitArray,
@@ -1285,7 +1285,7 @@ fn split_authority(
   }
 }
 
-@external(erlang, "http2_ffi", "split_once")
+@external(erlang, "ewe_http2_ffi", "split_once")
 fn split_once(
   string: String,
   on pattern: Pattern,
@@ -1582,7 +1582,7 @@ fn build_response_headers(
   })
 }
 
-@external(erlang, "http2_ffi", "has_forbidden_header_bytes")
+@external(erlang, "ewe_http2_ffi", "has_forbidden_header_bytes")
 fn has_forbidden_header_bytes(pattern: Pattern, value: String) -> Bool
 
 fn response_body_size(body: connection.Body) -> Int {

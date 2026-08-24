@@ -10,7 +10,7 @@ import gleam/result
 import gleam/string
 import logging
 
-@external(erlang, "glisten_ffi", "rescue")
+@external(erlang, "ewe_glisten_ffi", "rescue")
 fn rescue(func: fn() -> anything) -> Result(anything, Dynamic)
 
 /// All message types that the handler will receive, or that you can
@@ -348,8 +348,8 @@ pub fn start(
   |> actor.start()
 }
 
-@external(erlang, "glisten_ffi", "socket_data")
+@external(erlang, "ewe_glisten_ffi", "socket_data")
 fn socket_data(record: Dynamic) -> BitArray
 
-@external(erlang, "glisten_ffi", "socket_data")
+@external(erlang, "ewe_glisten_ffi", "socket_data")
 fn socket_error(record: Dynamic) -> SocketReason

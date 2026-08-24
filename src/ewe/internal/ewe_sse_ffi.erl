@@ -1,4 +1,4 @@
--module(sse_ffi).
+-module(ewe_sse_ffi).
 
 -on_load(init/0).
 -export([

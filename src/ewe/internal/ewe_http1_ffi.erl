@@ -1,4 +1,4 @@
--module(http1_ffi).
+-module(ewe_http1_ffi).
 
 -on_load(init/0).
 -export([

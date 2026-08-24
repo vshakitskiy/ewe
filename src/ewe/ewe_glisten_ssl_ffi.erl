@@ -1,9 +1,9 @@
--module(glisten_tcp_ffi).
+-module(ewe_glisten_ssl_ffi).
 
--export([controlling_process/2, send/2, set_opts/2, shutdown/2, close/1, sockname/1, peername/1]).
+-export([controlling_process/2, send/2, set_opts/2, shutdown/2, close/1, negotiated_protocol/1, sockname/1, peername/1]).
 
 send(Socket, Packet) ->
-  case gen_tcp:send(Socket, Packet) of
+  case ssl:send(Socket, Packet) of
     ok ->
       {ok, nil};
     Res ->
@@ -11,7 +11,7 @@ send(Socket, Packet) ->
   end.
 
 set_opts(Socket, Options) ->
-  case inet:setopts(Socket, Options) of
+  case ssl:setopts(Socket, Options) of
     ok ->
       {ok, nil};
     {error, _Reason} ->
@@ -19,7 +19,7 @@ set_opts(Socket, Options) ->
   end.
 
 controlling_process(Socket, Pid) ->
-  case gen_tcp:controlling_process(Socket, Pid) of
+  case ssl:controlling_process(Socket, Pid) of
     ok ->
       {ok, nil};
     {error, Reason} ->
@@ -27,7 +27,7 @@ controlling_process(Socket, Pid) ->
   end.
 
 shutdown(Socket, How) ->
-  case gen_tcp:shutdown(Socket, How) of
+  case ssl:shutdown(Socket, How) of
     ok ->
       {ok, nil};
     {error, Reason} ->
@@ -35,15 +35,23 @@ shutdown(Socket, How) ->
   end.
 
 close(Socket) ->
-  case gen_tcp:close(Socket) of
+  case ssl:close(Socket) of
     ok ->
       {ok, nil};
     {error, Reason} ->
       {error, Reason}
   end.
 
+negotiated_protocol(Socket) ->
+  case ssl:negotiated_protocol(Socket) of
+    {error, _} ->
+      {error, "Socket not negotiated"};
+    Protocol ->
+      Protocol
+  end.
+
 sockname(Socket) ->
-  case inet:sockname(Socket) of
+  case ssl:sockname(Socket) of
     {ok, {local, Path}} ->
       {ok, {unix_sock_name, Path}};
     {ok, {Ip, Port}} ->
@@ -53,7 +61,7 @@ sockname(Socket) ->
   end.
 
 peername(Socket) ->
-  case inet:peername(Socket) of
+  case ssl:peername(Socket) of
     {ok, {local, Path}} ->
       {ok, {unix_sock_name, Path}};
     {ok, {Ip, Port}} ->

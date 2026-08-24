@@ -71,8 +71,8 @@ fn append_lines(
   }
 }
 
-@external(erlang, "sse_ffi", "split_breaks")
+@external(erlang, "ewe_sse_ffi", "split_breaks")
 fn split_breaks(value: String) -> List(String)
 
-@external(erlang, "sse_ffi", "strip_breaks")
+@external(erlang, "ewe_sse_ffi", "strip_breaks")
 fn strip_breaks(value: String) -> String

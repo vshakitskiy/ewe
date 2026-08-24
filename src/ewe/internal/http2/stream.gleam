@@ -151,5 +151,5 @@ fn write(
   writer
 }
 
-@external(erlang, "http2_ffi", "exit_self")
+@external(erlang, "ewe_http2_ffi", "exit_self")
 fn abort(reason: String) -> a

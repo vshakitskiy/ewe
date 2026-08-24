@@ -204,5 +204,5 @@ fn client_data(_record: dynamic.Dynamic) -> Received(user_message) {
   ClientData
 }
 
-@external(erlang, "http1_ffi", "socket_error_reason")
+@external(erlang, "ewe_http1_ffi", "socket_error_reason")
 fn socket_error_reason(record: dynamic.Dynamic) -> socket.SocketReason

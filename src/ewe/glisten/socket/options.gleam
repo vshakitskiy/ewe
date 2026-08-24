@@ -89,7 +89,7 @@ pub type VerifyMode {
 
 pub type ErlangTcpOption
 
-@external(erlang, "glisten_ffi", "to_erl_tcp_options")
+@external(erlang, "ewe_glisten_ffi", "to_erl_tcp_options")
 pub fn to_erl_options(options: List(TcpOption)) -> List(ErlangTcpOption)
 
 pub const unix_default_options = [
@@ -110,7 +110,7 @@ pub const tcp_default_options = [
   ActiveMode(Passive),
 ]
 
-@external(erlang, "glisten_ffi", "merge_type_list")
+@external(erlang, "ewe_glisten_ffi", "merge_type_list")
 pub fn merge_type_list(original: List(a), override: List(a)) -> List(a)
 
 pub fn merge_with_tcp_defaults(options: List(TcpOption)) -> List(TcpOption) {
