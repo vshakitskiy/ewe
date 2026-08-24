@@ -157,17 +157,17 @@ fn send_chunks(
   }
 }
 
-@external(erlang, "file_ffi", "read_range")
+@external(erlang, "ewe_file_ffi", "read_range")
 pub fn read_range(
   path: String,
   offset: Int,
   length: Int,
 ) -> Result(BitArray, FileError)
 
-@external(erlang, "file_ffi", "stat")
+@external(erlang, "ewe_file_ffi", "stat")
 fn stat(path: String) -> Result(Int, FileError)
 
-@external(erlang, "file_ffi", "sendfile")
+@external(erlang, "ewe_file_ffi", "sendfile")
 fn do_sendfile(
   handle: connection.FileDescriptor,
   socket: socket.Socket,
@@ -175,18 +175,18 @@ fn do_sendfile(
   bytes: Int,
 ) -> Result(Nil, socket.SocketReason)
 
-@external(erlang, "file_ffi", "open")
+@external(erlang, "ewe_file_ffi", "open")
 pub fn open(path: String) -> Result(connection.FileDescriptor, FileError)
 
-@external(erlang, "file_ffi", "size")
+@external(erlang, "ewe_file_ffi", "size")
 fn size(handle: connection.FileDescriptor) -> Result(Int, FileError)
 
-@external(erlang, "file_ffi", "pread")
+@external(erlang, "ewe_file_ffi", "pread")
 fn pread(
   handle: connection.FileDescriptor,
   offset: Int,
   length: Int,
 ) -> Result(BitArray, socket.SocketReason)
 
-@external(erlang, "file_ffi", "close")
+@external(erlang, "ewe_file_ffi", "close")
 pub fn close(handle: connection.FileDescriptor) -> Nil

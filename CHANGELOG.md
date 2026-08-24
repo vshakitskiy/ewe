@@ -1,5 +1,9 @@
 # Changelog
 
+## v5.0.2
+
+- Fix the previous fix to be an actual fix.
+
 ## v5.0.1
 
 - Fix ffi file names to avoid issues with vendored glisten.
