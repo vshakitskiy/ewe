@@ -1,4 +1,3 @@
-import ewe/internal/connection
 import gleam/bytes_tree
 import gleam/int
 import gleam/list
@@ -12,11 +11,6 @@ pub type Event {
     retry: option.Option(Int),
     data: option.Option(String),
   )
-}
-
-pub type Step(user_state) {
-  Proceed(user_state)
-  Halt(connection.Outcome)
 }
 
 pub fn new() -> Event {

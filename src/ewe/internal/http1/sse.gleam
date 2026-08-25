@@ -9,23 +9,32 @@ import ewe/internal/sse
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/option
 import gleam/result
 import logging
 
 pub fn run(
   conn: http1.SseConnection,
-  on_init: fn(process.Subject(user_message)) -> user_state,
+  on_init: fn(connection.SseConnection, process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
   step: fn(connection.SseConnection, user_state, user_message) ->
-    sse.Step(user_state),
+    connection.Step(user_state, user_message),
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   let handle = connection.Http1Sse(conn)
-  let subject = process.new_subject()
-  let state = on_init(subject)
+  let #(state, messages) = on_init(handle, process.new_selector())
 
   case activate(conn) {
     Ok(Nil) ->
-      loop(conn, handle, selector(subject), state, Clean, step, on_close)
+      loop(
+        conn,
+        handle,
+        merge_socket_selector(messages),
+        state,
+        Clean,
+        step,
+        on_close,
+      )
     Error(reason) -> socket_failed(conn, handle, state, on_close, reason)
   }
 }
@@ -101,7 +110,7 @@ fn loop(
   state: user_state,
   reuse: Reuse,
   step: fn(connection.SseConnection, user_state, user_message) ->
-    sse.Step(user_state),
+    connection.Step(user_state, user_message),
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
@@ -118,9 +127,15 @@ fn loop(
     Message(message) ->
       case rescue.handler(fn() { step(handle, state, message) }) {
         Error(details) -> crashed(conn, handle, state, on_close, details)
-        Ok(sse.Proceed(state)) ->
+        Ok(connection.Proceed(user_state: state, messages:)) -> {
+          let selector = case messages {
+            option.Some(messages) -> merge_socket_selector(messages)
+            option.None -> selector
+          }
+
           loop(conn, handle, selector, state, reuse, step, on_close)
-        Ok(sse.Halt(outcome)) ->
+        }
+        Ok(connection.Halt(outcome)) ->
           ended(
             conn,
             handle,
@@ -171,11 +186,15 @@ type Received(user_message) {
   Exhausted
 }
 
-fn selector(
-  subject: process.Subject(user_message),
+fn merge_socket_selector(
+  messages: process.Selector(user_message),
 ) -> process.Selector(Received(user_message)) {
+  process.map_selector(messages, Message)
+  |> process.merge_selector(socket_selector())
+}
+
+fn socket_selector() -> process.Selector(Received(user_message)) {
   process.new_selector()
-  |> process.select_map(subject, Message)
   |> process.select_record(atom.create("tcp_closed"), 1, disconnected)
   |> process.select_record(atom.create("ssl_closed"), 1, disconnected)
   |> process.select_record(atom.create("tcp_error"), 2, failed)

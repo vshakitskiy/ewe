@@ -82,7 +82,7 @@ pub fn run(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> websocket.Step(user_state, user_message),
+  ) -> connection.Step(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   let #(state, messages) =
@@ -159,7 +159,7 @@ fn loop(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> websocket.Step(user_state, user_message),
+  ) -> connection.Step(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
@@ -189,7 +189,7 @@ fn drain(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> websocket.Step(user_state, user_message),
+  ) -> connection.Step(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case websocks.next_frame(conn.context) {
@@ -238,7 +238,7 @@ fn deliver(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> websocket.Step(user_state, user_message),
+  ) -> connection.Step(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
   resume: Resume,
   message: websocket.Message(user_message),
@@ -247,7 +247,7 @@ fn deliver(
 
   case rescue.handler(fn() { step(handle, state, message) }) {
     Error(details) -> crashed(conn, state, on_close, details)
-    Ok(websocket.Proceed(user_state: state, messages:)) -> {
+    Ok(connection.Proceed(user_state: state, messages:)) -> {
       let selector = case messages {
         option.Some(messages) -> merge_socket_selector(messages)
         option.None -> selector
@@ -258,7 +258,7 @@ fn deliver(
         AwaitSocket -> loop(conn, selector, state, step, on_close)
       }
     }
-    Ok(websocket.Halt(outcome)) -> ended(conn, state, on_close, outcome)
+    Ok(connection.Halt(outcome)) -> ended(conn, state, on_close, outcome)
   }
 }
 

@@ -108,18 +108,18 @@ fn handle_websocket_message(
   conn: ewe.WebsocketConnection,
   state: WebsocketState,
   message: ewe.WebsocketMessage(Broadcast),
-) -> ewe.WebsocketNext(WebsocketState, Broadcast) {
+) -> ewe.Next(WebsocketState, Broadcast) {
   case message {
     // Text frame from the client; broadcast to all subscribers.
     ewe.TextFrame(text) -> {
       pubsub.publish(state.pubsub, topic: state.topic, message: Text(text))
-      ewe.websocket_continue(state)
+      ewe.continue(state)
     }
 
     // Binary frame from the client; broadcast to all subscribers.
     ewe.BinaryFrame(data) -> {
       pubsub.publish(state.pubsub, topic: state.topic, message: Bytes(data))
-      ewe.websocket_continue(state)
+      ewe.continue(state)
     }
 
     // Message from the pubsub; forward to this client.
@@ -130,9 +130,8 @@ fn handle_websocket_message(
       }
 
       case sent {
-        Ok(Nil) -> ewe.websocket_continue(state)
-        Error(_send_error) ->
-          ewe.websocket_stop_abnormal("Failed to send a frame")
+        Ok(Nil) -> ewe.continue(state)
+        Error(_send_error) -> ewe.stop_abnormal("Failed to send a frame")
       }
     }
   }

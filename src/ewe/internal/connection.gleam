@@ -63,6 +63,14 @@ pub type Outcome {
   StoppedAbnormal(reason: String)
 }
 
+pub type Step(user_state, user_message) {
+  Proceed(
+    user_state: user_state,
+    messages: option.Option(process.Selector(user_message)),
+  )
+  Halt(Outcome)
+}
+
 pub type Message {
   Timeout
   Http2Handshake

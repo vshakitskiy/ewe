@@ -74,17 +74,19 @@ fn handle_request(
     http.Get, "/sse" ->
       response.new(200)
       |> ewe.sse(
-        // Initialize the connection and subscribe this client to the pubsub.
-        on_init: fn(client) {
+        // Subscribe this client to the pubsub and listen on the subject it
+        // publishes to.
+        on_init: fn(_conn, selector) {
+          let client = process.new_subject()
           pubsub.subscribe(pubsub, topic:, client:)
 
-          client
+          #(client, process.select(selector, client))
         },
         // Handle messages from the pubsub and send them as SSE events.
         handler: fn(conn, client, message) {
           case ewe.send_event(conn, ewe.event(message)) {
-            Ok(Nil) -> ewe.sse_continue(client)
-            Error(_send_error) -> ewe.sse_stop()
+            Ok(Nil) -> ewe.continue(client)
+            Error(_send_error) -> ewe.stop()
           }
         },
         // Clean up when the client disconnects.

@@ -37,18 +37,18 @@ fn echo_message(
   conn: ewe.WebsocketConnection,
   state: Nil,
   message: ewe.WebsocketMessage(Nil),
-) -> ewe.WebsocketNext(Nil, Nil) {
+) -> ewe.Next(Nil, Nil) {
   case message {
     ewe.TextFrame(text) ->
       case ewe.send_text_frame(conn, text) {
-        Ok(Nil) -> ewe.websocket_continue(state)
-        Error(_send) -> ewe.websocket_stop()
+        Ok(Nil) -> ewe.continue(state)
+        Error(_send) -> ewe.stop()
       }
     ewe.BinaryFrame(data) ->
       case ewe.send_binary_frame(conn, data) {
-        Ok(Nil) -> ewe.websocket_continue(state)
-        Error(_send) -> ewe.websocket_stop()
+        Ok(Nil) -> ewe.continue(state)
+        Error(_send) -> ewe.stop()
       }
-    ewe.UserMessage(_message) -> ewe.websocket_continue(state)
+    ewe.UserMessage(_message) -> ewe.continue(state)
   }
 }

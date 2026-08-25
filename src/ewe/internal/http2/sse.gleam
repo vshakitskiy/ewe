@@ -5,40 +5,47 @@ import ewe/internal/rescue
 import ewe/internal/sse
 import gleam/bytes_tree
 import gleam/erlang/process
-import gleam/erlang/reference
+import gleam/option
 import gleam/result
 import logging
 
 pub fn run(
   conn: http2.SseConnection(connection.Body),
-  on_init: fn(process.Subject(user_message)) -> user_state,
+  on_init: fn(connection.SseConnection, process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
   step: fn(connection.SseConnection, user_state, user_message) ->
-    sse.Step(user_state),
+    connection.Step(user_state, user_message),
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   let handle = connection.Http2Sse(conn)
-  let tag = reference.new()
-  let subject = process.unsafely_create_subject(process.self(), http2.tag(tag))
+  let #(state, messages) = on_init(handle, process.new_selector())
 
-  loop(conn, handle, tag, on_init(subject), step, on_close)
+  loop(conn, handle, merge_exit_selector(messages), state, step, on_close)
 }
 
 fn loop(
   conn: http2.SseConnection(connection.Body),
   handle: connection.SseConnection,
-  tag: reference.Reference,
+  selector: process.Selector(Received(user_message)),
   state: user_state,
   step: fn(connection.SseConnection, user_state, user_message) ->
-    sse.Step(user_state),
+    connection.Step(user_state, user_message),
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
-  case http2.receive_reply(tag) {
-    Error(_interrupted) -> ended(handle, state, on_close, connection.Stopped)
-    Ok(message) ->
+  case process.selector_receive_forever(selector) {
+    Interrupted -> ended(handle, state, on_close, connection.Stopped)
+    Message(message) ->
       case rescue.handler(fn() { step(handle, state, message) }) {
         Error(details) -> crashed(handle, state, on_close, details)
-        Ok(sse.Proceed(state)) -> loop(conn, handle, tag, state, step, on_close)
-        Ok(sse.Halt(outcome)) -> {
+        Ok(connection.Proceed(user_state: state, messages:)) -> {
+          let selector = case messages {
+            option.Some(messages) -> merge_exit_selector(messages)
+            option.None -> selector
+          }
+
+          loop(conn, handle, selector, state, step, on_close)
+        }
+        Ok(connection.Halt(outcome)) -> {
           let outcome = ended(handle, state, on_close, outcome)
 
           case outcome {
@@ -80,6 +87,23 @@ fn crashed(
 
   connection.StoppedAbnormal("the handler crashed")
   |> ended(handle, state, on_close, _)
+}
+
+type Received(user_message) {
+  Message(user_message)
+  Interrupted
+}
+
+fn merge_exit_selector(
+  messages: process.Selector(user_message),
+) -> process.Selector(Received(user_message)) {
+  process.map_selector(messages, Message)
+  |> process.merge_selector(exit_selector())
+}
+
+fn exit_selector() -> process.Selector(Received(user_message)) {
+  process.new_selector()
+  |> process.select_trapped_exits(fn(_exit) { Interrupted })
 }
 
 pub fn send(

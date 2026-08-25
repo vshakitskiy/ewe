@@ -58,16 +58,21 @@
 ////     ]
 ////   },
 ////   {
+////     header: "Next",
+////     functions: [
+////       "continue",
+////       "continue_with_selector",
+////       "stop",
+////       "stop_abnormal"
+////     ]
+////   },
+////   {
 ////     header: "Websocket",
 ////     functions: [
 ////       "websocket",
 ////       "send_binary_frame",
 ////       "send_text_frame",
-////       "send_close_frame",
-////       "websocket_continue",
-////       "websocket_continue_with_selector",
-////       "websocket_stop",
-////       "websocket_stop_abnormal"
+////       "send_close_frame"
 ////     ]
 ////   },
 ////   {
@@ -79,10 +84,7 @@
 ////       "event_name",
 ////       "event_id",
 ////       "event_retry",
-////       "send_event",
-////       "sse_continue",
-////       "sse_stop",
-////       "sse_stop_abnormal"
+////       "send_event"
 ////     ]
 ////   },
 ////   {
@@ -1478,6 +1480,53 @@ pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   }
 }
 
+/// What a WebSocket or a Server-Sent Events stream does once the handler has
+/// dealt with a message.
+///
+/// Create one with `continue`, `continue_with_selector`, `stop` or
+/// `stop_abnormal`.
+pub opaque type Next(user_state, user_message) {
+  Continue(user_state, Option(process.Selector(user_message)))
+  Stop
+  StopAbnormal(reason: String)
+}
+
+/// Carry on, handling further messages with the given state and the selector
+/// the connection already has.
+pub fn continue(user_state: user_state) -> Next(user_state, user_message) {
+  Continue(user_state, None)
+}
+
+/// Carry on, listening on the given selector from here on instead of the one
+/// the connection was started with.
+pub fn continue_with_selector(
+  user_state: user_state,
+  selector: process.Selector(user_message),
+) -> Next(user_state, user_message) {
+  Continue(user_state, Some(selector))
+}
+
+/// End the connection. To tell a WebSocket client why, use `send_close_frame` 
+/// instead.
+pub fn stop() -> Next(user_state, user_message) {
+  Stop
+}
+
+/// End the connection and exit its process abnormally with the given reason.
+pub fn stop_abnormal(reason: String) -> Next(user_state, user_message) {
+  StopAbnormal(reason)
+}
+
+fn to_internal_step(
+  next: Next(user_state, user_message),
+) -> connection.Step(user_state, user_message) {
+  case next {
+    Continue(state, messages) -> connection.Proceed(state, messages)
+    Stop -> connection.Halt(connection.Stopped)
+    StopAbnormal(reason) -> connection.Halt(connection.StoppedAbnormal(reason))
+  }
+}
+
 /// A handle for sending on an open Server-Sent Events stream.
 pub type SseConnection =
   connection.SseConnection
@@ -1488,32 +1537,6 @@ pub type SseConnection =
 /// `event_name`, `event_id` and `event_retry`.
 pub type SseEvent =
   sse.Event
-
-/// What a Server-Sent Events stream does once the handler has dealt with a
-/// message.
-///
-/// Create one with `sse_continue`, `sse_stop` or `sse_stop_abnormal`.
-pub opaque type SseNext(user_state) {
-  SseContinue(user_state)
-  SseStop
-  SseStopAbnormal(reason: String)
-}
-
-/// Carry on with the stream, handling further messages with the given state.
-pub fn sse_continue(user_state: user_state) -> SseNext(user_state) {
-  SseContinue(user_state)
-}
-
-/// End the stream.
-pub fn sse_stop() -> SseNext(user_state) {
-  SseStop
-}
-
-/// End the stream and exit the connection process abnormally with the given
-/// reason.
-pub fn sse_stop_abnormal(reason: String) -> SseNext(user_state) {
-  SseStopAbnormal(reason)
-}
 
 /// Create an event carrying the given data.
 ///
@@ -1571,9 +1594,10 @@ pub fn send_event(
 /// Set the body of a response to a Server-Sent Events stream which runs until
 /// the handler stops it or the client goes away.
 ///
-/// - `on_init` is called once, with a subject that the rest of your program
-///   sends messages to, and returns the starting state.
-/// - `handler` is called for each message that arrives on that subject.
+/// - `on_init` is called once with a selector to add whatever the rest of your 
+///   program sends this stream to and returns the starting state along with 
+///   that selector.
+/// - `handler` is called for each message the selector picks up.
 /// - `on_close` is called once, however the stream ended.
 ///
 /// The `content-type` and `cache-control` headers the stream needs are set by
@@ -1587,14 +1611,15 @@ pub fn send_event(
 /// ```gleam
 /// response.new(200)
 /// |> ewe.sse(
-///   on_init: fn(subject) {
-///     pubsub.subscribe(pubsub, subject)
-///     0
+///   on_init: fn(_conn, selector) {
+///     let client = process.new_subject()
+///     pubsub.subscribe(pubsub, client)
+///     #(0, process.select(selector, client))
 ///   },
 ///   handler: fn(conn, sent, message) {
 ///     case ewe.send_event(conn, ewe.event(message)) {
-///       Ok(Nil) -> ewe.sse_continue(sent + 1)
-///       Error(_send_error) -> ewe.sse_stop()
+///       Ok(Nil) -> ewe.continue(sent + 1)
+///       Error(_send_error) -> ewe.stop()
 ///     }
 ///   },
 ///   on_close: fn(_conn, _sent) { Nil },
@@ -1602,17 +1627,14 @@ pub fn send_event(
 /// ```
 pub fn sse(
   response: response.Response(a),
-  on_init on_init: fn(process.Subject(user_message)) -> user_state,
+  on_init on_init: fn(SseConnection, process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
   handler handler: fn(SseConnection, user_state, user_message) ->
-    SseNext(user_state),
+    Next(user_state, user_message),
   on_close on_close: fn(SseConnection, user_state) -> Nil,
 ) -> response.Response(Body) {
   let step = fn(conn, state, message) {
-    case handler(conn, state, message) {
-      SseContinue(state) -> sse.Proceed(state)
-      SseStop -> sse.Halt(connection.Stopped)
-      SseStopAbnormal(reason) -> sse.Halt(connection.StoppedAbnormal(reason))
-    }
+    handler(conn, state, message) |> to_internal_step
   }
 
   let stream = fn(conn) {
@@ -1651,46 +1673,6 @@ fn from_internal_websocket_message(
     websocket.BinaryFrame(data) -> BinaryFrame(data)
     websocket.UserMessage(message) -> UserMessage(message)
   }
-}
-
-/// What a WebSocket does once the handler has dealt with a message.
-///
-/// Create one with `websocket_continue`, `websocket_continue_with_selector`,
-/// `websocket_stop` or `websocket_stop_abnormal`.
-pub opaque type WebsocketNext(user_state, user_message) {
-  WebsocketContinue(user_state, Option(process.Selector(user_message)))
-  WebsocketStop
-  WebsocketStopAbnormal(reason: String)
-}
-
-/// Carry on with the WebSocket handling further messages with the given state
-/// and the selector the connection already has.
-pub fn websocket_continue(
-  user_state: user_state,
-) -> WebsocketNext(user_state, user_message) {
-  WebsocketContinue(user_state, None)
-}
-
-/// Carry on with the WebSockets listening on the given selector from here on
-/// instead of the one the connection was started with.
-pub fn websocket_continue_with_selector(
-  user_state: user_state,
-  selector: process.Selector(user_message),
-) -> WebsocketNext(user_state, user_message) {
-  WebsocketContinue(user_state, Some(selector))
-}
-
-/// End the WebSocket. To tell the client why first, use `send_close_frame`.
-pub fn websocket_stop() -> WebsocketNext(user_state, user_message) {
-  WebsocketStop
-}
-
-/// End the WebSocket and exit the connection process abnormally with the given
-/// reason.
-pub fn websocket_stop_abnormal(
-  reason: String,
-) -> WebsocketNext(user_state, user_message) {
-  WebsocketStopAbnormal(reason)
 }
 
 /// The reason a WebSocket is being closed, sent to the client in the close
@@ -1798,21 +1780,21 @@ pub fn send_binary_frame(
 pub fn send_close_frame(
   conn: WebsocketConnection,
   reason: CloseReason,
-) -> WebsocketNext(user_state, user_message) {
+) -> Next(user_state, user_message) {
   let _sent = case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_close(conn, to_internal_close_reason(reason))
   }
 
-  WebsocketStop
+  Stop
 }
 
 /// Upgrade the request to a WebSocket which runs until the handler stops it or
 /// the client goes away.
 ///
-/// - `on_init` is called once, with an empty selector to add whatever the rest
-///   of your program sends this connection to, and returns the starting state
-///   along with that selector.
+/// - `on_init` is called once with a selector to add whatever the rest of your 
+///   program sends this connection to, and returns the starting state along 
+///   with that selector.
 /// - `handler` is called for each frame from the client and each message the
 ///   selector picks up.
 /// - `on_close` is called once, however the WebSocket ended.
@@ -1835,10 +1817,10 @@ pub fn send_close_frame(
 ///     case message {
 ///       ewe.TextFrame(text) -> {
 ///         let assert Ok(Nil) = ewe.send_text_frame(conn, text)
-///         ewe.websocket_continue(count + 1)
+///         ewe.continue(count + 1)
 ///       }
 ///       ewe.BinaryFrame(_data) | ewe.UserMessage(_message) ->
-///         ewe.websocket_continue(count)
+///         ewe.continue(count)
 ///     }
 ///   },
 ///   on_close: fn(_conn, _count) { Nil },
@@ -1852,16 +1834,12 @@ pub fn websocket(
     WebsocketConnection,
     user_state,
     WebsocketMessage(user_message),
-  ) -> WebsocketNext(user_state, user_message),
+  ) -> Next(user_state, user_message),
   on_close on_close: fn(WebsocketConnection, user_state) -> Nil,
 ) -> response.Response(Body) {
   let step = fn(conn, state, message) {
-    case handler(conn, state, from_internal_websocket_message(message)) {
-      WebsocketContinue(state, messages) -> websocket.Proceed(state, messages)
-      WebsocketStop -> websocket.Halt(connection.Stopped)
-      WebsocketStopAbnormal(reason) ->
-        websocket.Halt(connection.StoppedAbnormal(reason))
-    }
+    handler(conn, state, from_internal_websocket_message(message))
+    |> to_internal_step
   }
 
   let socket = fn(conn) {

@@ -139,19 +139,21 @@ type Tick {
 fn sse_burst(data: String, count: Int) -> response.Response(ewe.Body) {
   ewe.sse(
     response.new(200),
-    on_init: fn(subject) {
+    on_init: fn(_conn, selector) {
+      let subject = process.new_subject()
       process.send(subject, Tick(1))
-      subject
+
+      #(subject, process.select(selector, subject))
     },
     handler: fn(conn, subject, message) {
       let Tick(n) = message
 
       case ewe.send_event(conn, ewe.event(data) |> ewe.event_name("tick")) {
-        Error(_reason) -> ewe.sse_stop()
-        Ok(Nil) if n >= count -> ewe.sse_stop()
+        Error(_reason) -> ewe.stop()
+        Ok(Nil) if n >= count -> ewe.stop()
         Ok(Nil) -> {
           process.send(subject, Tick(n + 1))
-          ewe.sse_continue(subject)
+          ewe.continue(subject)
         }
       }
     },

@@ -1,5 +1,13 @@
 # Changelog
 
+## v6.0.0
+
+- `sse`'s `on_init` function now receives the stream connection and a 
+  `process.Selector` and returns the starting state along with that selector.
+- Replace `SseNext` and `WebsocketNext` with a single `Next` and their eight
+  constructors with `continue`, `continue_with_selector`, `stop` and
+  `stop_abnormal`.
+
 ## v5.0.2
 
 - Fix the previous fix to be an actual fix.

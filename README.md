@@ -24,7 +24,6 @@ ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
   - [Connection Limits and Timeouts](#connection-limits-and-timeouts)
   - [Running Under Supervision](#running-under-supervision)
   - [Running as an OTP Application](#running-as-an-otp-application)
-  - [Using Ewe with Wisp](#using-ewe-with-wisp)
 - [Examples](#examples)
 - [API Reference](#api-reference)
 
@@ -34,7 +33,7 @@ based on.
 <h2 id="installation">Installation</h2>
 
 ```sh
-gleam add ewe@5 gleam_erlang gleam_otp gleam_http logging
+gleam add ewe@6 gleam_erlang gleam_otp gleam_http logging
 ```
 
 <h2 id="usage">Usage</h2>
@@ -318,7 +317,7 @@ your program arrive as [`ewe.WebsocketMessage`](https://hexdocs.pm/ewe/ewe.html#
 values. Answer them with [`ewe.send_text_frame`](https://hexdocs.pm/ewe/ewe.html#send_text_frame)
 or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame)
 and say what happens next with
-[`ewe.WebsocketNext`](https://hexdocs.pm/ewe/ewe.html#WebsocketNext).
+[`ewe.Next`](https://hexdocs.pm/ewe/ewe.html#Next).
 
 ```gleam
 fn handle_topic(
@@ -351,16 +350,16 @@ fn handle_websocket_message(
   conn: ewe.WebsocketConnection,
   state: WebsocketState,
   message: ewe.WebsocketMessage(Broadcast),
-) -> ewe.WebsocketNext(WebsocketState, Broadcast) {
+) -> ewe.Next(WebsocketState, Broadcast) {
   case message {
     ewe.TextFrame(text) -> {
       pubsub.publish(state.pubsub, topic: state.topic, message: Text(text))
-      ewe.websocket_continue(state)
+      ewe.continue(state)
     }
 
     ewe.BinaryFrame(data) -> {
       pubsub.publish(state.pubsub, topic: state.topic, message: Bytes(data))
-      ewe.websocket_continue(state)
+      ewe.continue(state)
     }
 
     // A message from the rest of the program.
@@ -371,9 +370,9 @@ fn handle_websocket_message(
       }
 
       case sent {
-        Ok(Nil) -> ewe.websocket_continue(state)
+        Ok(Nil) -> ewe.continue(state)
         Error(_send_error) ->
-          ewe.websocket_stop_abnormal("Failed to send a frame")
+          ewe.stop_abnormal("Failed to send a frame")
       }
     }
   }
@@ -389,23 +388,25 @@ sent after it!
 <h3 id="server-sent-events"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/sse.gleam">Server-Sent Events</a></h3>
 
 [`ewe.sse`](https://hexdocs.pm/ewe/ewe.html#sse) turns a response into an SSE
-stream which runs until the handler stops it or the client disconnects. `on_init`
-receives the subject the rest of your program pushes messages to, `handler` is
-called for each of those messages and `on_close` runs once the stream ends.
-The `content-type` and `cache-control` headers the stream needs are set by ewe.
+stream which runs until the handler stops it or the client disconnects. Like a
+WebSocket, `on_init` receives a selector to add whatever the rest of your program
+sends to this stream, `handler` is called for each message it picks up and
+`on_close` runs once the stream ends. The `content-type` and `cache-control`
+headers the stream needs are set by ewe.
 
 ```gleam
 response.new(200)
 |> ewe.sse(
-  on_init: fn(client) {
+  on_init: fn(_conn, selector) {
+    let client = process.new_subject()
     pubsub.subscribe(pubsub, topic:, client:)
 
-    client
+    #(client, process.select(selector, client))
   },
   handler: fn(conn, client, message) {
     case ewe.send_event(conn, ewe.event(message)) {
-      Ok(Nil) -> ewe.sse_continue(client)
-      Error(_send_error) -> ewe.sse_stop()
+      Ok(Nil) -> ewe.continue(client)
+      Error(_send_error) -> ewe.stop()
     }
   },
   on_close: fn(_conn, client) {
@@ -577,112 +578,6 @@ pub fn main() {
 > [!NOTE]
 > `main` still has to sleep. `gleam run` boots the application and then calls it,
 > so without it the node exits as soon as it returns.
-
-<h3 id="using-ewe-with-wisp">Using Ewe with Wisp</h3>
-
-At the time of updating this README, ewe is not an official adapter option for 
-wisp. However, you can copy this module into your project until a future wisp 
-release officially supports ewe:
-
-```gleam
-import ewe
-import exception
-import gleam/http/request
-import gleam/http/response
-import gleam/option
-import gleam/string
-import wisp
-import wisp/internal
-
-const max_body_size = 8_000_000
-
-/// Convert a Wisp request handler into a function that can be run with the Ewe
-/// web server.
-///
-/// # Examples
-///
-/// ```gleam
-/// pub fn main() {
-///   let secret_key_base = "..."
-///   let listener_name = process.new_name("ewe_listener")
-///   let connection_factory_name = process.new_name("ewe_connection_factory")
-///
-///   let assert Ok(_) =
-///     handle_request
-///     |> wisp_ewe.handler(secret_key_base)
-///     |> ewe.new(listener_name:, connection_factory_name:, handler: _)
-///     |> ewe.listening(on: 8000)
-///     |> ewe.start
-///
-///   process.sleep_forever()
-/// }
-/// ```
-///
-/// The secret key base is used for signing and encryption. To be able to
-/// verify and decrypt messages you will need to use the same key each time
-/// your program is run. Keep this value secret! Malicious people with this
-/// value will likely be able to hack your application.
-///
-pub fn handler(
-  handler: fn(wisp.Request) -> wisp.Response,
-  secret_key_base: String,
-) -> fn(request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
-  fn(req: request.Request(ewe.Connection)) {
-    let connection = req.body
-    let wisp_req =
-      internal.make_connection(ewe_body_reader(req), secret_key_base)
-      |> request.set_body(req, _)
-
-    use <- exception.defer(fn() {
-      let assert Ok(_) = wisp.delete_temporary_files(wisp_req)
-    })
-
-    handler(wisp_req)
-    |> ewe_response(connection)
-  }
-}
-
-fn ewe_body_reader(req: request.Request(ewe.Connection)) -> internal.Reader {
-  fn(size) {
-    case ewe.read_body_chunk(req, max_chunk_bytes: size, limit: max_body_size) {
-      Ok(ewe.Chunk(data:, request:)) ->
-        Ok(internal.Chunk(data, ewe_body_reader(request)))
-      Ok(ewe.Done(..)) -> Ok(internal.ReadingFinished)
-      Error(_) -> Error(Nil)
-    }
-  }
-}
-
-fn ewe_response(
-  resp: response.Response(wisp.Body),
-  connection: ewe.Connection,
-) -> response.Response(ewe.Body) {
-  case resp.body {
-    wisp.Text(text) -> response.set_body(resp, ewe.Text(text))
-    wisp.Bytes(bytes) -> response.set_body(resp, ewe.Bytes(bytes))
-    wisp.File(path:, offset:, limit:) ->
-      ewe_send_file(resp, connection, path, offset, limit)
-  }
-}
-
-fn ewe_send_file(
-  resp: response.Response(wisp.Body),
-  connection: ewe.Connection,
-  path: String,
-  offset: Int,
-  limit: option.Option(Int),
-) -> response.Response(ewe.Body) {
-  case ewe.file(connection, path, offset: option.Some(offset), limit:) {
-    Ok(file) -> response.set_body(resp, file)
-    Error(error) -> {
-      string.inspect(error)
-      |> wisp.log_error
-
-      response.new(500) |> response.set_body(ewe.Empty)
-    }
-  }
-}
-```
 
 <h2 id="examples">Examples</h2>
 
