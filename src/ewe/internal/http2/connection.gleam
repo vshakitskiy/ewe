@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/http/response
 import gleam/option
+import websocks
 
 pub type Options {
   Options(
@@ -20,8 +21,6 @@ pub type Options {
     drain_timeout_ms: Int,
     recv_window_low_water_mark: Int,
     recv_window_high_water_mark: Int,
-    send_buffer_low_water_mark: Int,
-    send_buffer_high_water_mark: Int,
     send_buffer_limit: Int,
     file_read_threshold: Int,
     body_read_timeout: Int,
@@ -43,8 +42,6 @@ pub fn default_options() -> Options {
     drain_timeout_ms: 4000,
     recv_window_low_water_mark: 262_144,
     recv_window_high_water_mark: 2_097_152,
-    send_buffer_low_water_mark: 65_536,
-    send_buffer_high_water_mark: 262_144,
     send_buffer_limit: 1_048_576,
     file_read_threshold: 1_048_576,
     body_read_timeout: 10_000,
@@ -61,6 +58,7 @@ pub type Connection(body) {
     read: Int,
     body_read_timeout: Int,
     peer: Result(socket.SockName, Nil),
+    protocol: option.Option(String),
   )
 }
 
@@ -80,12 +78,11 @@ pub type Reply(body) {
 pub type ResponseMode {
   PlainStream
   EventStream
-  WebsocketStream(notify: process.Subject(WriteSignal))
+  WebsocketStream(notify: process.Subject(StreamSignal))
 }
 
-pub type WriteSignal {
-  WritePaused
-  WriteResumed
+pub type StreamSignal {
+  Draining
 }
 
 pub type Chunk {
@@ -114,6 +111,15 @@ pub type ResponseWriter(body) {
 
 pub type SseConnection(body) {
   SseConnection(writer: ResponseWriter(body))
+}
+
+pub type WebsocketConnection(body) {
+  WebsocketConnection(
+    writer: ResponseWriter(body),
+    context: websocks.Context,
+    body: process.Subject(BodyEvent),
+    signals: process.Subject(StreamSignal),
+  )
 }
 
 pub type Interrupted {

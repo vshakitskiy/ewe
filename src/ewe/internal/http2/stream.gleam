@@ -54,13 +54,30 @@ fn deliver(
   method: http.Method,
 ) -> Nil {
   case response.body, method {
-    connection.Websocket(_metadata), _method -> {
-      logging.log(
-        logging.Error,
-        "Discarded a WebSocket response: HTTP/2 connections do not carry them",
-      )
+    connection.Websocket(connection.WebsocketMetadata(context:, handler:)),
+      _method
+    -> {
+      let signals = process.new_subject()
 
-      internal_error(reply_to, stream_id)
+      case
+        begin(reply_to, stream_id, response, http2.WebsocketStream(signals))
+      {
+        Error(_interrupted) -> Nil
+        Ok(writer) ->
+          case
+            http2.WebsocketConnection(
+              writer:,
+              context:,
+              body: process.new_subject(),
+              signals:,
+            )
+            |> connection.Http2Websocket
+            |> handler
+          {
+            connection.Stopped -> Nil
+            connection.StoppedAbnormal(reason) -> abort(reason)
+          }
+      }
     }
     _body, http.Head ->
       process.send(reply_to, http2.Respond(stream_id, response))

@@ -38,6 +38,7 @@ fn mock_connection(
     read: 0,
     body_read_timeout: 1000,
     peer: Error(Nil),
+    protocol: option.None,
   )
 }
 
@@ -115,6 +116,7 @@ pub fn read_body_no_body_skips_round_trip_test() {
       read: 0,
       body_read_timeout: 1000,
       peer: Error(Nil),
+      protocol: option.None,
     )
 
   assert body.read_body(conn, 100) == Ok(#(<<>>, []))
@@ -176,6 +178,7 @@ pub fn read_body_chunk_no_body_skips_round_trip_test() {
       read: 0,
       body_read_timeout: 1000,
       peer: Error(Nil),
+      protocol: option.None,
     )
 
   assert body.read_body_chunk(conn, max_chunk_bytes: 100, limit: 100)

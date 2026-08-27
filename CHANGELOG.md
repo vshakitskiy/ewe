@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fix ssl application not starting up.
+- Support WebSocket over HTTP/2.
+
 ## v6.0.0
 
 - `sse`'s `on_init` function now receives the stream connection and a 

@@ -282,8 +282,11 @@ pub fn build_request_minimal_valid_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.method == http.Get
   assert request.scheme == http.Https
   assert request.host == "example.com"
@@ -301,8 +304,11 @@ pub fn build_request_with_query_and_port_test() {
     #(<<":path":utf8>>, <<"/search?q=1":utf8>>),
     #(<<"x-custom":utf8>>, <<"value":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.method == http.Post
   assert request.host == "example.com"
   assert request.port == Some(8080)
@@ -430,8 +436,11 @@ pub fn build_request_te_trailers_allowed_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"te":utf8>>, <<"trailers":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.headers == [#("te", "trailers")]
 }
 
@@ -1260,155 +1269,73 @@ pub fn empty_terminator_closes_stream_with_the_window_shut_test() {
   assert dict.get(state.streams, 1) == Error(Nil)
 }
 
-fn watermarked_state(low: Int, high: Int) -> connection.State {
-  let options =
-    http2.Options(
-      ..http2.default_options(),
-      send_buffer_low_water_mark: low,
-      send_buffer_high_water_mark: high,
-    )
-
-  connection.State(..connection.test_state(), options:, conn_send_window: 0)
-}
-
-fn writing_stream(
-  send_window: Int,
-  flow: connection.Flow,
-  notify: process.Subject(http2.WriteSignal),
-  chunks: List(http2.Chunk),
-) -> connection.Stream {
+fn writing_stream(queued: Int) -> connection.Stream {
   connection.Stream(
-    ..queued_stream(send_window, chunks),
-    writer: Some(connection.Writer(notify:, flow:)),
+    ..queued_stream(0, [http2.Chunk(<<0:size(queued)>>, None)]),
+    writer: Some(process.new_subject()),
   )
 }
 
-pub fn crossing_the_high_water_mark_pauses_the_writer_test() {
-  let notify = process.new_subject()
-  let entry =
-    writing_stream(0, connection.Flowing, notify, [
-      http2.Chunk(<<"0123456789":utf8>>, None),
-    ])
+pub fn a_writer_already_over_the_limit_is_stopped_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
 
-  let assert connection.FlushAccumulated(state, _out, False) =
-    connection.do_flush_stream(
-      watermarked_state(2, 8),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
-    )
-
-  assert process.receive(notify, 0) == Ok(http2.WritePaused)
-
-  let assert Ok(paused) = dict.get(state.streams, 1)
-  assert paused.writer
-    == Some(connection.Writer(notify:, flow: connection.Paused))
+  assert connection.over_send_buffer_limit(writing_stream(80), options)
 }
 
-pub fn the_pause_signal_is_not_repeated_while_it_holds_test() {
-  let notify = process.new_subject()
-  let entry =
-    writing_stream(0, connection.Paused, notify, [
-      http2.Chunk(<<"0123456789":utf8>>, None),
-    ])
-
-  let assert connection.FlushAccumulated(_state, _out, False) =
-    connection.do_flush_stream(
-      watermarked_state(2, 8),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
-    )
-
-  assert process.receive(notify, 0) == Error(Nil)
-}
-
-pub fn draining_below_the_low_water_mark_resumes_the_writer_test() {
-  let notify = process.new_subject()
-  let entry =
-    writing_stream(64, connection.Paused, notify, [
-      http2.Chunk(<<"0123456789":utf8>>, None),
-    ])
-  let state =
-    connection.State(..watermarked_state(2, 8), conn_send_window: 65_535)
-
-  let assert connection.FlushAccumulated(state, _out, True) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  assert process.receive(notify, 0) == Ok(http2.WriteResumed)
-
-  let assert Ok(flowing) = dict.get(state.streams, 1)
-  assert flowing.writer
-    == Some(connection.Writer(notify:, flow: connection.Flowing))
-}
-
-pub fn a_stream_with_no_writer_is_never_signalled_test() {
-  let entry = queued_stream(0, [http2.Chunk(<<"0123456789":utf8>>, None)])
-
-  let assert connection.FlushAccumulated(state, _out, False) =
-    connection.do_flush_stream(
-      watermarked_state(2, 8),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
-    )
-
-  let assert Ok(parked) = dict.get(state.streams, 1)
-  assert parked.writer == None
-}
-
-pub fn a_send_buffer_over_the_limit_resets_a_registered_writer_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 4)
-  let entry =
-    writing_stream(0, connection.Flowing, process.new_subject(), [
-      http2.Chunk(<<"0123456789":utf8>>, None),
-    ])
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-    )
-
-  let assert connection.RejectStream(_state, 1, frame.InternalError) =
-    connection.enforce_send_buffer_limit(connection.Proceed(state), 1, options)
-}
-
-pub fn a_send_buffer_within_the_limit_is_left_alone_test() {
+pub fn a_writer_within_the_limit_carries_on_test() {
   let options = http2.Options(..http2.default_options(), send_buffer_limit: 64)
-  let entry =
-    writing_stream(0, connection.Flowing, process.new_subject(), [
-      http2.Chunk(<<"0123456789":utf8>>, None),
-    ])
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-    )
 
-  assert connection.enforce_send_buffer_limit(
-      connection.Proceed(state),
-      1,
-      options,
-    )
-    == connection.Proceed(state)
+  assert !connection.over_send_buffer_limit(writing_stream(80), options)
 }
 
-pub fn a_waiting_caller_is_never_capped_however_large_its_chunk_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 4)
-  let entry = queued_stream(0, [http2.Chunk(<<"0123456789":utf8>>, None)])
+// One huge message is a single legitimate send: the queue it is measured
+// against is the one before it, which is empty.
+pub fn one_message_larger_than_the_limit_is_allowed_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+  let empty =
+    connection.Stream(
+      ..queued_stream(0, []),
+      writer: Some(process.new_subject()),
+    )
+
+  assert !connection.over_send_buffer_limit(empty, options)
+}
+
+pub fn a_waiting_caller_is_never_capped_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+  let entry = queued_stream(0, [http2.Chunk(<<0:size(80)>>, None)])
+
+  assert !connection.over_send_buffer_limit(entry, options)
+}
+
+fn pending_ids(state: connection.State, cursor: Int) -> List(Int) {
+  connection.State(..state, flush_cursor: cursor)
+  |> connection.rotated_pending
+  |> list.map(fn(entry) { entry.0 })
+}
+
+pub fn pending_streams_take_turns_at_the_connection_window_test() {
+  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
   let state =
     connection.State(
       ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
+      streams: dict.from_list([#(5, queued), #(1, queued), #(3, queued)]),
     )
 
-  assert connection.enforce_send_buffer_limit(
-      connection.Proceed(state),
-      1,
-      options,
+  assert pending_ids(state, 0) == [1, 3, 5]
+  assert pending_ids(state, 1) == [3, 5, 1]
+  assert pending_ids(state, 3) == [5, 1, 3]
+  assert pending_ids(state, 5) == [1, 3, 5]
+}
+
+pub fn streams_with_nothing_queued_are_not_flushed_test() {
+  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
+  let idle = queued_stream(0, [])
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, idle), #(3, queued), #(5, idle)]),
     )
-    == connection.Proceed(state)
+
+  assert pending_ids(state, 0) == [3]
 }
