@@ -622,6 +622,7 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
+    ..,
   ) = http2.default_options()
 
   Http2Options(
@@ -738,6 +739,9 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Options {
     ),
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
+    send_buffer_low_water_mark: defaults.send_buffer_low_water_mark,
+    send_buffer_high_water_mark: defaults.send_buffer_high_water_mark,
+    send_buffer_limit: defaults.send_buffer_limit,
     file_read_threshold: at_least(
       options.file_read_threshold,
       0,

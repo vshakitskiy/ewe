@@ -20,6 +20,9 @@ pub type Options {
     drain_timeout_ms: Int,
     recv_window_low_water_mark: Int,
     recv_window_high_water_mark: Int,
+    send_buffer_low_water_mark: Int,
+    send_buffer_high_water_mark: Int,
+    send_buffer_limit: Int,
     file_read_threshold: Int,
     body_read_timeout: Int,
   )
@@ -40,6 +43,9 @@ pub fn default_options() -> Options {
     drain_timeout_ms: 4000,
     recv_window_low_water_mark: 262_144,
     recv_window_high_water_mark: 2_097_152,
+    send_buffer_low_water_mark: 65_536,
+    send_buffer_high_water_mark: 262_144,
+    send_buffer_limit: 1_048_576,
     file_read_threshold: 1_048_576,
     body_read_timeout: 10_000,
   )
@@ -66,19 +72,25 @@ pub type Reply(body) {
     ack: process.Subject(WriteAck),
     status: Int,
     headers: List(#(String, String)),
-    reserved: Reserved,
+    mode: ResponseMode,
   )
-  WriteData(
-    stream_id: Int,
-    ack: process.Subject(WriteAck),
-    chunk: BitArray,
-    end_stream: Bool,
-  )
+  PushData(stream_id: Int, chunk: Chunk)
 }
 
-pub type Reserved {
-  Nothing
-  SseHeaders
+pub type ResponseMode {
+  PlainStream
+  EventStream
+  WebsocketStream(notify: process.Subject(WriteSignal))
+}
+
+pub type WriteSignal {
+  WritePaused
+  WriteResumed
+}
+
+pub type Chunk {
+  Chunk(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
+  Finish(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
 }
 
 pub type BodyEvent {

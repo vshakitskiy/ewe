@@ -18,6 +18,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import logging
 
 @internal
 pub type PeerSettings {
@@ -92,7 +93,7 @@ pub type StreamStatus {
 
 @internal
 pub type Pending {
-  PendingBytes(BitArray)
+  PendingChunks(front: List(http2.Chunk), back: List(http2.Chunk), bytes: Int)
   PendingFile(
     descriptor: connection.FileDescriptor,
     offset: Int,
@@ -101,13 +102,23 @@ pub type Pending {
 }
 
 @internal
+pub type Flow {
+  Flowing
+  Paused
+}
+
+@internal
+pub type Writer {
+  Writer(notify: process.Subject(http2.WriteSignal), flow: Flow)
+}
+
+@internal
 pub type Stream {
   Stream(
     status: StreamStatus,
     send_window: Int,
     pending: Pending,
-    pending_end_stream: Bool,
-    write_ack: Option(process.Subject(http2.WriteAck)),
+    writer: Option(Writer),
     recv_window: Int,
     recv_buffer: bytes_tree.BytesTree,
     request_half_closed: Bool,
@@ -229,7 +240,7 @@ pub fn kill_live_workers(state: State) -> Nil {
 
   case entry.pending {
     PendingFile(descriptor, _offset, _remaining) -> file.close(descriptor)
-    PendingBytes(_bytes) -> Nil
+    PendingChunks(..) -> Nil
   }
 }
 
@@ -386,7 +397,7 @@ fn reset_and_remove_stream(
 
   case entry.pending {
     PendingFile(descriptor, _offset, _remaining) -> file.close(descriptor)
-    PendingBytes(_bytes) -> Nil
+    PendingChunks(..) -> Nil
   }
 
   State(..state, streams: dict.delete(state.streams, stream_id))
@@ -977,9 +988,8 @@ fn track_stream(
       status: Computing(pid),
       method:,
       send_window: state.peer_settings.initial_window_size,
-      pending: PendingBytes(<<>>),
-      pending_end_stream: True,
-      write_ack: None,
+      pending: no_chunks(),
+      writer: None,
       recv_window: state.options.initial_window_size,
       recv_buffer: bytes_tree.new(),
       request_half_closed: end_stream,
@@ -1430,18 +1440,18 @@ fn handle_stream_reply(
       }
     http2.ReadBody(stream_id, reply_to) ->
       handle_read_body(state, stream_id, reply_to, connection)
-    http2.WriteHeaders(stream_id, ack, status, headers, reserved) ->
+    http2.WriteHeaders(stream_id, ack, status, headers, mode) ->
       handle_write_headers(
         state,
         stream_id,
         ack,
         status,
         headers,
-        reserved,
+        mode,
         connection,
       )
-    http2.WriteData(stream_id, ack, chunk, end_stream) ->
-      handle_write_data(state, stream_id, ack, chunk, end_stream, connection)
+    http2.PushData(stream_id, chunk) ->
+      handle_push_data(state, stream_id, chunk, connection)
   }
 }
 
@@ -1607,14 +1617,14 @@ fn open_pending(
   file_read_threshold: Int,
 ) -> Result(Pending, file.FileError) {
   case body {
-    connection.Bytes(tree) -> Ok(PendingBytes(bytes_tree.to_bit_array(tree)))
-    connection.Text(text) -> Ok(PendingBytes(bit_array.from_string(text)))
-    connection.Empty -> Ok(PendingBytes(<<>>))
+    connection.Bytes(tree) -> Ok(closed_chunks(bytes_tree.to_bit_array(tree)))
+    connection.Text(text) -> Ok(closed_chunks(bit_array.from_string(text)))
+    connection.Empty -> Ok(no_chunks())
     connection.File(connection.OpenFile(handle:, offset:, length:)) ->
       Ok(PendingFile(handle, offset, length))
     connection.File(connection.PendingFile(path:, offset:, length:))
       if length <= file_read_threshold
-    -> file.read_range(path, offset, length) |> result.map(PendingBytes)
+    -> file.read_range(path, offset, length) |> result.map(closed_chunks)
     connection.File(connection.PendingFile(path:, offset:, length:)) ->
       file.open(path) |> result.map(PendingFile(_, offset, length))
     connection.Streaming(_metadata)
@@ -1640,7 +1650,7 @@ fn respond(
         response.status,
         response.headers,
         head_content_length(response.body),
-        PendingBytes(<<>>),
+        no_chunks(),
         connection,
       )
     _method ->
@@ -1664,7 +1674,7 @@ fn respond(
             500,
             [],
             Some(0),
-            PendingBytes(<<>>),
+            no_chunks(),
             connection,
           )
       }
@@ -1776,21 +1786,21 @@ fn handle_write_headers(
   ack: process.Subject(http2.WriteAck),
   status: Int,
   headers: List(#(String, String)),
-  reserved: http2.Reserved,
+  mode: http2.ResponseMode,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
   case dict.get(state.streams, stream_id) {
     Error(Nil) -> Continue(state)
-    Ok(_entry) -> {
-      let headers = case reserved {
-        http2.Nothing -> headers
-        http2.SseHeaders -> drop_sse_headers(headers)
+    Ok(entry) -> {
+      let headers = case mode {
+        http2.PlainStream | http2.WebsocketStream(..) -> headers
+        http2.EventStream -> drop_sse_headers(headers)
       }
       let fields = build_response_headers(headers, state.patterns.forbidden)
 
-      let reserved_fields = case reserved {
-        http2.Nothing -> []
-        http2.SseHeaders -> sse_fields()
+      let reserved_fields = case mode {
+        http2.PlainStream | http2.WebsocketStream(..) -> []
+        http2.EventStream -> sse_fields()
       }
 
       let header_fields = [
@@ -1824,7 +1834,7 @@ fn handle_write_headers(
       case glisten.send(connection, out) {
         Ok(Nil) -> {
           process.send(ack, http2.WriteAck)
-          Continue(state)
+          Continue(register_writer(state, stream_id, entry, mode))
         }
         Error(_reason) -> terminate(state, connection, None)
       }
@@ -1832,28 +1842,74 @@ fn handle_write_headers(
   }
 }
 
-fn handle_write_data(
+fn register_writer(
   state: State,
   stream_id: Int,
-  reply_to: process.Subject(http2.WriteAck),
-  chunk: BitArray,
-  end_stream: Bool,
+  entry: Stream,
+  mode: http2.ResponseMode,
+) -> State {
+  case mode {
+    http2.PlainStream | http2.EventStream -> state
+    http2.WebsocketStream(notify:) -> {
+      let entry = Stream(..entry, writer: Some(Writer(notify:, flow: Flowing)))
+
+      State(..state, streams: dict.insert(state.streams, stream_id, entry))
+    }
+  }
+}
+
+fn handle_push_data(
+  state: State,
+  stream_id: Int,
+  chunk: http2.Chunk,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
   case dict.get(state.streams, stream_id) {
     Error(Nil) -> Continue(state)
-    Ok(entry) -> {
-      let entry =
-        Stream(
-          ..entry,
-          pending: PendingBytes(chunk),
-          pending_end_stream: end_stream,
-          write_ack: Some(reply_to),
-        )
+    Ok(entry) ->
+      case push_chunk(entry.pending, chunk) {
+        Error(Nil) -> {
+          logging.log(
+            logging.Error,
+            "Dropped a queued write; the stream is already sending a file",
+          )
 
-      flush_stream(state, stream_id, entry, bytes_tree.new(), connection)
-      |> resolve_frame_result(state, connection)
-    }
+          Continue(state)
+        }
+        Ok(pending) ->
+          Stream(..entry, pending:)
+          |> flush_stream(state, stream_id, _, bytes_tree.new(), connection)
+          |> enforce_send_buffer_limit(stream_id, state.options)
+          |> resolve_frame_result(state, connection)
+      }
+  }
+}
+
+@internal
+pub fn enforce_send_buffer_limit(
+  result: FrameResult,
+  stream_id: Int,
+  options: http2.Options,
+) -> FrameResult {
+  case result {
+    ProceedWithOutbound(..) | RejectStream(..) | Terminate(..) -> result
+    Proceed(state) ->
+      case dict.get(state.streams, stream_id) {
+        Error(Nil) -> result
+        Ok(Stream(writer: None, ..)) -> result
+        Ok(Stream(writer: Some(_writer), pending:, ..)) ->
+          case queued_bytes(pending) > options.send_buffer_limit {
+            False -> result
+            True -> {
+              logging.log(
+                logging.Error,
+                "Reset a stream; its send buffer outgrew send_buffer_limit",
+              )
+
+              RejectStream(state, stream_id, frame.InternalError)
+            }
+          }
+      }
   }
 }
 
@@ -1933,77 +1989,12 @@ pub fn do_flush_stream(
   wrote: Bool,
 ) -> FlushOutcome {
   case entry.pending {
-    PendingBytes(<<>>) -> {
-      let out =
-        frame.encode(frame.Data(stream_id, entry.pending_end_stream, <<>>, 0))
-        |> bytes_tree.append(out, _)
-
-      finish_pending(state, stream_id, entry, out, True)
-    }
+    PendingChunks(..) -> flush_chunks(state, stream_id, entry, out, wrote)
     PendingFile(descriptor, _offset, 0) -> {
       file.close(descriptor)
 
       State(..state, streams: dict.delete(state.streams, stream_id))
       |> FlushAccumulated(out, wrote)
-    }
-    PendingBytes(pending) -> {
-      let allowed =
-        int.min(state.conn_send_window, entry.send_window)
-        |> int.min(state.peer_settings.max_frame_size)
-
-      case allowed <= 0 {
-        True -> {
-          State(..state, streams: dict.insert(state.streams, stream_id, entry))
-          |> FlushAccumulated(out, wrote)
-        }
-        False ->
-          case pending {
-            <<chunk:bytes-size(allowed), remaining:bits>> if remaining != <<>> -> {
-              let out =
-                frame.encode_data_header(stream_id, False, allowed)
-                |> bytes_tree.append(out, _)
-                |> bytes_tree.append(chunk)
-
-              let entry =
-                Stream(
-                  ..entry,
-                  send_window: entry.send_window - allowed,
-                  pending: PendingBytes(remaining),
-                )
-
-              let state =
-                State(
-                  ..state,
-                  conn_send_window: state.conn_send_window - allowed,
-                )
-
-              do_flush_stream(state, stream_id, entry, out, True)
-            }
-            _pending -> {
-              let sent = bit_array.byte_size(pending)
-              let out =
-                frame.encode_data_header(
-                  stream_id,
-                  entry.pending_end_stream,
-                  sent,
-                )
-                |> bytes_tree.append(out, _)
-                |> bytes_tree.append(pending)
-
-              let entry =
-                Stream(
-                  ..entry,
-                  send_window: entry.send_window - sent,
-                  pending: PendingBytes(<<>>),
-                )
-
-              let state =
-                State(..state, conn_send_window: state.conn_send_window - sent)
-
-              finish_pending(state, stream_id, entry, out, True)
-            }
-          }
-      }
     }
     PendingFile(_descriptor, _offset, remaining) -> {
       let allowed =
@@ -2011,10 +2002,7 @@ pub fn do_flush_stream(
         |> int.min(state.peer_settings.max_frame_size)
 
       case allowed <= 0 {
-        True -> {
-          State(..state, streams: dict.insert(state.streams, stream_id, entry))
-          |> FlushAccumulated(out, wrote)
-        }
+        True -> park_stream(state, stream_id, entry, out, wrote)
         False -> {
           let chunk_size = int.min(allowed, remaining)
           let end_stream = chunk_size == remaining
@@ -2029,27 +2017,148 @@ pub fn do_flush_stream(
   }
 }
 
-fn finish_pending(
+fn flush_chunks(
   state: State,
   stream_id: Int,
   entry: Stream,
   out: bytes_tree.BytesTree,
   wrote: Bool,
 ) -> FlushOutcome {
-  case entry.write_ack {
+  case peek_chunk(entry.pending) {
+    Error(Nil) -> park_stream(state, stream_id, entry, out, wrote)
+    Ok(http2.Chunk(bytes:, ack:)) ->
+      flush_bytes(state, stream_id, entry, bytes, ack, False, out, wrote)
+    Ok(http2.Finish(bytes:, ack:)) ->
+      flush_bytes(state, stream_id, entry, bytes, ack, True, out, wrote)
+  }
+}
+
+fn flush_bytes(
+  state: State,
+  stream_id: Int,
+  entry: Stream,
+  bytes: BitArray,
+  ack: Option(process.Subject(http2.WriteAck)),
+  end_stream: Bool,
+  out: bytes_tree.BytesTree,
+  wrote: Bool,
+) -> FlushOutcome {
+  let allowed =
+    int.min(state.conn_send_window, entry.send_window)
+    |> int.min(state.peer_settings.max_frame_size)
+
+  case allowed <= 0 && bytes != <<>> {
+    True -> park_stream(state, stream_id, entry, out, wrote)
+    False ->
+      case bytes {
+        <<chunk:bytes-size(allowed), remaining:bits>> if remaining != <<>> -> {
+          let out =
+            frame.encode_data_header(stream_id, False, allowed)
+            |> bytes_tree.append(out, _)
+            |> bytes_tree.append(chunk)
+
+          let entry =
+            Stream(
+              ..entry,
+              send_window: entry.send_window - allowed,
+              pending: keep_chunk(
+                entry.pending,
+                partial_chunk(remaining, ack, end_stream),
+                allowed,
+              ),
+            )
+
+          let state =
+            State(..state, conn_send_window: state.conn_send_window - allowed)
+
+          do_flush_stream(state, stream_id, entry, out, True)
+        }
+        _bytes -> {
+          let sent = bit_array.byte_size(bytes)
+          let out =
+            frame.encode_data_header(stream_id, end_stream, sent)
+            |> bytes_tree.append(out, _)
+            |> bytes_tree.append(bytes)
+
+          acknowledge(ack)
+
+          let state =
+            State(..state, conn_send_window: state.conn_send_window - sent)
+
+          case end_stream {
+            True ->
+              State(..state, streams: dict.delete(state.streams, stream_id))
+              |> FlushAccumulated(out, True)
+            False ->
+              Stream(
+                ..entry,
+                send_window: entry.send_window - sent,
+                pending: drop_chunk(entry.pending),
+              )
+              |> do_flush_stream(state, stream_id, _, out, True)
+          }
+        }
+      }
+  }
+}
+
+fn partial_chunk(
+  bytes: BitArray,
+  ack: Option(process.Subject(http2.WriteAck)),
+  end_stream: Bool,
+) -> http2.Chunk {
+  case end_stream {
+    True -> http2.Finish(bytes, ack)
+    False -> http2.Chunk(bytes, ack)
+  }
+}
+
+fn park_stream(
+  state: State,
+  stream_id: Int,
+  entry: Stream,
+  out: bytes_tree.BytesTree,
+  wrote: Bool,
+) -> FlushOutcome {
+  let entry = apply_watermarks(entry, state.options)
+
+  State(..state, streams: dict.insert(state.streams, stream_id, entry))
+  |> FlushAccumulated(out, wrote)
+}
+
+fn apply_watermarks(entry: Stream, options: http2.Options) -> Stream {
+  case entry.writer {
+    None -> entry
+    Some(Writer(notify:, flow: Flowing)) ->
+      case queued_bytes(entry.pending) >= options.send_buffer_high_water_mark {
+        False -> entry
+        True -> {
+          process.send(notify, http2.WritePaused)
+          Stream(..entry, writer: Some(Writer(notify:, flow: Paused)))
+        }
+      }
+    Some(Writer(notify:, flow: Paused)) ->
+      case queued_bytes(entry.pending) <= options.send_buffer_low_water_mark {
+        False -> entry
+        True -> {
+          process.send(notify, http2.WriteResumed)
+          Stream(..entry, writer: Some(Writer(notify:, flow: Flowing)))
+        }
+      }
+  }
+}
+
+fn queued_bytes(pending: Pending) -> Int {
+  case pending {
+    PendingChunks(bytes:, ..) -> bytes
+    PendingFile(..) -> 0
+  }
+}
+
+fn acknowledge(ack: Option(process.Subject(http2.WriteAck))) -> Nil {
+  case ack {
     Some(reply_to) -> process.send(reply_to, http2.WriteAck)
     None -> Nil
-  }
-
-  case entry.pending_end_stream {
-    True ->
-      State(..state, streams: dict.delete(state.streams, stream_id))
-      |> FlushAccumulated(out, wrote)
-    False -> {
-      let entry = Stream(..entry, write_ack: None)
-      State(..state, streams: dict.insert(state.streams, stream_id, entry))
-      |> FlushAccumulated(out, wrote)
-    }
   }
 }
 
@@ -2181,15 +2290,85 @@ pub fn flush_stream(
   flush_many(state, [#(stream_id, entry)], out, False, connection)
 }
 
+@internal
+pub fn no_chunks() -> Pending {
+  PendingChunks([], [], 0)
+}
+
+@internal
+pub fn closed_chunks(bytes: BitArray) -> Pending {
+  case bytes {
+    <<>> -> no_chunks()
+    bytes ->
+      PendingChunks([http2.Finish(bytes, None)], [], bit_array.byte_size(bytes))
+  }
+}
+
+fn chunk_byte_size(chunk: http2.Chunk) -> Int {
+  case chunk {
+    http2.Chunk(bytes:, ..) | http2.Finish(bytes:, ..) ->
+      bit_array.byte_size(bytes)
+  }
+}
+
+@internal
+pub fn push_chunk(
+  pending: Pending,
+  chunk: http2.Chunk,
+) -> Result(Pending, Nil) {
+  case pending {
+    PendingChunks(front: [], bytes:, ..) ->
+      Ok(PendingChunks([chunk], [], bytes + chunk_byte_size(chunk)))
+    PendingChunks(front:, back:, bytes:) ->
+      Ok(PendingChunks(
+        front:,
+        back: [chunk, ..back],
+        bytes: bytes + chunk_byte_size(chunk),
+      ))
+    PendingFile(..) -> Error(Nil)
+  }
+}
+
+fn peek_chunk(pending: Pending) -> Result(http2.Chunk, Nil) {
+  case pending {
+    PendingChunks(front: [chunk, ..], ..) -> Ok(chunk)
+    PendingChunks(front: [], ..) -> Error(Nil)
+    PendingFile(..) -> Error(Nil)
+  }
+}
+
+fn drop_chunk(pending: Pending) -> Pending {
+  case pending {
+    PendingChunks(front: [chunk], back:, bytes:) ->
+      PendingChunks(list.reverse(back), [], bytes - chunk_byte_size(chunk))
+    PendingChunks(front: [chunk, ..rest], back:, bytes:) ->
+      PendingChunks(rest, back, bytes - chunk_byte_size(chunk))
+    PendingChunks(front: [], ..) -> pending
+    PendingFile(..) -> pending
+  }
+}
+
+fn keep_chunk(pending: Pending, chunk: http2.Chunk, written: Int) -> Pending {
+  case pending {
+    PendingChunks(front: [_drained, ..rest], back:, bytes:) ->
+      PendingChunks([chunk, ..rest], back, bytes - written)
+    PendingChunks(front: [], ..) -> pending
+    PendingFile(..) -> pending
+  }
+}
+
 fn has_pending(entry: Stream) -> Bool {
-  pending_has_bytes(entry.pending)
+  case entry.pending {
+    PendingChunks(front: [], ..) -> False
+    PendingChunks(..) -> True
+    PendingFile(_descriptor, _offset, remaining) -> remaining > 0
+  }
 }
 
 fn pending_has_bytes(pending: Pending) -> Bool {
   case pending {
-    PendingBytes(<<>>) -> False
-    PendingFile(_descriptor, _offset, 0) -> False
-    _pending -> True
+    PendingChunks(bytes:, ..) -> bytes > 0
+    PendingFile(_descriptor, _offset, remaining) -> remaining > 0
   }
 }
 
