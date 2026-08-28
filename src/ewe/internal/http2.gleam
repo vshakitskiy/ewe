@@ -58,7 +58,7 @@ fn apply_setting(
       PeerSettings(..settings, max_header_list_size: Some(value))
     frame.EnablePush(_enabled)
     | frame.MaxConcurrentStreams(_limit)
-    | frame.EnableConnectProtocol(_extended_connect)
+    | frame.EnableConnectProtocol(_websocket)
     | frame.UnknownSetting(_id, _value) -> settings
   }
 }
@@ -190,7 +190,8 @@ const max_window_size = 2_147_483_647
 
 pub const socket_active_batch_size = 32
 
-fn build_settings_frame(options: http2.Options) -> bytes_tree.BytesTree {
+@internal
+pub fn build_settings_frame(options: http2.Options) -> bytes_tree.BytesTree {
   let params = case options.header_table_size {
     4096 -> []
     _size -> [frame.HeaderTableSize(options.header_table_size)]
@@ -216,7 +217,10 @@ fn build_settings_frame(options: http2.Options) -> bytes_tree.BytesTree {
     None -> params
   }
 
-  let params = [frame.EnableConnectProtocol(True), ..params]
+  let params = case options.websocket {
+    True -> [frame.EnableConnectProtocol(True), ..params]
+    False -> params
+  }
 
   frame.Settings(0, False, params)
   |> frame.encode
@@ -841,10 +845,17 @@ pub fn complete_header_block(
         Error(_error) ->
           RejectStream(state, assembly.stream_id, frame.ProtocolError)
         Ok(DecodedRequest(request:, content_length:, protocol:)) ->
-          case assembly.end_stream, content_length {
-            True, Some(expected) if expected != 0 ->
+          case
+            protocol,
+            state.options.websocket,
+            assembly.end_stream,
+            content_length
+          {
+            Some(_protocol), False, _end_stream, _length ->
               RejectStream(state, assembly.stream_id, frame.ProtocolError)
-            _end_stream, _content_length -> {
+            _protocol, _websocket, True, Some(expected) if expected != 0 ->
+              RejectStream(state, assembly.stream_id, frame.ProtocolError)
+            _protocol, _websocket, _end_stream, _content_length -> {
               let connection =
                 connection.Http2(http2.Connection(
                   connection: state.reply_subject,

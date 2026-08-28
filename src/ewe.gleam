@@ -220,8 +220,8 @@ pub type Body {
   Sse(connection.Sse)
   /// A WebSocket created with the `websocket` function.
   ///
-  /// The connection stops being HTTP once the handshake has been sent so it
-  /// will never carry another request.
+  /// On HTTP/1 the connection stops being HTTP once the handshake has been
+  /// sent so it will never carry another request.
   Websocket(connection.Websocket)
 }
 
@@ -601,8 +601,14 @@ pub type Http2Options {
     file_read_threshold: Int,
     /// How long a single read of a request body waits for the client.
     body_read_timeout: Int,
-    /// How many WebSocket stream may leave queued for a client that is not
-    /// reading before the server gives up and resets it.
+    /// Whether a client may open a WebSocket over HTTP/2 with the extended
+    /// `CONNECT` of RFC 8441. `True` advertises 
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`; `False` refuses a request carrying
+    /// `:protocol` as malformed.
+    websocket: Bool,
+    /// How many bytes a WebSocket stream may already have queued for a client
+    /// that is not reading before a further write makes the server give up and
+    /// reset it.
     send_buffer_limit: Int,
   )
 }
@@ -626,6 +632,7 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
+    websocket:,
     send_buffer_limit:,
   ) = http2.default_options()
 
@@ -645,6 +652,7 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
+    websocket:,
     send_buffer_limit:,
   )
 }
@@ -744,6 +752,7 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Options {
     ),
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
+    websocket: options.websocket,
     send_buffer_limit: at_least(
       options.send_buffer_limit,
       1,
@@ -1820,12 +1829,10 @@ pub fn send_close_frame(
 /// - `on_close` is called once, however the WebSocket ended.
 ///
 /// A request that is not a valid handshake is answered with status code 400:
-/// Bad Request, and the handler is never run. WebSockets travel over extended
-/// CONNECT on HTTP/2, which ewe does not negotiate yet, so a request on an
-/// HTTP/2 connection is answered with status code 501: Not Implemented.
+/// Bad Request, and the handler is never run.
 ///
-/// The connection stops being HTTP once the handshake has been sent so it will
-/// never carry another request.
+/// On HTTP/1 the handshake is an `Upgrade` and the connection stops being HTTP
+/// once it has been sent so it will never carry another request.
 ///
 /// # Examples
 ///

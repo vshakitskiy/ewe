@@ -1,0 +1,15 @@
+{
+  "outdir": "./reports/server_h2",
+  "servers": [
+    {
+      "url": "ws://localhost:9000",
+      "agent": "ewe (http/2)"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {},
+  "optioms": {
+    "failByDrop": false
+  }
+}

@@ -1339,3 +1339,131 @@ pub fn streams_with_nothing_queued_are_not_flushed_test() {
 
   assert pending_ids(state, 0) == [3]
 }
+
+fn connect_pseudo_headers() -> List(#(BitArray, BitArray)) {
+  [
+    #(<<":method":utf8>>, <<"CONNECT":utf8>>),
+    #(<<":scheme":utf8>>, <<"https":utf8>>),
+    #(<<":authority":utf8>>, <<"example.com":utf8>>),
+    #(<<":path":utf8>>, <<"/socket":utf8>>),
+    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+  ]
+}
+
+fn connect_pseudo_fields() -> List(alpacki.HeaderField) {
+  use #(name, value) <- list.map(connect_pseudo_headers())
+  alpacki.HeaderField(name, value, alpacki.WithoutIndexing)
+}
+
+fn extended_connect_state(websocket: Bool) -> connection.State {
+  let options = http2.Options(..http2.default_options(), websocket:)
+
+  connection.State(
+    ..connection.test_state(),
+    options:,
+    settings_frame: connection.build_settings_frame(options),
+  )
+}
+
+pub fn extended_connect_carries_its_protocol_test() {
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: Some("websocket"),
+  )) =
+    connection.build_request(
+      connect_pseudo_headers(),
+      Nil,
+      connection.header_patterns(),
+    )
+
+  assert request.method == http.Connect
+  assert request.path == "/socket"
+}
+
+pub fn protocol_without_connect_is_rejected_test() {
+  let headers = [
+    #(<<":method":utf8>>, <<"GET":utf8>>),
+    #(<<":scheme":utf8>>, <<"https":utf8>>),
+    #(<<":authority":utf8>>, <<"example.com":utf8>>),
+    #(<<":path":utf8>>, <<"/socket":utf8>>),
+    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+  ]
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.ProtocolWithoutConnect)
+}
+
+pub fn protocol_with_content_length_is_rejected_test() {
+  let headers =
+    list.append(connect_pseudo_headers(), [
+      #(<<"content-length":utf8>>, <<"5":utf8>>),
+    ])
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.ProtocolWithContentLength)
+}
+
+pub fn duplicate_protocol_is_rejected_test() {
+  let headers =
+    list.append(connect_pseudo_headers(), [
+      #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+    ])
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.DuplicatePseudoHeader)
+}
+
+pub fn extended_connect_is_refused_when_websockets_are_off_test() {
+  let assembly =
+    connection.HeaderAssembly(
+      1,
+      True,
+      1,
+      encode(connect_pseudo_fields()),
+      False,
+    )
+  let result =
+    connection.complete_header_block(extended_connect_state(False), assembly)
+
+  let assert connection.RejectStream(_state, stream_id, code) = result
+  assert stream_id == 1
+  assert code == frame.ProtocolError
+}
+
+pub fn extended_connect_is_served_when_websockets_are_on_test() {
+  let assembly =
+    connection.HeaderAssembly(
+      1,
+      True,
+      1,
+      encode(connect_pseudo_fields()),
+      False,
+    )
+
+  let assert connection.Proceed(_state) =
+    connection.complete_header_block(extended_connect_state(True), assembly)
+}
+
+fn advertised_settings(websocket: Bool) -> List(frame.Setting) {
+  let assert Ok(#(frame.Settings(_stream_id, _ack, params), <<>>)) =
+    extended_connect_state(websocket).settings_frame
+    |> bytes_tree.to_bit_array
+    |> frame.decode(16_384)
+
+  params
+}
+
+pub fn websockets_off_does_not_advertise_extended_connect_test() {
+  assert !list.contains(
+    advertised_settings(False),
+    frame.EnableConnectProtocol(True),
+  )
+}
+
+pub fn websockets_on_advertises_extended_connect_test() {
+  assert list.contains(
+    advertised_settings(True),
+    frame.EnableConnectProtocol(True),
+  )
+}

@@ -143,8 +143,8 @@ fn drain(
   resume: Resume,
 ) -> connection.Outcome {
   case websocks.next_frame(conn.context) {
-    Error(_violation) ->
-      close(conn, websocks.CloseReason(websocks.ProtocolError, ""))
+    Error(violation) ->
+      close(conn, websocket.close_reason(violation))
       |> resolve(conn, state, on_close, _)
     Ok(websocks.MoreData(context:)) -> {
       let conn = with_context(conn, context)

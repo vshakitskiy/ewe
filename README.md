@@ -125,9 +125,6 @@ connection is served as HTTP/2 when it opens with the HTTP/2 preface which is
 what a client with prior knowledge sends. An `Upgrade: h2c` request is not
 negotiated, it is answered as HTTP/1.1.
 
-> [!NOTE]
-> Extended CONNECT is not negotiated yet, so WebSockets over HTTP/2 are not
-> supported.
 
 <h3 id="sending-a-response"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/v5/examples/src/sending_response.gleam">Sending a Response</a></h3>
 
@@ -319,6 +316,18 @@ or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame)
 and say what happens next with
 [`ewe.Next`](https://hexdocs.pm/ewe/ewe.html#Next).
 
+The same handler serves both protocols. On HTTP/1 the request is the usual
+`Upgrade: websocket` handshake, and on HTTP/2 it is the extended `CONNECT` of
+[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441).
+
+The HTTP/2 is off until you enable it:
+
+```gleam
+|> ewe.with_http2(ewe.Http2Options(..ewe.default_http2_options(), websocket: True))
+```
+
+With it on, ewe advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+
 ```gleam
 fn handle_topic(
   req: request.Request(ewe.Connection),
@@ -491,6 +500,8 @@ peer:
 | `drain_timeout` | `4000` | How long a draining connection waits for its streams after GOAWAY. |
 | `recv_window_low_water_mark` | `262_144` | Once a receive window falls to this it is topped back up. |
 | `recv_window_high_water_mark` | `2_097_152` | What it is topped up to; a wider gap costs fewer WINDOW_UPDATE round trips. |
+| `websocket` | `False` | Whether a client may open a WebSocket over HTTP/2 with the extended `CONNECT` of RFC 8441. |
+| `send_buffer_limit` | `1_048_576` | Bytes a WebSocket stream may already have queued for a client that is not reading before a further write resets it. One message is always sent whatever its size. |
 | `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
 | `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
 
