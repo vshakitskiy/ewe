@@ -165,6 +165,7 @@ import ewe/internal/http2/body as http2_body
 import ewe/internal/http2/connection as http2
 import ewe/internal/http2/sse as http2_sse
 import ewe/internal/http2/stream as http2_stream
+import ewe/internal/http2/websocket as http2_websocket
 import ewe/internal/sse
 import ewe/internal/websocket
 import gleam/bytes_tree
@@ -219,8 +220,8 @@ pub type Body {
   Sse(connection.Sse)
   /// A WebSocket created with the `websocket` function.
   ///
-  /// The connection stops being HTTP once the handshake has been sent so it
-  /// will never carry another request.
+  /// On HTTP/1 the connection stops being HTTP once the handshake has been
+  /// sent so it will never carry another request.
   Websocket(connection.Websocket)
 }
 
@@ -600,6 +601,15 @@ pub type Http2Options {
     file_read_threshold: Int,
     /// How long a single read of a request body waits for the client.
     body_read_timeout: Int,
+    /// Whether a client may open a WebSocket over HTTP/2 with the extended
+    /// `CONNECT` of RFC 8441. `True` advertises 
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`; `False` refuses a request carrying
+    /// `:protocol` as malformed.
+    websocket: Bool,
+    /// How many bytes a WebSocket stream may already have queued for a client
+    /// that is not reading before a further write makes the server give up and
+    /// reset it.
+    send_buffer_limit: Int,
   )
 }
 
@@ -622,6 +632,8 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
+    websocket:,
+    send_buffer_limit:,
   ) = http2.default_options()
 
   Http2Options(
@@ -640,6 +652,8 @@ pub fn default_http2_options() -> Http2Options {
     recv_window_high_water_mark:,
     file_read_threshold:,
     body_read_timeout:,
+    websocket:,
+    send_buffer_limit:,
   )
 }
 
@@ -738,6 +752,13 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Options {
     ),
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
+    websocket: options.websocket,
+    send_buffer_limit: at_least(
+      options.send_buffer_limit,
+      1,
+      defaults.send_buffer_limit,
+      "send_buffer_limit",
+    ),
     file_read_threshold: at_least(
       options.file_read_threshold,
       0,
@@ -1753,6 +1774,7 @@ pub fn send_text_frame(
   case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_text(conn, text) |> result.map_error(to_send_error)
+    connection.Http2Websocket(conn) -> Ok(http2_websocket.send_text(conn, text))
   }
 }
 
@@ -1764,6 +1786,8 @@ pub fn send_binary_frame(
   case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_binary(conn, data) |> result.map_error(to_send_error)
+    connection.Http2Websocket(conn) ->
+      Ok(http2_websocket.send_binary(conn, data))
   }
 }
 
@@ -1781,9 +1805,14 @@ pub fn send_close_frame(
   conn: WebsocketConnection,
   reason: CloseReason,
 ) -> Next(user_state, user_message) {
-  let _sent = case conn {
-    connection.Http1Websocket(conn) ->
-      http1_websocket.send_close(conn, to_internal_close_reason(reason))
+  case conn {
+    connection.Http1Websocket(conn) -> {
+      let _sent =
+        http1_websocket.send_close(conn, to_internal_close_reason(reason))
+      Nil
+    }
+    connection.Http2Websocket(conn) ->
+      http2_websocket.send_close(conn, to_internal_close_reason(reason))
   }
 
   Stop
@@ -1800,12 +1829,10 @@ pub fn send_close_frame(
 /// - `on_close` is called once, however the WebSocket ended.
 ///
 /// A request that is not a valid handshake is answered with status code 400:
-/// Bad Request, and the handler is never run. WebSockets travel over extended
-/// CONNECT on HTTP/2, which ewe does not negotiate yet, so a request on an
-/// HTTP/2 connection is answered with status code 501: Not Implemented.
+/// Bad Request, and the handler is never run.
 ///
-/// The connection stops being HTTP once the handshake has been sent so it will
-/// never carry another request.
+/// On HTTP/1 the handshake is an `Upgrade` and the connection stops being HTTP
+/// once it has been sent so it will never carry another request.
 ///
 /// # Examples
 ///
@@ -1846,6 +1873,8 @@ pub fn websocket(
     case conn {
       connection.Http1Websocket(conn) ->
         http1_websocket.run(conn, on_init, step, on_close)
+      connection.Http2Websocket(conn) ->
+        http2_websocket.run(conn, on_init, step, on_close)
     }
   }
 
@@ -1874,16 +1903,30 @@ pub fn websocket(
           response.set_body(response.new(400), Empty)
         }
       }
-    // WebSockets ride on extended CONNECT over HTTP/2 which ewe does not
-    // negotiate yet!
-    connection.Http2(_connection) -> {
-      logging.log(
-        logging.Debug,
-        "Rejected a WebSocket handshake! HTTP/2 connections do not carry WebSockets",
-      )
+    connection.Http2(conn) ->
+      case http2_websocket.handshake(request, conn.protocol) {
+        Ok(http2_websocket.Handshake(compression:)) -> {
+          let context = websocks.create_context(compression, websocks.Server)
 
-      response.set_body(response.new(501), Empty)
-    }
+          response.Response(
+            status: 200,
+            headers: extension_headers(compression),
+            body: Websocket(connection.WebsocketMetadata(
+              context:,
+              handler: socket,
+            )),
+          )
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Debug,
+            "Rejected a WebSocket handshake: "
+              <> http2_websocket.handshake_error_to_string(error),
+          )
+
+          response.set_body(response.new(400), Empty)
+        }
+      }
   }
 }
 
@@ -1891,18 +1934,22 @@ fn handshake_headers(
   accept: String,
   compression: option.Option(websocks.CompressionExtensions),
 ) -> List(#(String, String)) {
-  let headers = [
+  [
     #("connection", "upgrade"),
     #("upgrade", "websocket"),
     #("sec-websocket-accept", accept),
+    ..extension_headers(compression)
   ]
+}
 
+fn extension_headers(
+  compression: option.Option(websocks.CompressionExtensions),
+) -> List(#(String, String)) {
   case compression {
     Some(extensions) -> [
       #("sec-websocket-extensions", compression_header(extensions)),
-      ..headers
     ]
-    None -> headers
+    None -> []
   }
 }
 

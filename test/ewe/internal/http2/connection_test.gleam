@@ -15,9 +15,8 @@ fn pending_stream(send_window: Int, pending: BitArray) -> connection.Stream {
   connection.Stream(
     status: connection.Flushing,
     send_window:,
-    pending: connection.PendingBytes(pending),
-    pending_end_stream: True,
-    write_ack: None,
+    pending: connection.closed_chunks(pending),
+    writer: None,
     recv_window: 65_535,
     recv_buffer: bytes_tree.new(),
     request_half_closed: False,
@@ -36,9 +35,8 @@ fn inbound_stream(
   connection.Stream(
     status: connection.Flushing,
     send_window: 65_535,
-    pending: connection.PendingBytes(<<>>),
-    pending_end_stream: True,
-    write_ack: None,
+    pending: connection.no_chunks(),
+    writer: None,
     recv_window:,
     recv_buffer: bytes_tree.new(),
     request_half_closed: False,
@@ -284,8 +282,11 @@ pub fn build_request_minimal_valid_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.method == http.Get
   assert request.scheme == http.Https
   assert request.host == "example.com"
@@ -303,8 +304,11 @@ pub fn build_request_with_query_and_port_test() {
     #(<<":path":utf8>>, <<"/search?q=1":utf8>>),
     #(<<"x-custom":utf8>>, <<"value":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.method == http.Post
   assert request.host == "example.com"
   assert request.port == Some(8080)
@@ -432,8 +436,11 @@ pub fn build_request_te_trailers_allowed_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"te":utf8>>, <<"trailers":utf8>>),
   ]
-  let assert Ok(#(request, None)) =
-    connection.build_request(headers, Nil, connection.header_patterns())
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: None,
+  )) = connection.build_request(headers, Nil, connection.header_patterns())
   assert request.headers == [#("te", "trailers")]
 }
 
@@ -576,7 +583,7 @@ pub fn flush_stream_partial_drain_blocks_on_stream_window_test() {
   let assert Ok(remaining) = dict.get(state.streams, 1)
   assert remaining.status == connection.Flushing
   assert remaining.send_window == 0
-  assert remaining.pending == connection.PendingBytes(<<"lo":utf8>>)
+  assert remaining.pending == connection.closed_chunks(<<"lo":utf8>>)
   assert state.conn_send_window == 65_535 - 3
 }
 
@@ -1143,4 +1150,320 @@ pub fn content_length_nonzero_with_no_body_rejects_before_spawn_test() {
 
   let assert connection.RejectStream(state, 1, frame.ProtocolError) = result
   assert dict.get(state.streams, 1) == Error(Nil)
+}
+
+fn queued_stream(
+  send_window: Int,
+  chunks: List(http2.Chunk),
+) -> connection.Stream {
+  let pending =
+    list.fold(chunks, connection.no_chunks(), fn(pending, chunk) {
+      let assert Ok(pending) = connection.push_chunk(pending, chunk)
+      pending
+    })
+
+  connection.Stream(..pending_stream(send_window, <<>>), pending:)
+}
+
+pub fn queued_chunks_acknowledge_each_on_full_delivery_test() {
+  let first = process.new_subject()
+  let second = process.new_subject()
+  let entry =
+    queued_stream(65_535, [
+      http2.Chunk(<<"one":utf8>>, Some(first)),
+      http2.Finish(<<"two":utf8>>, Some(second)),
+    ])
+
+  let assert connection.FlushAccumulated(state, out, True) =
+    connection.do_flush_stream(
+      connection.test_state(),
+      1,
+      entry,
+      bytes_tree.new(),
+      False,
+    )
+
+  let assert Ok(#(frame.Data(1, False, <<"one":utf8>>, 3), rest)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  let assert Ok(#(frame.Data(1, True, <<"two":utf8>>, 3), <<>>)) =
+    frame.decode(rest, 16_384)
+
+  assert process.receive(first, 0) == Ok(http2.WriteAck)
+  assert process.receive(second, 0) == Ok(http2.WriteAck)
+  assert dict.get(state.streams, 1) == Error(Nil)
+  assert state.conn_send_window == 65_535 - 6
+}
+
+pub fn queue_preserves_order_across_the_reversal_test() {
+  let entry =
+    queued_stream(65_535, [
+      http2.Chunk(<<"a":utf8>>, None),
+      http2.Chunk(<<"b":utf8>>, None),
+      http2.Finish(<<"c":utf8>>, None),
+    ])
+
+  let assert connection.FlushAccumulated(state, out, True) =
+    connection.do_flush_stream(
+      connection.test_state(),
+      1,
+      entry,
+      bytes_tree.new(),
+      False,
+    )
+
+  let assert Ok(#(frame.Data(1, False, <<"a":utf8>>, 1), rest)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  let assert Ok(#(frame.Data(1, False, <<"b":utf8>>, 1), rest)) =
+    frame.decode(rest, 16_384)
+  let assert Ok(#(frame.Data(1, True, <<"c":utf8>>, 1), <<>>)) =
+    frame.decode(rest, 16_384)
+
+  assert dict.get(state.streams, 1) == Error(Nil)
+  assert state.conn_send_window == 65_535 - 3
+}
+
+pub fn partial_drain_withholds_acknowledgement_until_complete_test() {
+  let ack = process.new_subject()
+  let entry = queued_stream(3, [http2.Chunk(<<"hello":utf8>>, Some(ack))])
+
+  let assert connection.FlushAccumulated(state, _blocked_out, True) =
+    connection.do_flush_stream(
+      connection.test_state(),
+      1,
+      entry,
+      bytes_tree.new(),
+      False,
+    )
+
+  assert process.receive(ack, 0) == Error(Nil)
+  let assert Ok(blocked) = dict.get(state.streams, 1)
+
+  let assert connection.FlushAccumulated(state, out, True) =
+    connection.do_flush_stream(
+      state,
+      1,
+      connection.Stream(..blocked, send_window: 10),
+      bytes_tree.new(),
+      False,
+    )
+
+  let assert Ok(#(frame.Data(1, False, <<"lo":utf8>>, 2), <<>>)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  assert process.receive(ack, 0) == Ok(http2.WriteAck)
+
+  let assert Ok(drained) = dict.get(state.streams, 1)
+  assert drained.pending == connection.no_chunks()
+}
+
+pub fn empty_terminator_closes_stream_with_the_window_shut_test() {
+  let ack = process.new_subject()
+  let state = connection.State(..connection.test_state(), conn_send_window: 0)
+  let entry = queued_stream(0, [http2.Finish(<<>>, Some(ack))])
+
+  let assert connection.FlushAccumulated(state, out, True) =
+    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
+
+  let assert Ok(#(frame.Data(1, True, <<>>, 0), <<>>)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  assert process.receive(ack, 0) == Ok(http2.WriteAck)
+  assert dict.get(state.streams, 1) == Error(Nil)
+}
+
+fn writing_stream(queued: Int) -> connection.Stream {
+  connection.Stream(
+    ..queued_stream(0, [http2.Chunk(<<0:size(queued)>>, None)]),
+    writer: Some(process.new_subject()),
+  )
+}
+
+pub fn a_writer_already_over_the_limit_is_stopped_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+
+  assert connection.over_send_buffer_limit(writing_stream(80), options)
+}
+
+pub fn a_writer_within_the_limit_carries_on_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 64)
+
+  assert !connection.over_send_buffer_limit(writing_stream(80), options)
+}
+
+// One huge message is a single legitimate send: the queue it is measured
+// against is the one before it, which is empty.
+pub fn one_message_larger_than_the_limit_is_allowed_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+  let empty =
+    connection.Stream(
+      ..queued_stream(0, []),
+      writer: Some(process.new_subject()),
+    )
+
+  assert !connection.over_send_buffer_limit(empty, options)
+}
+
+pub fn a_waiting_caller_is_never_capped_test() {
+  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+  let entry = queued_stream(0, [http2.Chunk(<<0:size(80)>>, None)])
+
+  assert !connection.over_send_buffer_limit(entry, options)
+}
+
+fn pending_ids(state: connection.State, cursor: Int) -> List(Int) {
+  connection.State(..state, flush_cursor: cursor)
+  |> connection.rotated_pending
+  |> list.map(fn(entry) { entry.0 })
+}
+
+pub fn pending_streams_take_turns_at_the_connection_window_test() {
+  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(5, queued), #(1, queued), #(3, queued)]),
+    )
+
+  assert pending_ids(state, 0) == [1, 3, 5]
+  assert pending_ids(state, 1) == [3, 5, 1]
+  assert pending_ids(state, 3) == [5, 1, 3]
+  assert pending_ids(state, 5) == [1, 3, 5]
+}
+
+pub fn streams_with_nothing_queued_are_not_flushed_test() {
+  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
+  let idle = queued_stream(0, [])
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, idle), #(3, queued), #(5, idle)]),
+    )
+
+  assert pending_ids(state, 0) == [3]
+}
+
+fn connect_pseudo_headers() -> List(#(BitArray, BitArray)) {
+  [
+    #(<<":method":utf8>>, <<"CONNECT":utf8>>),
+    #(<<":scheme":utf8>>, <<"https":utf8>>),
+    #(<<":authority":utf8>>, <<"example.com":utf8>>),
+    #(<<":path":utf8>>, <<"/socket":utf8>>),
+    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+  ]
+}
+
+fn connect_pseudo_fields() -> List(alpacki.HeaderField) {
+  use #(name, value) <- list.map(connect_pseudo_headers())
+  alpacki.HeaderField(name, value, alpacki.WithoutIndexing)
+}
+
+fn extended_connect_state(websocket: Bool) -> connection.State {
+  let options = http2.Options(..http2.default_options(), websocket:)
+
+  connection.State(
+    ..connection.test_state(),
+    options:,
+    settings_frame: connection.build_settings_frame(options),
+  )
+}
+
+pub fn extended_connect_carries_its_protocol_test() {
+  let assert Ok(connection.DecodedRequest(
+    request:,
+    content_length: None,
+    protocol: Some("websocket"),
+  )) =
+    connection.build_request(
+      connect_pseudo_headers(),
+      Nil,
+      connection.header_patterns(),
+    )
+
+  assert request.method == http.Connect
+  assert request.path == "/socket"
+}
+
+pub fn protocol_without_connect_is_rejected_test() {
+  let headers = [
+    #(<<":method":utf8>>, <<"GET":utf8>>),
+    #(<<":scheme":utf8>>, <<"https":utf8>>),
+    #(<<":authority":utf8>>, <<"example.com":utf8>>),
+    #(<<":path":utf8>>, <<"/socket":utf8>>),
+    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+  ]
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.ProtocolWithoutConnect)
+}
+
+pub fn protocol_with_content_length_is_rejected_test() {
+  let headers =
+    list.append(connect_pseudo_headers(), [
+      #(<<"content-length":utf8>>, <<"5":utf8>>),
+    ])
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.ProtocolWithContentLength)
+}
+
+pub fn duplicate_protocol_is_rejected_test() {
+  let headers =
+    list.append(connect_pseudo_headers(), [
+      #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+    ])
+
+  assert connection.build_request(headers, Nil, connection.header_patterns())
+    == Error(connection.DuplicatePseudoHeader)
+}
+
+pub fn extended_connect_is_refused_when_websockets_are_off_test() {
+  let assembly =
+    connection.HeaderAssembly(
+      1,
+      True,
+      1,
+      encode(connect_pseudo_fields()),
+      False,
+    )
+  let result =
+    connection.complete_header_block(extended_connect_state(False), assembly)
+
+  let assert connection.RejectStream(_state, stream_id, code) = result
+  assert stream_id == 1
+  assert code == frame.ProtocolError
+}
+
+pub fn extended_connect_is_served_when_websockets_are_on_test() {
+  let assembly =
+    connection.HeaderAssembly(
+      1,
+      True,
+      1,
+      encode(connect_pseudo_fields()),
+      False,
+    )
+
+  let assert connection.Proceed(_state) =
+    connection.complete_header_block(extended_connect_state(True), assembly)
+}
+
+fn advertised_settings(websocket: Bool) -> List(frame.Setting) {
+  let assert Ok(#(frame.Settings(_stream_id, _ack, params), <<>>)) =
+    extended_connect_state(websocket).settings_frame
+    |> bytes_tree.to_bit_array
+    |> frame.decode(16_384)
+
+  params
+}
+
+pub fn websockets_off_does_not_advertise_extended_connect_test() {
+  assert !list.contains(
+    advertised_settings(False),
+    frame.EnableConnectProtocol(True),
+  )
+}
+
+pub fn websockets_on_advertises_extended_connect_test() {
+  assert list.contains(
+    advertised_settings(True),
+    frame.EnableConnectProtocol(True),
+  )
 }

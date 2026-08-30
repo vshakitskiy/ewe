@@ -40,6 +40,7 @@ pub type Setting {
   InitialWindowSize(Int)
   MaxFrameSize(Int)
   MaxHeaderListSize(Int)
+  EnableConnectProtocol(Bool)
   UnknownSetting(Int, Int)
 }
 
@@ -287,6 +288,12 @@ fn decode_setting(id: Int, value: Int) -> Result(Setting, FrameError) {
         False -> Ok(MaxFrameSize(value))
       }
     0x6 -> Ok(MaxHeaderListSize(value))
+    0x8 ->
+      case value {
+        0 -> Ok(EnableConnectProtocol(False))
+        1 -> Ok(EnableConnectProtocol(True))
+        _value -> Error(Violation(ProtocolError))
+      }
     other -> Ok(UnknownSetting(other, value))
   }
 }
@@ -417,6 +424,7 @@ fn encode_setting(setting: Setting) -> #(Int, Int) {
     InitialWindowSize(value) -> #(0x4, value)
     MaxFrameSize(value) -> #(0x5, value)
     MaxHeaderListSize(value) -> #(0x6, value)
+    EnableConnectProtocol(value) -> #(0x8, bit(value))
     UnknownSetting(id, value) -> #(id, value)
   }
 }

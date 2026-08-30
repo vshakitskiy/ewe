@@ -6,6 +6,7 @@ import gleam/erlang/reference
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/option
 import gleam/result
 import logging
 
@@ -53,23 +54,40 @@ fn deliver(
   method: http.Method,
 ) -> Nil {
   case response.body, method {
-    connection.Websocket(_metadata), _method -> {
-      logging.log(
-        logging.Error,
-        "Discarded a WebSocket response: HTTP/2 connections do not carry them",
-      )
+    connection.Websocket(connection.WebsocketMetadata(context:, handler:)),
+      _method
+    -> {
+      let signals = process.new_subject()
 
-      internal_error(reply_to, stream_id)
+      case
+        begin(reply_to, stream_id, response, http2.WebsocketStream(signals))
+      {
+        Error(_interrupted) -> Nil
+        Ok(writer) ->
+          case
+            http2.WebsocketConnection(
+              writer:,
+              context:,
+              body: process.new_subject(),
+              signals:,
+            )
+            |> connection.Http2Websocket
+            |> handler
+          {
+            connection.Stopped -> Nil
+            connection.StoppedAbnormal(reason) -> abort(reason)
+          }
+      }
     }
     _body, http.Head ->
       process.send(reply_to, http2.Respond(stream_id, response))
     connection.Streaming(connection.StreamingMetadata(handler:)), _method ->
-      case begin(reply_to, stream_id, response, http2.Nothing) {
+      case begin(reply_to, stream_id, response, http2.PlainStream) {
         Error(_interrupted) -> Nil
         Ok(writer) -> handler(connection.Http2Writer(writer))
       }
     connection.Sse(connection.SseMetadata(handler:)), _method ->
-      case begin(reply_to, stream_id, response, http2.SseHeaders) {
+      case begin(reply_to, stream_id, response, http2.EventStream) {
         Error(_interrupted) -> Nil
         Ok(writer) ->
           case handler(connection.Http2Sse(http2.SseConnection(writer))) {
@@ -89,7 +107,7 @@ fn begin(
   reply_to: process.Subject(http2.Reply(connection.Body)),
   stream_id: Int,
   response: response.Response(connection.Body),
-  reserved: http2.Reserved,
+  mode: http2.ResponseMode,
 ) -> Result(http2.ResponseWriter(connection.Body), http2.Interrupted) {
   let ack_ref = reference.new()
   let ack = process.unsafely_create_subject(process.self(), http2.tag(ack_ref))
@@ -101,7 +119,7 @@ fn begin(
       ack:,
       status: response.status,
       headers: response.headers,
-      reserved:,
+      mode:,
     ),
   )
 
@@ -115,7 +133,12 @@ pub fn send_chunk(
 ) -> Result(http2.ResponseWriter(connection.Body), http2.Interrupted) {
   case chunk {
     <<>> -> Ok(writer)
-    _chunk -> write(writer, chunk, False)
+    _chunk -> {
+      push(writer, http2.Chunk(chunk, option.Some(writer.ack)))
+
+      use _written <- result.map(http2.receive_reply(writer.ack_ref))
+      writer
+    }
   }
 }
 
@@ -123,7 +146,9 @@ pub fn finish_chunk(
   writer: http2.ResponseWriter(connection.Body),
   chunk: BitArray,
 ) -> Result(Nil, http2.Interrupted) {
-  write(writer, chunk, True) |> result.replace(Nil)
+  push(writer, http2.Finish(chunk, option.Some(writer.ack)))
+
+  http2.receive_reply(writer.ack_ref) |> result.replace(Nil)
 }
 
 pub fn finish_response(
@@ -132,23 +157,11 @@ pub fn finish_response(
   finish_chunk(writer, <<>>)
 }
 
-fn write(
+fn push(
   writer: http2.ResponseWriter(connection.Body),
-  chunk: BitArray,
-  end_stream: Bool,
-) -> Result(http2.ResponseWriter(connection.Body), http2.Interrupted) {
-  process.send(
-    writer.connection,
-    http2.WriteData(
-      stream_id: writer.stream_id,
-      ack: writer.ack,
-      chunk:,
-      end_stream:,
-    ),
-  )
-
-  use _written <- result.map(http2.receive_reply(writer.ack_ref))
-  writer
+  chunk: http2.Chunk,
+) -> Nil {
+  process.send(writer.connection, http2.PushData(writer.stream_id, chunk))
 }
 
 @external(erlang, "ewe_http2_ffi", "exit_self")

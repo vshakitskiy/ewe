@@ -56,6 +56,7 @@ pub type SseConnection {
 
 pub type WebsocketConnection {
   Http1Websocket(http1.WebsocketConnection)
+  Http2Websocket(http2.WebsocketConnection(Body))
 }
 
 pub type Outcome {

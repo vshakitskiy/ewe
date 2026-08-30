@@ -215,3 +215,36 @@ pub fn encode_data_header_declares_length_without_payload_test() {
     |> frame.decode(16_384)
     == Ok(#(frame.Data(1, True, <<"hello":utf8>>, 5), <<>>))
 }
+
+pub fn settings_enable_connect_protocol_test() {
+  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 1:32>>
+    |> frame.decode(16_384)
+    == Ok(
+      #(frame.Settings(0, False, [frame.EnableConnectProtocol(True)]), <<>>),
+    )
+}
+
+pub fn settings_enable_connect_protocol_disabled_test() {
+  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 0:32>>
+    |> frame.decode(16_384)
+    == Ok(
+      #(frame.Settings(0, False, [frame.EnableConnectProtocol(False)]), <<>>),
+    )
+}
+
+pub fn settings_enable_connect_protocol_invalid_value_test() {
+  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 2:32>>
+    |> frame.decode(16_384)
+    == Error(frame.Violation(frame.ProtocolError))
+}
+
+pub fn settings_enable_connect_protocol_round_trips_test() {
+  let encoded =
+    frame.Settings(0, False, [frame.EnableConnectProtocol(True)])
+    |> frame.encode
+
+  assert frame.decode(encoded, 16_384)
+    == Ok(
+      #(frame.Settings(0, False, [frame.EnableConnectProtocol(True)]), <<>>),
+    )
+}

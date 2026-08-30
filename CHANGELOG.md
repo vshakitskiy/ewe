@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Fix ssl application not starting up.
+- Support WebSocket over HTTP/2 through the extended `CONNECT` of RFC 8441.
+  `ewe.websocket` serves it with no change to your handler.
+- Add `websocket` to `Http2Options`, which says whether that is offered. It is
+  `False` by default; `True` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` so
+  browsers open WebSockets over HTTP/2 rather than falling back to the HTTP/1
+  handshake.
+- Add `send_buffer_limit` to `Http2Options`, the bytes a WebSocket stream may
+  leave queued for a client that is not reading before the stream is reset.
+- Fix the close code a WebSocket answers a broken frame with. Every fault closed
+  with 1002: Protocol Error, where RFC 6455 asks for 1007: Invalid Frame Payload
+  Data on a text message that is not UTF-8 or a payload that will not inflate,
+  and 1009: Message Too Big on one past `max_frame_size` or `max_message_size`.
+
 ## v6.0.0
 
 - `sse`'s `on_init` function now receives the stream connection and a 

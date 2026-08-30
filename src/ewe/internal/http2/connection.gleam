@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/http/response
 import gleam/option
+import websocks
 
 pub type Options {
   Options(
@@ -20,6 +21,8 @@ pub type Options {
     drain_timeout_ms: Int,
     recv_window_low_water_mark: Int,
     recv_window_high_water_mark: Int,
+    websocket: Bool,
+    send_buffer_limit: Int,
     file_read_threshold: Int,
     body_read_timeout: Int,
   )
@@ -40,6 +43,8 @@ pub fn default_options() -> Options {
     drain_timeout_ms: 4000,
     recv_window_low_water_mark: 262_144,
     recv_window_high_water_mark: 2_097_152,
+    websocket: False,
+    send_buffer_limit: 1_048_576,
     file_read_threshold: 1_048_576,
     body_read_timeout: 10_000,
   )
@@ -55,6 +60,7 @@ pub type Connection(body) {
     read: Int,
     body_read_timeout: Int,
     peer: Result(socket.SockName, Nil),
+    protocol: option.Option(String),
   )
 }
 
@@ -66,19 +72,24 @@ pub type Reply(body) {
     ack: process.Subject(WriteAck),
     status: Int,
     headers: List(#(String, String)),
-    reserved: Reserved,
+    mode: ResponseMode,
   )
-  WriteData(
-    stream_id: Int,
-    ack: process.Subject(WriteAck),
-    chunk: BitArray,
-    end_stream: Bool,
-  )
+  PushData(stream_id: Int, chunk: Chunk)
 }
 
-pub type Reserved {
-  Nothing
-  SseHeaders
+pub type ResponseMode {
+  PlainStream
+  EventStream
+  WebsocketStream(notify: process.Subject(StreamSignal))
+}
+
+pub type StreamSignal {
+  Draining
+}
+
+pub type Chunk {
+  Chunk(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
+  Finish(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
 }
 
 pub type BodyEvent {
@@ -102,6 +113,15 @@ pub type ResponseWriter(body) {
 
 pub type SseConnection(body) {
   SseConnection(writer: ResponseWriter(body))
+}
+
+pub type WebsocketConnection(body) {
+  WebsocketConnection(
+    writer: ResponseWriter(body),
+    context: websocks.Context,
+    body: process.Subject(BodyEvent),
+    signals: process.Subject(StreamSignal),
+  )
 }
 
 pub type Interrupted {

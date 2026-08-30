@@ -13,3 +13,4 @@ autobahn/server
 /benchmark/results
 /benchmark/.wrk2
 NOTE.md
+autobahn/server_h2
