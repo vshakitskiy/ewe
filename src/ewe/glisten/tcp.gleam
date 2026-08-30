@@ -1,7 +1,6 @@
 import ewe/glisten/socket.{type ListenSocket, type Socket, type SocketReason}
 import ewe/glisten/socket/options.{type TcpOption}
 import gleam/bytes_tree.{type BytesTree}
-import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
@@ -17,12 +16,6 @@ fn do_listen_tcp(
 ) -> Result(ListenSocket, SocketReason)
 
 @external(erlang, "gen_tcp", "accept")
-pub fn accept_timeout(
-  socket: ListenSocket,
-  timeout: Int,
-) -> Result(Socket, SocketReason)
-
-@external(erlang, "gen_tcp", "accept")
 pub fn accept(socket: ListenSocket) -> Result(Socket, SocketReason)
 
 @external(erlang, "gen_tcp", "recv")
@@ -32,24 +25,11 @@ pub fn receive_timeout(
   timeout: Int,
 ) -> Result(BitArray, SocketReason)
 
-@external(erlang, "gen_tcp", "recv")
-pub fn receive(socket: Socket, length: Int) -> Result(BitArray, SocketReason)
-
 @external(erlang, "ewe_glisten_tcp_ffi", "send")
 pub fn send(socket: Socket, packet: BytesTree) -> Result(Nil, SocketReason)
 
-@external(erlang, "socket", "info")
-pub fn socket_info(socket: Socket) -> Dict(a, b)
-
 @external(erlang, "ewe_glisten_tcp_ffi", "close")
 pub fn close(socket: a) -> Result(Nil, SocketReason)
-
-@external(erlang, "ewe_glisten_tcp_ffi", "shutdown")
-pub fn do_shutdown(socket: Socket, write: Atom) -> Result(Nil, SocketReason)
-
-pub fn shutdown(socket: Socket) -> Result(Nil, SocketReason) {
-  do_shutdown(socket, atom.create("write"))
-}
 
 @external(erlang, "ewe_glisten_tcp_ffi", "set_opts")
 fn do_set_opts(
@@ -75,8 +55,8 @@ pub fn listen(
   let is_unix =
     list.any(opts, fn(option) {
       case option {
-        options.Ip(options.UnixPath(_)) -> True
-        _ -> False
+        options.Ip(options.UnixPath(_path)) -> True
+        _option -> False
       }
     })
 
@@ -92,9 +72,6 @@ pub fn listen(
 pub fn handshake(socket: Socket) -> Result(Socket, Nil) {
   Ok(socket)
 }
-
-@external(erlang, "tcp", "negotiated_protocol")
-pub fn negotiated_protocol(socket: Socket) -> a
 
 @external(erlang, "ewe_glisten_tcp_ffi", "peername")
 pub fn peername(socket: Socket) -> Result(socket.SockName, SocketReason)

@@ -6,13 +6,14 @@ import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http2/connection as http2
 import ewe/internal/http2/frame
+import ewe/internal/http2/headers
 import ewe/internal/http2/stream
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/http
-import gleam/http/request.{type Request, Request}
+import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
@@ -120,39 +121,6 @@ pub type Stream {
   )
 }
 
-type Pattern
-
-pub opaque type HeaderPatterns {
-  HeaderPatterns(
-    name: Pattern,
-    forbidden: Pattern,
-    query: Pattern,
-    colon: Pattern,
-  )
-}
-
-@external(erlang, "ewe_http2_ffi", "name_pattern")
-fn name_pattern() -> Pattern
-
-@external(erlang, "ewe_http2_ffi", "forbidden_header_pattern")
-fn forbidden_header_pattern() -> Pattern
-
-@external(erlang, "ewe_http2_ffi", "query_pattern")
-fn query_pattern() -> Pattern
-
-@external(erlang, "ewe_http2_ffi", "colon_pattern")
-fn colon_pattern() -> Pattern
-
-@internal
-pub fn header_patterns() -> HeaderPatterns {
-  HeaderPatterns(
-    name: name_pattern(),
-    forbidden: forbidden_header_pattern(),
-    query: query_pattern(),
-    colon: colon_pattern(),
-  )
-}
-
 @internal
 pub type State {
   State(
@@ -178,7 +146,7 @@ pub type State {
     drain_timer: Option(process.Timer),
     options: http2.Options,
     settings_frame: bytes_tree.BytesTree,
-    patterns: HeaderPatterns,
+    patterns: headers.HeaderPatterns,
     peer: Result(socket.SockName, Nil),
     parent: Result(process.Pid, Nil),
   )
@@ -281,7 +249,7 @@ pub fn init(
     drain_timer: None,
     options:,
     settings_frame: build_settings_frame(options),
-    patterns: header_patterns(),
+    patterns: headers.header_patterns(),
     peer:,
     parent:,
   )
@@ -840,11 +808,11 @@ pub fn complete_header_block(
 ) -> FrameResult {
   case decode_and_validate_header_block(state, assembly) {
     Error(result) -> result
-    Ok(#(state, headers)) ->
-      case build_request(headers, Nil, state.patterns) {
+    Ok(#(state, header_list)) ->
+      case headers.build_request(header_list, Nil, state.patterns) {
         Error(_error) ->
           RejectStream(state, assembly.stream_id, frame.ProtocolError)
-        Ok(DecodedRequest(request:, content_length:, protocol:)) ->
+        Ok(headers.DecodedRequest(request:, content_length:, protocol:)) ->
           case
             protocol,
             state.options.websocket,
@@ -888,14 +856,17 @@ fn complete_trailer_block(
 ) -> FrameResult {
   case decode_and_validate_header_block(state, assembly) {
     Error(result) -> result
-    Ok(#(next_state, headers)) ->
-      case list.any(headers, is_pseudo_header), assembly.end_stream {
+    Ok(#(next_state, header_list)) ->
+      case
+        list.any(header_list, headers.is_pseudo_header),
+        assembly.end_stream
+      {
         True, _end_stream ->
           RejectStream(next_state, assembly.stream_id, frame.ProtocolError)
         False, False ->
           RejectStream(next_state, assembly.stream_id, frame.ProtocolError)
         False, True ->
-          case decode_trailers(state.patterns, headers) {
+          case headers.decode_trailers(state.patterns, header_list) {
             Ok(trailers) ->
               Proceed(finish_trailers(next_state, assembly.stream_id, trailers))
             Error(_error) ->
@@ -903,41 +874,6 @@ fn complete_trailer_block(
           }
       }
   }
-}
-
-fn is_pseudo_header(header: #(BitArray, BitArray)) -> Bool {
-  case header.0 {
-    <<58, _rest:bits>> -> True
-    _name -> False
-  }
-}
-
-fn decode_trailers(
-  patterns: HeaderPatterns,
-  headers: List(#(BitArray, BitArray)),
-) -> Result(List(#(String, String)), RequestError) {
-  let empty =
-    PseudoHeaders(
-      method: None,
-      scheme: None,
-      authority: None,
-      path: None,
-      protocol: None,
-    )
-    |> HeaderAccumulated(
-      regular: dict.new(),
-      seen_regular: False,
-      content_length: None,
-    )
-
-  use acc <- result.try(
-    list.try_fold(headers, empty, fn(acc, header) {
-      let #(name, value) = header
-      add_regular(patterns, acc, name, value)
-    }),
-  )
-
-  Ok(dict.to_list(acc.regular))
 }
 
 fn finish_trailers(
@@ -1018,354 +954,6 @@ fn track_stream(
   )
 }
 
-@internal
-pub type RequestError {
-  InvalidUtf8
-  EmptyHeaderName
-  UppercaseHeaderName
-  MalformedHeaderBytes
-  PseudoHeaderAfterRegular
-  UnknownPseudoHeader
-  MissingPseudoHeader
-  DuplicatePseudoHeader
-  ConnectionSpecificHeader
-  InvalidMethod
-  InvalidScheme
-  InvalidAuthority
-  InvalidPath
-  InvalidContentLength
-  InvalidProtocol
-  ProtocolWithoutConnect
-  ProtocolWithContentLength
-}
-
-fn validate_protocol(
-  method: http.Method,
-  protocol: Option(String),
-  content_length: Option(Int),
-) -> Result(Nil, RequestError) {
-  case protocol, method, content_length {
-    None, _method, _length -> Ok(Nil)
-    Some(_protocol), http.Connect, None -> Ok(Nil)
-    Some(_protocol), http.Connect, Some(_length) ->
-      Error(ProtocolWithContentLength)
-    Some(_protocol), _method, _length -> Error(ProtocolWithoutConnect)
-  }
-}
-
-type PseudoHeaders {
-  PseudoHeaders(
-    method: Option(http.Method),
-    scheme: Option(http.Scheme),
-    authority: Option(String),
-    path: Option(String),
-    protocol: Option(String),
-  )
-}
-
-@internal
-pub type DecodedRequest(body) {
-  DecodedRequest(
-    request: Request(body),
-    content_length: Option(Int),
-    protocol: Option(String),
-  )
-}
-
-type HeaderAccumulated {
-  HeaderAccumulated(
-    pseudo: PseudoHeaders,
-    regular: Dict(String, String),
-    seen_regular: Bool,
-    content_length: Option(Int),
-  )
-}
-
-@internal
-pub fn build_request(
-  headers: List(#(BitArray, BitArray)),
-  body: body,
-  patterns: HeaderPatterns,
-) -> Result(DecodedRequest(body), RequestError) {
-  let pseudo =
-    PseudoHeaders(
-      method: None,
-      scheme: None,
-      authority: None,
-      path: None,
-      protocol: None,
-    )
-
-  let empty =
-    HeaderAccumulated(
-      regular: dict.new(),
-      seen_regular: False,
-      content_length: None,
-      pseudo:,
-    )
-
-  use acc <- result.try(
-    list.try_fold(headers, empty, fn(acc, header) {
-      add_header(patterns, acc, header)
-    }),
-  )
-
-  case
-    acc.pseudo.method,
-    acc.pseudo.scheme,
-    acc.pseudo.authority,
-    acc.pseudo.path
-  {
-    Some(method), Some(scheme), Some(authority), Some(path) -> {
-      use Nil <- result.try(validate_protocol(
-        method,
-        acc.pseudo.protocol,
-        acc.content_length,
-      ))
-      use #(host, port) <- result.try(split_authority(patterns, authority))
-      let #(path, query) = case split_once(path, patterns.query) {
-        Ok(#(path, query)) -> #(path, Some(query))
-        Error(Nil) -> #(path, None)
-      }
-
-      Ok(DecodedRequest(
-        request: Request(
-          method:,
-          headers: dict.to_list(acc.regular),
-          body:,
-          scheme:,
-          host:,
-          port:,
-          path:,
-          query:,
-        ),
-        content_length: acc.content_length,
-        protocol: acc.pseudo.protocol,
-      ))
-    }
-    _method, _scheme, _authority, _path -> Error(MissingPseudoHeader)
-  }
-}
-
-fn add_header(
-  patterns: HeaderPatterns,
-  acc: HeaderAccumulated,
-  header: #(BitArray, BitArray),
-) -> Result(HeaderAccumulated, RequestError) {
-  let #(name, value) = header
-
-  case name {
-    <<>> -> Error(EmptyHeaderName)
-    <<":method":utf8>> ->
-      case acc.seen_regular, acc.pseudo.method {
-        True, _method -> Error(PseudoHeaderAfterRegular)
-        False, Some(_method) -> Error(DuplicatePseudoHeader)
-        False, None ->
-          case parse_method(patterns, value) {
-            Ok(method) -> {
-              let pseudo = PseudoHeaders(..acc.pseudo, method: Some(method))
-              Ok(HeaderAccumulated(..acc, pseudo:))
-            }
-            Error(error) -> Error(error)
-          }
-      }
-    <<":scheme":utf8>> ->
-      case acc.seen_regular, acc.pseudo.scheme {
-        True, _scheme -> Error(PseudoHeaderAfterRegular)
-        False, Some(_scheme) -> Error(DuplicatePseudoHeader)
-        False, None ->
-          case parse_scheme(value) {
-            Ok(scheme) -> {
-              let pseudo = PseudoHeaders(..acc.pseudo, scheme: Some(scheme))
-              Ok(HeaderAccumulated(..acc, pseudo:))
-            }
-            Error(error) -> Error(error)
-          }
-      }
-    <<":authority":utf8>> ->
-      case acc.seen_regular, acc.pseudo.authority {
-        True, _authority -> Error(PseudoHeaderAfterRegular)
-        False, Some(_authority) -> Error(DuplicatePseudoHeader)
-        False, None ->
-          case validate_header_value(patterns.forbidden, value) {
-            Ok(authority) -> {
-              let pseudo =
-                PseudoHeaders(..acc.pseudo, authority: Some(authority))
-              Ok(HeaderAccumulated(..acc, pseudo:))
-            }
-            Error(error) -> Error(error)
-          }
-      }
-    <<":path":utf8>> ->
-      case acc.seen_regular, acc.pseudo.path {
-        True, _path -> Error(PseudoHeaderAfterRegular)
-        False, Some(_path) -> Error(DuplicatePseudoHeader)
-        False, None ->
-          case validate_header_value(patterns.forbidden, value) {
-            Ok("") -> Error(InvalidPath)
-            Ok(path) -> {
-              let pseudo = PseudoHeaders(..acc.pseudo, path: Some(path))
-              Ok(HeaderAccumulated(..acc, pseudo:))
-            }
-            Error(error) -> Error(error)
-          }
-      }
-    <<":protocol":utf8>> ->
-      case acc.seen_regular, acc.pseudo.protocol {
-        True, _protocol -> Error(PseudoHeaderAfterRegular)
-        False, Some(_protocol) -> Error(DuplicatePseudoHeader)
-        False, None ->
-          case validate_header_value(patterns.forbidden, value) {
-            Ok("") -> Error(InvalidProtocol)
-            Ok(protocol) -> {
-              let pseudo = PseudoHeaders(..acc.pseudo, protocol: Some(protocol))
-              Ok(HeaderAccumulated(..acc, pseudo:))
-            }
-            Error(error) -> Error(error)
-          }
-      }
-    <<58, _rest:bits>> ->
-      case acc.seen_regular {
-        True -> Error(PseudoHeaderAfterRegular)
-        False -> Error(UnknownPseudoHeader)
-      }
-    <<"connection":utf8>>
-    | <<"keep-alive":utf8>>
-    | <<"proxy-connection":utf8>>
-    | <<"transfer-encoding":utf8>>
-    | <<"upgrade":utf8>> -> Error(ConnectionSpecificHeader)
-    <<"content-length":utf8>> -> {
-      case acc.content_length {
-        Some(_prior) -> Error(InvalidContentLength)
-        None -> {
-          use value <- result.try(validate_header_value(
-            patterns.forbidden,
-            value,
-          ))
-
-          case int.parse(value) {
-            Ok(n) if n >= 0 -> {
-              let regular = dict.insert(acc.regular, "content-length", value)
-
-              HeaderAccumulated(
-                ..acc,
-                regular:,
-                seen_regular: True,
-                content_length: Some(n),
-              )
-              |> Ok
-            }
-            _value -> Error(InvalidContentLength)
-          }
-        }
-      }
-    }
-    <<"te":utf8>> ->
-      case value {
-        <<"trailers":utf8>> -> {
-          let regular = dict.insert(acc.regular, "te", "trailers")
-          Ok(HeaderAccumulated(..acc, regular:))
-        }
-        _name -> Error(ConnectionSpecificHeader)
-      }
-    _name -> add_regular(patterns, acc, name, value)
-  }
-}
-
-fn parse_method(
-  patterns: HeaderPatterns,
-  value: BitArray,
-) -> Result(http.Method, RequestError) {
-  case value {
-    <<"GET":utf8>> -> Ok(http.Get)
-    <<"POST":utf8>> -> Ok(http.Post)
-    <<"PUT":utf8>> -> Ok(http.Put)
-    <<"DELETE":utf8>> -> Ok(http.Delete)
-    <<"HEAD":utf8>> -> Ok(http.Head)
-    <<"OPTIONS":utf8>> -> Ok(http.Options)
-    <<"PATCH":utf8>> -> Ok(http.Patch)
-    <<"CONNECT":utf8>> -> Ok(http.Connect)
-    <<"TRACE":utf8>> -> Ok(http.Trace)
-    _method -> {
-      use method <- result.try(validate_header_value(patterns.forbidden, value))
-      http.parse_method(method) |> result.replace_error(InvalidMethod)
-    }
-  }
-}
-
-fn parse_scheme(value: BitArray) -> Result(http.Scheme, RequestError) {
-  case value {
-    <<"https":utf8>> -> Ok(http.Https)
-    <<"http":utf8>> -> Ok(http.Http)
-    _scheme -> Error(InvalidScheme)
-  }
-}
-
-@external(erlang, "ewe_http2_ffi", "validate_header_name")
-fn validate_header_name(
-  pattern: Pattern,
-  name: BitArray,
-) -> Result(String, RequestError)
-
-@external(erlang, "ewe_http2_ffi", "validate_header_value")
-fn validate_header_value(
-  pattern: Pattern,
-  value: BitArray,
-) -> Result(String, RequestError)
-
-fn add_regular(
-  patterns: HeaderPatterns,
-  acc: HeaderAccumulated,
-  name: BitArray,
-  value: BitArray,
-) -> Result(HeaderAccumulated, RequestError) {
-  use name <- result.try(validate_header_name(patterns.name, name))
-  use value <- result.try(validate_header_value(patterns.forbidden, value))
-
-  let separator = case name {
-    "cookie" -> "; "
-    _existing -> ", "
-  }
-
-  let regular =
-    dict_upsert(
-      name,
-      fn(prior) { prior <> separator <> value },
-      value,
-      acc.regular,
-    )
-
-  Ok(HeaderAccumulated(..acc, regular:, seen_regular: True))
-}
-
-@external(erlang, "maps", "update_with")
-fn dict_upsert(
-  key: String,
-  with: fn(String) -> String,
-  init: String,
-  map: Dict(String, String),
-) -> Dict(String, String)
-
-fn split_authority(
-  patterns: HeaderPatterns,
-  authority: String,
-) -> Result(#(String, Option(Int)), RequestError) {
-  case split_once(authority, patterns.colon) {
-    Ok(#(host, port_str)) ->
-      case int.parse(port_str) {
-        Ok(port) -> Ok(#(host, Some(port)))
-        Error(Nil) -> Error(InvalidAuthority)
-      }
-    Error(Nil) -> Ok(#(authority, None))
-  }
-}
-
-@external(erlang, "ewe_http2_ffi", "split_once")
-fn split_once(
-  string: String,
-  on pattern: Pattern,
-) -> Result(#(String, String), Nil)
-
 fn handle_client_settings(
   state: State,
   params: List(frame.Setting),
@@ -1383,7 +971,7 @@ fn handle_client_settings(
       let state = adjust_stream_windows(State(..state, peer_settings:), delta)
       let state = case state.handshake {
         AwaitingSettings -> {
-          cancel_timer(state.timer)
+          connection.cancel_timer(state.timer)
           State(..state, handshake: Connected, timer: None)
         }
         Connected -> state
@@ -1409,16 +997,6 @@ pub fn adjust_stream_windows(state: State, delta: Int) -> State {
 
       State(..state, streams:)
     }
-  }
-}
-
-fn cancel_timer(timer: Option(process.Timer)) -> Nil {
-  case timer {
-    Some(timer) -> {
-      let _cancelled = process.cancel_timer(timer)
-      Nil
-    }
-    None -> Nil
   }
 }
 
@@ -1497,7 +1075,7 @@ fn notify_draining(state: State) -> Nil {
 fn finish_or_continue(state: State) -> Next {
   case state.draining && dict.size(state.streams) == 0 {
     True -> {
-      cancel_timer(state.drain_timer)
+      connection.cancel_timer(state.drain_timer)
       Close
     }
     False -> Continue(state)
@@ -1635,43 +1213,6 @@ fn append_window_update(
   }
 }
 
-fn build_response_headers(
-  headers: List(#(String, String)),
-  pattern: Pattern,
-) -> List(alpacki.HeaderField) {
-  list.fold(headers, [], fn(fields, header) {
-    let #(name, value) = header
-    case name {
-      "connection"
-      | "keep-alive"
-      | "proxy-connection"
-      | "transfer-encoding"
-      | "upgrade"
-      | "date"
-      | "content-length"
-      | "" -> fields
-      _name ->
-        case
-          has_forbidden_header_bytes(pattern, name)
-          || has_forbidden_header_bytes(pattern, value)
-        {
-          True -> fields
-          False -> [
-            alpacki.HeaderField(
-              <<name:utf8>>,
-              <<value:utf8>>,
-              alpacki.WithoutIndexing,
-            ),
-            ..fields
-          ]
-        }
-    }
-  })
-}
-
-@external(erlang, "ewe_http2_ffi", "has_forbidden_header_bytes")
-fn has_forbidden_header_bytes(pattern: Pattern, value: String) -> Bool
-
 fn response_body_size(body: connection.Body) -> Int {
   case body {
     connection.Bytes(tree) -> bytes_tree.byte_size(tree)
@@ -1694,6 +1235,7 @@ fn open_pending(
   file_read_threshold: Int,
 ) -> Result(Pending, file.FileError) {
   case body {
+    // TODO: remove this to_bit_array perchance?
     connection.Bytes(tree) -> Ok(closed_chunks(bytes_tree.to_bit_array(tree)))
     connection.Text(text) -> Ok(closed_chunks(bit_array.from_string(text)))
     connection.Empty -> Ok(no_chunks())
@@ -1774,13 +1316,12 @@ fn send_response(
   stream_id: Int,
   entry: Stream,
   status: Int,
-  headers: List(#(String, String)),
+  response_headers: List(#(String, String)),
   content_length: Option(Int),
   pending: Pending,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  let fields = build_response_headers(headers, state.patterns.forbidden)
-
+  let fields = headers.build_response_headers(response_headers, state.patterns)
   let content_length_fields = case status, content_length {
     status, _length if status == 204 || { status >= 100 && status < 200 } -> []
     _status, None -> []
@@ -1793,29 +1334,15 @@ fn send_response(
     ]
   }
 
-  let header_fields = [
-    alpacki.HeaderField(
-      <<":status":utf8>>,
-      <<int.to_string(status):utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-    alpacki.HeaderField(<<"date":utf8>>, clock.get(), alpacki.WithoutIndexing),
-    ..list.append(content_length_fields, list.reverse(fields))
-  ]
-
-  let #(block, hpack_encoder) =
-    alpacki.encode_header_block(header_fields, state.hpack_encoder, True)
-
-  let state = State(..state, hpack_encoder:)
-
   let has_body = pending_has_bytes(pending)
-  let out =
-    bytes_tree.new()
-    |> append_header_frames(
+  let #(state, out) =
+    encode_head(
+      state,
       stream_id,
       !has_body,
-      block,
-      state.peer_settings.max_frame_size,
+      status,
+      content_length_fields,
+      fields,
     )
 
   case has_body {
@@ -1833,6 +1360,39 @@ fn send_response(
       |> resolve_frame_result(state, connection)
     }
   }
+}
+
+fn encode_head(
+  state: State,
+  stream_id: Int,
+  end_stream: Bool,
+  status: Int,
+  reserved: List(alpacki.HeaderField),
+  fields: List(alpacki.HeaderField),
+) -> #(State, bytes_tree.BytesTree) {
+  let header_fields = [
+    alpacki.HeaderField(
+      <<":status":utf8>>,
+      <<int.to_string(status):utf8>>,
+      alpacki.WithoutIndexing,
+    ),
+    alpacki.HeaderField(<<"date":utf8>>, clock.get(), alpacki.WithoutIndexing),
+    ..list.append(reserved, list.reverse(fields))
+  ]
+
+  let #(block, hpack_encoder) =
+    alpacki.encode_header_block(header_fields, state.hpack_encoder, True)
+
+  let out =
+    bytes_tree.new()
+    |> append_header_frames(
+      stream_id,
+      end_stream,
+      block,
+      state.peer_settings.max_frame_size,
+    )
+
+  #(State(..state, hpack_encoder:), out)
 }
 
 fn drop_sse_headers(
@@ -1862,51 +1422,26 @@ fn handle_write_headers(
   stream_id: Int,
   ack: process.Subject(http2.WriteAck),
   status: Int,
-  headers: List(#(String, String)),
+  response_headers: List(#(String, String)),
   mode: http2.ResponseMode,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
   case dict.get(state.streams, stream_id) {
     Error(Nil) -> Continue(state)
     Ok(entry) -> {
-      let headers = case mode {
-        http2.PlainStream | http2.WebsocketStream(..) -> headers
-        http2.EventStream -> drop_sse_headers(headers)
+      let response_headers = case mode {
+        http2.PlainStream | http2.WebsocketStream(..) -> response_headers
+        http2.EventStream -> drop_sse_headers(response_headers)
       }
-      let fields = build_response_headers(headers, state.patterns.forbidden)
-
+      let fields =
+        headers.build_response_headers(response_headers, state.patterns)
       let reserved_fields = case mode {
         http2.PlainStream | http2.WebsocketStream(..) -> []
         http2.EventStream -> sse_fields()
       }
 
-      let header_fields = [
-        alpacki.HeaderField(
-          <<":status":utf8>>,
-          <<int.to_string(status):utf8>>,
-          alpacki.WithoutIndexing,
-        ),
-        alpacki.HeaderField(
-          <<"date":utf8>>,
-          clock.get(),
-          alpacki.WithoutIndexing,
-        ),
-        ..list.append(reserved_fields, list.reverse(fields))
-      ]
-
-      let #(block, hpack_encoder) =
-        alpacki.encode_header_block(header_fields, state.hpack_encoder, True)
-
-      let state = State(..state, hpack_encoder:)
-
-      let out =
-        bytes_tree.new()
-        |> append_header_frames(
-          stream_id,
-          False,
-          block,
-          state.peer_settings.max_frame_size,
-        )
+      let #(state, out) =
+        encode_head(state, stream_id, False, status, reserved_fields, fields)
 
       case glisten.send(connection, out) {
         Ok(Nil) -> {
@@ -2042,8 +1577,10 @@ pub type FlushOutcome {
     out: bytes_tree.BytesTree,
     stream_id: Int,
     entry: Stream,
+    descriptor: connection.FileDescriptor,
+    offset: Int,
+    remaining: Int,
     chunk_size: Int,
-    end_stream: Bool,
   )
 }
 
@@ -2063,7 +1600,7 @@ pub fn do_flush_stream(
       State(..state, streams: dict.delete(state.streams, stream_id))
       |> FlushAccumulated(out, wrote)
     }
-    PendingFile(_descriptor, _offset, remaining) -> {
+    PendingFile(descriptor, offset, remaining) -> {
       let allowed =
         int.min(state.conn_send_window, entry.send_window)
         |> int.min(state.peer_settings.max_frame_size)
@@ -2072,12 +1609,24 @@ pub fn do_flush_stream(
         True -> park_stream(state, stream_id, entry, out, wrote)
         False -> {
           let chunk_size = int.min(allowed, remaining)
-          let end_stream = chunk_size == remaining
           let out =
-            frame.encode_data_header(stream_id, end_stream, chunk_size)
+            frame.encode_data_header(
+              stream_id,
+              chunk_size == remaining,
+              chunk_size,
+            )
             |> bytes_tree.append(out, _)
 
-          FlushFileChunk(state, out, stream_id, entry, chunk_size, end_stream)
+          FlushFileChunk(
+            state,
+            out,
+            stream_id,
+            entry,
+            descriptor,
+            offset,
+            remaining,
+            chunk_size,
+          )
         }
       }
     }
@@ -2234,14 +1783,23 @@ fn flush_many(
       case do_flush_stream(state, stream_id, entry, out, wrote) {
         FlushAccumulated(state, out, wrote) ->
           flush_many(state, remaining, out, wrote, connection)
-        FlushFileChunk(state, out, stream_id, entry, chunk_size, end_stream) ->
+        FlushFileChunk(
+          state,
+          out,
+          stream_id,
+          entry,
+          descriptor,
+          offset,
+          file_remaining,
+          chunk_size,
+        ) ->
           send_file_chunk(
             state,
             stream_id,
             entry,
             out,
+            File(descriptor:, offset:, remaining: file_remaining),
             chunk_size,
-            end_stream,
             remaining,
             connection,
           )
@@ -2249,17 +1807,21 @@ fn flush_many(
   }
 }
 
+type File {
+  File(descriptor: connection.FileDescriptor, offset: Int, remaining: Int)
+}
+
 fn send_file_chunk(
   state: State,
   stream_id: Int,
   entry: Stream,
   out: bytes_tree.BytesTree,
+  file: File,
   chunk_size: Int,
-  end_stream: Bool,
   rest: List(#(Int, Stream)),
   connection: glisten.Connection(connection.Message),
 ) -> FrameResult {
-  let assert PendingFile(descriptor, offset, remaining) = entry.pending
+  let File(descriptor:, offset:, remaining:) = file
 
   case glisten.send(connection, out) {
     Error(_reason) -> {
@@ -2287,7 +1849,7 @@ fn send_file_chunk(
               conn_send_window: state.conn_send_window - chunk_size,
             )
 
-          case end_stream {
+          case chunk_size == remaining {
             True -> {
               file.close(descriptor)
 
@@ -2295,17 +1857,15 @@ fn send_file_chunk(
               |> flush_many(rest, bytes_tree.new(), False, connection)
             }
             False -> {
-              let pending =
-                PendingFile(
-                  descriptor,
-                  offset + chunk_size,
-                  remaining - chunk_size,
-                )
               let entry =
                 Stream(
                   ..entry,
                   send_window: entry.send_window - chunk_size,
-                  pending:,
+                  pending: PendingFile(
+                    descriptor,
+                    offset + chunk_size,
+                    remaining - chunk_size,
+                  ),
                 )
 
               flush_many(
@@ -2574,7 +2134,7 @@ pub fn test_state() -> State {
     drain_timer: None,
     options:,
     settings_frame: build_settings_frame(options),
-    patterns: header_patterns(),
+    patterns: headers.header_patterns(),
     peer: Error(Nil),
     parent: Error(Nil),
   )

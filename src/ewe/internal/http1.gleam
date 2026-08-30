@@ -43,76 +43,11 @@ pub fn handle_message(
   state: State,
   connection: glisten.Connection(connection.Message),
 ) -> Next {
-  connection.cancel_idle_timer(state.idle_timer)
+  connection.cancel_timer(state.idle_timer)
 
   case parser.parse(state.buffer, state.options) {
-    Ok(parser.Complete(head, metadata, remaining)) -> {
-      let self = process.new_subject()
-
-      let body_connection =
-        http1.Connection(
-          transport: connection.transport,
-          socket: connection.socket,
-          self:,
-          buffer: remaining,
-          framing: metadata.framing,
-          read: 0,
-          chunk_remaining: 0,
-          options: state.options,
-          upgrade: metadata.upgrade,
-        )
-
-      let request = to_request(head, connection, body_connection)
-
-      case rescue.handler(fn() { state.handler(request) }) {
-        Error(details) -> crashed(connection, details)
-        Ok(response) -> {
-          let drained = drain_messages(self)
-          let ResolvedBody(buffer, body_keep_alive) =
-            resolve_body(body_connection, drained.body, state.options)
-          let keep_alive =
-            http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
-
-          let sent = case
-            encoder.encode_response(
-              response,
-              head.method,
-              head.version,
-              keep_alive,
-            )
-          {
-            Ok(encoded) ->
-              send_response(
-                encoded,
-                connection.transport,
-                connection.socket,
-                self,
-              )
-            Error(encoder.UnsafeHeader(name)) -> {
-              logging.log(
-                logging.Error,
-                "Handler produced an unsafe response header: " <> name,
-              )
-              file.release_body(response.body)
-
-              transport.send(
-                connection.transport,
-                connection.socket,
-                encoder.internal_server_error(),
-              )
-              |> result.replace(SentClose)
-            }
-          }
-
-          case sent {
-            Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
-            Ok(SentClose) -> Close
-            Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
-            Error(_reason) -> Close
-          }
-        }
-      }
-    }
+    Ok(parser.Complete(head, metadata, remaining)) ->
+      handle_request(state, connection, head, metadata, remaining)
     Ok(parser.Incomplete) -> {
       let idle_timer =
         connection.start_idle_timer(connection, state.options.idle_timeout)
@@ -124,35 +59,94 @@ pub fn handle_message(
         "Failed to parse HTTP/1.x request: " <> parser.error_to_string(error),
       )
 
-      let _sent =
-        transport.send(
-          connection.transport,
-          connection.socket,
-          encoder.error_response(parser.error_to_status(error)),
-        )
-
+      refuse(connection, encoder.error_response(parser.error_to_status(error)))
       Close
     }
   }
 }
 
-fn crashed(
+fn handle_request(
+  state: State,
   connection: glisten.Connection(connection.Message),
-  details: String,
+  head: parser.Head,
+  metadata: parser.Metadata,
+  remaining: BitArray,
 ) -> Next {
-  logging.log(
-    logging.Error,
-    "Caught a crash in the request handler: " <> details,
-  )
+  let self = process.new_subject()
 
-  let _sent =
-    transport.send(
-      connection.transport,
-      connection.socket,
-      encoder.internal_server_error(),
+  let body_connection =
+    http1.Connection(
+      transport: connection.transport,
+      socket: connection.socket,
+      self:,
+      buffer: remaining,
+      framing: metadata.framing,
+      read: 0,
+      chunk_remaining: 0,
+      options: state.options,
+      upgrade: metadata.upgrade,
     )
 
-  Close
+  let request = to_request(head, connection, body_connection)
+
+  case rescue.handler(fn() { state.handler(request) }) {
+    Error(details) -> {
+      logging.log(
+        logging.Error,
+        "Caught a crash in the request handler: " <> details,
+      )
+
+      refuse(connection, encoder.internal_server_error())
+      Close
+    }
+    Ok(response) -> {
+      let drained = drain_messages(self)
+      let ResolvedBody(buffer, body_keep_alive) =
+        resolve_body(body_connection, drained.body, state.options)
+      let keep_alive =
+        http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
+
+      case respond(connection, response, head, keep_alive, self) {
+        Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
+        Ok(SentClose) | Error(_reason) -> Close
+        Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
+      }
+    }
+  }
+}
+
+fn respond(
+  connection: glisten.Connection(connection.Message),
+  response: response.Response(connection.Body),
+  head: parser.Head,
+  keep_alive: http1.KeepAlive,
+  self: process.Subject(http1.Signal),
+) -> Result(Sent, socket.SocketReason) {
+  case
+    encoder.encode_response(response, head.method, head.version, keep_alive)
+  {
+    Ok(encoded) ->
+      send_response(encoded, connection.transport, connection.socket, self)
+    Error(encoder.UnsafeHeader(name)) -> {
+      logging.log(
+        logging.Error,
+        "Handler produced an unsafe response header: " <> name,
+      )
+      file.release_body(response.body)
+
+      refuse(connection, encoder.internal_server_error())
+      Ok(SentClose)
+    }
+  }
+}
+
+fn refuse(
+  connection: glisten.Connection(connection.Message),
+  response: bytes_tree.BytesTree,
+) -> Nil {
+  let _sent = transport.send(connection.transport, connection.socket, response)
+
+  Nil
 }
 
 fn await_next_request(
@@ -252,7 +246,7 @@ fn send_response(
             option.Some(http1.StreamFinished(keep_alive:)) ->
               Ok(to_sent(keep_alive))
             option.None -> {
-              let _ = encoder.end_stream(transport, socket, framing)
+              let _sent = encoder.end_stream(transport, socket, framing)
               Ok(SentClose)
             }
           }
@@ -280,7 +274,7 @@ fn send_response(
         |> connection.Http1Sse
         |> sse_handler
 
-      let _ = encoder.end_stream(transport, socket, framing)
+      let _sent = encoder.end_stream(transport, socket, framing)
 
       let drained = drain_messages(self)
       let stream_keep_alive = case drained.stream {

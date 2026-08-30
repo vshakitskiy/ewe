@@ -50,7 +50,7 @@ pub fn loop(
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {
   case state, message {
     Initialised(state, http2_options), glisten.Packet(data) -> {
-      connection.cancel_idle_timer(state.idle_timer)
+      connection.cancel_timer(state.idle_timer)
       let buffer = connection.append_buffer(state.buffer, data)
 
       case sniff_preface(buffer) {

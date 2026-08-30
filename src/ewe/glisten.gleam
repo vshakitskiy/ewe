@@ -16,8 +16,6 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
 import gleam/otp/static_supervisor as supervisor
-import gleam/otp/supervision.{type ChildSpecification}
-import gleam/result
 import gleam/string
 import logging
 
@@ -98,7 +96,7 @@ pub fn ip_address_to_string(address: IpAddress) -> String {
     IpV6(a, b, c, d, e, f, g, h) -> {
       let fields = [a, b, c, d, e, f, g, h]
       case ipv6_zeros(fields, 0, 0, 0, 0) {
-        Error(_) -> join_ipv6_fields(fields)
+        Error(Nil) -> join_ipv6_fields(fields)
         Ok(#(start, end)) ->
           join_ipv6_fields(list.take(fields, start))
           <> "::"
@@ -138,19 +136,8 @@ fn ipv6_zeros(
       }
     }
     // Continue to search for zeros
-    [_, ..xs] -> ipv6_zeros(xs, pos + 1, 0, max_start, max_len)
+    [_field, ..xs] -> ipv6_zeros(xs, pos + 1, 0, max_start, max_len)
   }
-}
-
-/// Tries to read the address of a connected client. For TCP/TLS connections
-/// this is the IPv4 or IPv6 address and port, attempting to return the most
-/// relevant one for the client. For unix socket connections this is the
-/// bound path, since unix sockets have no per-client address.
-pub fn get_connection_info(
-  conn: Connection(user_message),
-) -> Result(SocketAddress, Nil) {
-  transport.peername(conn.transport, conn.socket)
-  |> result.map(convert_sock_name)
 }
 
 /// Sends a BytesTree message over the socket using the active transport
@@ -180,9 +167,10 @@ pub fn with_selector(
   selector: Selector(user_message),
 ) -> Next(user_state, user_message) {
   case next {
-    Continue(state, _, active_state) ->
+    Continue(state, _selector, active_state) ->
       Continue(state, Some(selector), active_state)
-    stop -> stop
+    NormalStop -> NormalStop
+    AbnormalStop(reason) -> AbnormalStop(reason)
   }
 }
 
@@ -209,11 +197,12 @@ pub fn set_active_state(
       )
       next
     }
-    options.Once | options.Active | options.Count(_) ->
+    options.Once | options.Active | options.Count(_count) ->
       case next {
-        Continue(state, selector, _) ->
+        Continue(state, selector, _active_state) ->
           Continue(state, selector, Some(active_state))
-        stop -> stop
+        NormalStop -> NormalStop
+        AbnormalStop(reason) -> AbnormalStop(reason)
       }
   }
 }
@@ -224,36 +213,6 @@ pub fn stop() -> Next(user_state, user_message) {
 
 pub fn stop_abnormal(reason: String) -> Next(user_state, user_message) {
   AbnormalStop(reason)
-}
-
-@internal
-pub fn convert_next(
-  next: Next(state, user_message),
-) -> handler.Next(state, user_message) {
-  case next {
-    Continue(state, selector, active_state) ->
-      handler.Continue(state, selector, active_state)
-    NormalStop -> handler.NormalStop
-    AbnormalStop(reason) -> handler.AbnormalStop(reason)
-  }
-}
-
-@internal
-pub fn map_selector(
-  next: Next(state, user_message),
-  mapper: fn(user_message) -> other_message,
-) -> Next(state, other_message) {
-  case next {
-    Continue(state, Some(selector), active_state) ->
-      Continue(
-        state,
-        Some(process.map_selector(selector, mapper)),
-        active_state,
-      )
-    Continue(state, None, active_state) -> Continue(state, None, active_state)
-    AbnormalStop(reason) -> AbnormalStop(reason)
-    NormalStop -> NormalStop
-  }
 }
 
 /// This is the shape of the function you need to provide for the `handler`
@@ -268,7 +227,6 @@ pub opaque type Builder(state, user_message) {
     on_init: fn(Connection(user_message)) ->
       #(state, Option(Selector(user_message))),
     loop: Loop(state, user_message),
-    on_close: Option(fn(state) -> Nil),
     pool_size: Int,
     http2_support: Bool,
     ipv6_support: Bool,
@@ -309,7 +267,7 @@ fn convert_loop(
           Some(selector) ->
             handler.continue(data)
             |> handler.with_selector(map_user_selector(selector))
-          _ -> handler.continue(data)
+          None -> handler.continue(data)
         }
         case active_state {
           Some(active_state) -> handler.with_active_state(next, active_state)
@@ -360,9 +318,8 @@ pub fn new(
 ) -> Builder(state, user_message) {
   Builder(
     interface: options.Loopback,
-    on_init: on_init,
-    loop: loop,
-    on_close: None,
+    on_init:,
+    loop:,
     pool_size: 10,
     http2_support: False,
     ipv6_support: False,
@@ -373,14 +330,6 @@ pub fn new(
     connection_shutdown_timeout_ms: 5000,
     active_state: options.Once,
   )
-}
-
-/// Adds a function to the handler to be called when the connection is closed.
-pub fn with_close(
-  builder: Builder(state, user_message),
-  on_close: fn(state) -> Nil,
-) -> Builder(state, user_message) {
-  Builder(..builder, on_close: Some(on_close))
 }
 
 /// Modify the size of the acceptor pool
@@ -410,10 +359,10 @@ pub fn bind(
   interface: String,
 ) -> Builder(state, user_message) {
   let address = case interface, parse_address(charlist.from_string(interface)) {
-    "0.0.0.0", _ -> options.Any
-    "localhost", _ | "127.0.0.1", _ -> options.Loopback
-    _, Ok(address) -> options.Address(address)
-    _, Error(_nil) ->
+    "0.0.0.0", _parsed -> options.Any
+    "localhost", _parsed | "127.0.0.1", _parsed -> options.Loopback
+    _interface, Ok(address) -> options.Address(address)
+    _interface, Error(Nil) ->
       panic as "Invalid interface provided:  must be a valid IPv4/IPv6 address, or \"localhost\""
   }
   Builder(..builder, interface: address)
@@ -485,7 +434,7 @@ pub fn with_active_state(
     options.Once | options.Active ->
       Builder(..builder, active_state: active_state)
     options.Count(n) if n > 1 -> Builder(..builder, active_state: active_state)
-    options.Count(_) -> panic as "Count shall be greater than 1"
+    options.Count(_count) -> panic as "Count shall be greater than 1"
     options.Passive ->
       panic as "You cannot set the server's `ActiveState` to `Passive`"
   }
@@ -501,141 +450,101 @@ pub fn with_connection_shutdown_timeout_ms(
   Builder(..builder, connection_shutdown_timeout_ms: timeout_ms)
 }
 
-@internal
-pub fn with_listener_name(
-  builder: Builder(state, user_message),
-  listener_name: process.Name(listener.Message),
-) -> Builder(state, user_message) {
-  Builder(..builder, listener_name:)
-}
-
-@internal
-pub fn with_connection_factory_name(
-  builder: Builder(state, user_message),
-  connection_factory_name: process.Name(
-    factory.Message(socket.Socket, Subject(handler.Message(user_message))),
-  ),
-) -> Builder(state, user_message) {
-  Builder(..builder, connection_factory_name:)
-}
-
 /// Start the TCP server with the given handler on the provided port
 pub fn start(
   builder: Builder(state, user_message),
   port: Int,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  let listener_name = builder.listener_name
-  let connection_supervisor = builder.connection_factory_name
-  let options =
-    [options.Ip(builder.interface)]
-    |> list.append(case builder.ipv6_support {
-      True -> [options.Ipv6]
-      False -> []
-    })
-    |> list.append(case builder.tls_options {
-      Some(opts) -> [options.CertKeyConfig(opts)]
-      _ -> []
-    })
-    |> list.append(case builder.tls_options, builder.http2_support {
-      Some(_), True -> [options.AlpnPreferredProtocols(["h2", "http/1.1"])]
-      Some(_), False -> [options.AlpnPreferredProtocols(["http/1.1"])]
-      None, _ -> []
-    })
-    |> list.append(case builder.client_verification {
-      Some(CaCertFile(path)) -> [
-        options.Verify(options.VerifyPeer),
-        options.CaCertFile(path),
-        options.FailIfNoPeerCert(True),
-      ]
-      Some(CaCertData(certs)) -> [
-        options.Verify(options.VerifyPeer),
-        options.CaCerts(certs),
-        options.FailIfNoPeerCert(True),
-      ]
-      None -> []
-    })
-
-  let transport = case builder.tls_options {
-    Some(_) -> transport.Ssl
-    _ -> transport.Tcp
+  let ipv6 = case builder.ipv6_support {
+    True -> [options.Ipv6]
+    False -> []
   }
 
-  Pool(
-    handler: convert_loop(builder.loop),
-    name: connection_supervisor,
-    pool_count: builder.pool_size,
-    on_init: convert_on_init(builder.on_init),
-    on_close: builder.on_close,
-    transport:,
-    active_state: builder.active_state,
-    connection_shutdown_timeout_ms: builder.connection_shutdown_timeout_ms,
-  )
-  |> acceptor.start_pool(transport, port, options, listener_name)
+  [options.Ip(builder.interface), ..ipv6]
+  |> list.append(tls_options(builder))
+  |> list.append(verification_options(builder.client_verification))
+  |> listen(builder, port, _)
 }
-
-@external(erlang, "ewe_glisten_ffi", "delete_file")
-fn delete_socket_file(path: String) -> Result(Nil, dynamic.Dynamic)
 
 pub fn start_unix(
   builder: Builder(state, user_message),
   path: String,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
+  // An abstract socket has no file behind it to clear away.
   case path {
-    "@" <> _ -> Nil
-    _ -> {
-      let _ = delete_socket_file(path)
+    "@" <> _name -> Nil
+    _path -> {
+      let _deleted = delete_socket_file(path)
       Nil
     }
   }
 
-  let listener_name = builder.listener_name
-  let connection_supervisor = builder.connection_factory_name
+  [options.Ip(options.UnixPath(path)), ..tls_options(builder)]
+  |> listen(builder, 0, _)
+}
 
-  let options =
-    [options.Ip(options.UnixPath(path))]
-    |> list.append(case builder.tls_options {
-      Some(opts) -> [options.CertKeyConfig(opts)]
-      _ -> []
-    })
-    |> list.append(case builder.tls_options, builder.http2_support {
-      Some(_), True -> [options.AlpnPreferredProtocols(["h2", "http/1.1"])]
-      Some(_), False -> [options.AlpnPreferredProtocols(["http/1.1"])]
-      None, _ -> []
-    })
-
+fn listen(
+  builder: Builder(state, user_message),
+  port: Int,
+  socket_options: List(options.TcpOption),
+) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
   let transport = case builder.tls_options {
-    Some(_) -> transport.Ssl
-    _ -> transport.Tcp
+    Some(_certs) -> transport.Ssl
+    None -> transport.Tcp
   }
 
   Pool(
     handler: convert_loop(builder.loop),
-    name: connection_supervisor,
+    name: builder.connection_factory_name,
     pool_count: builder.pool_size,
     on_init: convert_on_init(builder.on_init),
-    on_close: builder.on_close,
     transport:,
     active_state: builder.active_state,
     connection_shutdown_timeout_ms: builder.connection_shutdown_timeout_ms,
   )
-  |> acceptor.start_pool(transport, 0, options, listener_name)
+  |> acceptor.start_pool(transport, port, socket_options, builder.listener_name)
 }
+
+fn tls_options(
+  builder: Builder(state, user_message),
+) -> List(options.TcpOption) {
+  case builder.tls_options {
+    None -> []
+    Some(certs) -> {
+      let protocols = case builder.http2_support {
+        True -> ["h2", "http/1.1"]
+        False -> ["http/1.1"]
+      }
+
+      [
+        options.CertKeyConfig(certs),
+        options.AlpnPreferredProtocols(protocols),
+      ]
+    }
+  }
+}
+
+fn verification_options(
+  client_verification: Option(CaCert),
+) -> List(options.TcpOption) {
+  let ca_cert = case client_verification {
+    None -> None
+    Some(CaCertFile(path)) -> Some(options.CaCertFile(path))
+    Some(CaCertData(certs)) -> Some(options.CaCerts(certs))
+  }
+
+  case ca_cert {
+    None -> []
+    Some(ca_cert) -> [
+      options.Verify(options.VerifyPeer),
+      ca_cert,
+      options.FailIfNoPeerCert(True),
+    ]
+  }
+}
+
+@external(erlang, "ewe_glisten_ffi", "delete_file")
+fn delete_socket_file(path: String) -> Result(Nil, dynamic.Dynamic)
 
 @external(erlang, "ewe_glisten_ffi", "parse_address")
 fn parse_address(value: Charlist) -> Result(ip_address, Nil)
-
-/// Helper method for building a child specification for use in a supervision
-/// tree.
-pub fn supervised(
-  handler: Builder(state, user_message),
-  port: Int,
-) -> ChildSpecification(supervisor.Supervisor) {
-  supervision.supervisor(fn() { start(handler, port) })
-}
-
-pub fn supervised_unix(
-  handler: Builder(state, user_message),
-  path: String,
-) -> ChildSpecification(supervisor.Supervisor) {
-  supervision.supervisor(fn() { start_unix(handler, path) })
-}

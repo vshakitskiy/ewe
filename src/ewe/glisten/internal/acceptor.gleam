@@ -67,54 +67,62 @@ pub fn start(
   |> actor.on_message(fn(state, msg) {
     let AcceptorState(sender, connection_factory:, ..) = state
     case msg {
-      AcceptConnection(listener) -> {
-        let res = {
-          use sock <- result.try(
-            transport.accept(state.transport, listener)
-            |> result.map_error(AcceptError),
-          )
-          case factory.start_child(connection_factory, sock) {
-            Ok(start) -> {
-              transport.controlling_process(state.transport, sock, start.pid)
-              |> result.map_error(ControlError)
-              |> result.map(fn(_) { process.send(start.data, Internal(Ready)) })
-            }
-            Error(reason) -> {
-              Error(HandlerError(reason))
-            }
-          }
-        }
-        case res {
-          Error(reason) -> {
-            let msg = case reason {
-              AcceptError(reason) ->
-                "acceptor failed: " <> socket.reason_to_string(reason)
-              HandlerError(actor.InitTimeout) -> "init timed out"
-              HandlerError(actor.InitFailed(reason)) ->
-                "init failed: " <> reason
-              HandlerError(actor.InitExited(process.Normal)) ->
-                "init exited normally"
-              HandlerError(actor.InitExited(process.Killed)) -> "init killed"
-              HandlerError(actor.InitExited(process.Abnormal(..))) ->
-                "init exited abnormally"
-              ControlError(reason) ->
-                "could not control socket: " <> atom.to_string(reason)
-            }
-            logging.log(
-              logging.Error,
-              "Failed to accept/start handler: " <> msg,
-            )
-            actor.stop_abnormal("Failed to accept/start handler")
-          }
-          _val -> {
+      AcceptConnection(listener) ->
+        case hand_off(state, connection_factory, listener) {
+          Ok(Nil) -> {
             actor.send(sender, AcceptConnection(listener))
             actor.continue(state)
           }
+          Error(reason) -> {
+            logging.log(
+              logging.Error,
+              "Failed to accept/start handler: " <> error_to_string(reason),
+            )
+            actor.stop_abnormal("Failed to accept/start handler")
+          }
         }
-      }
     }
   })
   |> actor.start
+}
+
+fn hand_off(
+  state: AcceptorState(user_message),
+  connection_factory: factory.Supervisor(
+    Socket,
+    Subject(handler.Message(user_message)),
+  ),
+  listener: ListenSocket,
+) -> Result(Nil, AcceptorError) {
+  use sock <- result.try(
+    transport.accept(state.transport, listener)
+    |> result.map_error(AcceptError),
+  )
+  use started <- result.try(
+    factory.start_child(connection_factory, sock)
+    |> result.map_error(HandlerError),
+  )
+  use Nil <- result.map(
+    transport.controlling_process(state.transport, sock, started.pid)
+    |> result.map_error(ControlError),
+  )
+
+  process.send(started.data, Internal(Ready))
+}
+
+fn error_to_string(error: AcceptorError) -> String {
+  case error {
+    AcceptError(reason) ->
+      "acceptor failed: " <> socket.reason_to_string(reason)
+    HandlerError(actor.InitTimeout) -> "init timed out"
+    HandlerError(actor.InitFailed(reason)) -> "init failed: " <> reason
+    HandlerError(actor.InitExited(process.Normal)) -> "init exited normally"
+    HandlerError(actor.InitExited(process.Killed)) -> "init killed"
+    HandlerError(actor.InitExited(process.Abnormal(..))) ->
+      "init exited abnormally"
+    ControlError(reason) ->
+      "could not control socket: " <> atom.to_string(reason)
+  }
 }
 
 pub type Pool(data, user_message) {
@@ -126,7 +134,6 @@ pub type Pool(data, user_message) {
     ),
     on_init: fn(Connection(user_message)) ->
       #(data, Option(Selector(user_message))),
-    on_close: Option(fn(data) -> Nil),
     connection_shutdown_timeout_ms: Int,
     transport: Transport,
     active_state: options.ActiveState,
@@ -167,7 +174,6 @@ pub fn start_pool(
         socket:,
         loop: pool.handler,
         on_init: pool.on_init,
-        on_close: pool.on_close,
         transport: pool.transport,
         active_state: pool.active_state,
       ))

@@ -96,7 +96,7 @@ pub fn start_idle_timer(
   |> option.Some
 }
 
-pub fn cancel_idle_timer(timer: option.Option(process.Timer)) -> Nil {
+pub fn cancel_timer(timer: option.Option(process.Timer)) -> Nil {
   case timer {
     option.Some(timer) -> {
       let _cancelled = process.cancel_timer(timer)

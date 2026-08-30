@@ -15,12 +15,6 @@ fn do_listen(
 ) -> Result(ListenSocket, SocketReason)
 
 @external(erlang, "ssl", "transport_accept")
-pub fn accept_timeout(
-  socket: ListenSocket,
-  timeout: Int,
-) -> Result(Socket, SocketReason)
-
-@external(erlang, "ssl", "transport_accept")
 pub fn accept(socket: ListenSocket) -> Result(Socket, SocketReason)
 
 @external(erlang, "ssl", "recv")
@@ -30,21 +24,11 @@ pub fn receive_timeout(
   timeout: Int,
 ) -> Result(BitArray, SocketReason)
 
-@external(erlang, "ssl", "recv")
-pub fn receive(socket: Socket, length: Int) -> Result(BitArray, SocketReason)
-
 @external(erlang, "ewe_glisten_ssl_ffi", "send")
 pub fn send(socket: Socket, packet: BytesTree) -> Result(Nil, SocketReason)
 
 @external(erlang, "ewe_glisten_ssl_ffi", "close")
 pub fn close(socket: Socket) -> Result(Nil, SocketReason)
-
-@external(erlang, "ewe_glisten_ssl_ffi", "shutdown")
-pub fn do_shutdown(socket: Socket, write: Atom) -> Result(Nil, SocketReason)
-
-pub fn shutdown(socket: Socket) -> Result(Nil, SocketReason) {
-  do_shutdown(socket, atom.create("write"))
-}
 
 @external(erlang, "ewe_glisten_ssl_ffi", "set_opts")
 fn do_set_opts(
@@ -75,9 +59,6 @@ pub fn listen(
   |> options.to_erl_options
   |> do_listen(port, _)
 }
-
-@external(erlang, "ewe_glisten_ssl_ffi", "negotiated_protocol")
-pub fn negotiated_protocol(socket: Socket) -> Result(String, String)
 
 @external(erlang, "ewe_glisten_ssl_ffi", "peername")
 pub fn peername(socket: Socket) -> Result(socket.SockName, SocketReason)

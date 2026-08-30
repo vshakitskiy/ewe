@@ -9,6 +9,14 @@ import gleam/option
 import gleam/result
 import logging
 
+type Handlers(user_state, user_message) {
+  Handlers(
+    step: fn(connection.SseConnection, user_state, user_message) ->
+      connection.Step(user_state, user_message),
+    on_close: fn(connection.SseConnection, user_state) -> Nil,
+  )
+}
+
 pub fn run(
   conn: http2.SseConnection(connection.Body),
   on_init: fn(connection.SseConnection, process.Selector(user_message)) ->
@@ -17,67 +25,62 @@ pub fn run(
     connection.Step(user_state, user_message),
   on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
+  let handlers = Handlers(step:, on_close:)
   let handle = connection.Http2Sse(conn)
   let #(state, messages) = on_init(handle, process.new_selector())
 
-  loop(conn, handle, merge_exit_selector(messages), state, step, on_close)
+  loop(conn, handle, handlers, exit_selector(messages), state)
 }
 
 fn loop(
   conn: http2.SseConnection(connection.Body),
   handle: connection.SseConnection,
+  handlers: Handlers(user_state, user_message),
   selector: process.Selector(Received(user_message)),
   state: user_state,
-  step: fn(connection.SseConnection, user_state, user_message) ->
-    connection.Step(user_state, user_message),
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
-    Interrupted -> ended(handle, state, on_close, connection.Stopped)
+    Interrupted -> ended(handle, handlers, state, connection.Stopped)
     Message(message) ->
-      case rescue.handler(fn() { step(handle, state, message) }) {
-        Error(details) -> crashed(handle, state, on_close, details)
+      case rescue.handler(fn() { handlers.step(handle, state, message) }) {
+        Error(details) -> crashed(handle, handlers, state, details)
         Ok(connection.Proceed(user_state: state, messages:)) -> {
           let selector = case messages {
-            option.Some(messages) -> merge_exit_selector(messages)
+            option.Some(messages) -> exit_selector(messages)
             option.None -> selector
           }
 
-          loop(conn, handle, selector, state, step, on_close)
+          loop(conn, handle, handlers, selector, state)
         }
-        Ok(connection.Halt(outcome)) -> {
-          let outcome = ended(handle, state, on_close, outcome)
-
-          case outcome {
+        Ok(connection.Halt(outcome)) ->
+          case ended(handle, handlers, state, outcome) {
             connection.Stopped -> {
               let _sent = stream.finish_response(conn.writer)
-              Nil
+              connection.Stopped
             }
-            connection.StoppedAbnormal(_reason) -> Nil
+            connection.StoppedAbnormal(reason) ->
+              connection.StoppedAbnormal(reason)
           }
-
-          outcome
-        }
       }
   }
 }
 
 fn ended(
   handle: connection.SseConnection,
+  handlers: Handlers(user_state, user_message),
   state: user_state,
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
   outcome: connection.Outcome,
 ) -> connection.Outcome {
   rescue.logged("server-sent events close handler", fn() {
-    on_close(handle, state)
+    handlers.on_close(handle, state)
   })
   outcome
 }
 
 fn crashed(
   handle: connection.SseConnection,
+  handlers: Handlers(user_state, user_message),
   state: user_state,
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
   details: String,
 ) -> connection.Outcome {
   logging.log(
@@ -86,7 +89,7 @@ fn crashed(
   )
 
   connection.StoppedAbnormal("the handler crashed")
-  |> ended(handle, state, on_close, _)
+  |> ended(handle, handlers, state, _)
 }
 
 type Received(user_message) {
@@ -94,15 +97,10 @@ type Received(user_message) {
   Interrupted
 }
 
-fn merge_exit_selector(
+fn exit_selector(
   messages: process.Selector(user_message),
 ) -> process.Selector(Received(user_message)) {
   process.map_selector(messages, Message)
-  |> process.merge_selector(exit_selector())
-}
-
-fn exit_selector() -> process.Selector(Received(user_message)) {
-  process.new_selector()
   |> process.select_trapped_exits(fn(_exit) { Interrupted })
 }
 

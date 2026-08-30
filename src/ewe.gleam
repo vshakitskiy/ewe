@@ -1197,25 +1197,27 @@ pub fn read_body(
   req: request.Request(Connection),
   limit limit: Int,
 ) -> Result(request.Request(BitArray), BodyError) {
-  case req.body {
-    connection.Http1(connection) -> {
-      use #(body, trailers) <- result.try(
-        http1_body.read_body(connection, limit)
-        |> result.map_error(from_internal_http1_body_error),
-      )
+  let read = case req.body {
+    connection.Http1(connection) ->
+      http1_body.read_body(connection, limit)
+      |> result.map_error(from_internal_http1_body_error)
+    connection.Http2(connection) ->
+      http2_body.read_body(connection, limit)
+      |> result.map_error(from_internal_http2_body_error)
+  }
 
-      request.Request(..req, headers: list.append(req.headers, trailers), body:)
-      |> Ok
-    }
-    connection.Http2(connection) -> {
-      use #(body, trailers) <- result.try(
-        http2_body.read_body(connection, limit)
-        |> result.map_error(from_internal_http2_body_error),
-      )
+  use #(body, trailers) <- result.map(read)
 
-      request.Request(..req, headers: list.append(req.headers, trailers), body:)
-      |> Ok
-    }
+  request.Request(..req, headers: with_trailers(req, trailers), body:)
+}
+
+fn with_trailers(
+  req: request.Request(a),
+  trailers: List(#(String, String)),
+) -> List(#(String, String)) {
+  case trailers {
+    [] -> req.headers
+    _trailers -> list.append(req.headers, trailers)
   }
 }
 
@@ -1264,33 +1266,36 @@ pub fn read_body_chunk(
   let max_chunk_bytes = int.max(max_chunk_bytes, 1)
 
   case req.body {
-    connection.Http1(connection) -> {
+    connection.Http1(connection) ->
       case http1_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
-        Ok(http1_body.Chunk(data, connection)) -> {
-          let body = connection.Http1(connection)
-          Ok(Chunk(data, request.set_body(req, body)))
-        }
-        Ok(http1_body.Done(trailers)) -> {
-          let headers = list.append(req.headers, trailers)
-          Ok(Done(request.Request(..req, headers:, body: Nil)))
-        }
+        Ok(http1_body.Chunk(data, connection)) ->
+          Ok(chunk_read(req, data, connection.Http1(connection)))
+        Ok(http1_body.Done(trailers)) -> Ok(done_read(req, trailers))
         Error(error) -> Error(from_internal_http1_body_error(error))
       }
-    }
-    connection.Http2(connection) -> {
+    connection.Http2(connection) ->
       case http2_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
-        Ok(http2_body.Chunk(data, connection)) -> {
-          let body = connection.Http2(connection)
-          Ok(Chunk(data, request.set_body(req, body)))
-        }
-        Ok(http2_body.Done(trailers)) -> {
-          let headers = list.append(req.headers, trailers)
-          Ok(Done(request.Request(..req, headers:, body: Nil)))
-        }
+        Ok(http2_body.Chunk(data, connection)) ->
+          Ok(chunk_read(req, data, connection.Http2(connection)))
+        Ok(http2_body.Done(trailers)) -> Ok(done_read(req, trailers))
         Error(error) -> Error(from_internal_http2_body_error(error))
       }
-    }
   }
+}
+
+fn chunk_read(
+  req: request.Request(Connection),
+  data: BitArray,
+  body: Connection,
+) -> ReadEvent {
+  Chunk(data, request.set_body(req, body))
+}
+
+fn done_read(
+  req: request.Request(Connection),
+  trailers: List(#(String, String)),
+) -> ReadEvent {
+  Done(request.Request(..req, headers: with_trailers(req, trailers), body: Nil))
 }
 
 /// The reason a write to the client did not go through.

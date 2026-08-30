@@ -2,6 +2,7 @@ import alpacki
 import ewe/internal/http2 as connection
 import ewe/internal/http2/connection as http2
 import ewe/internal/http2/frame
+import ewe/internal/http2/headers
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
@@ -282,11 +283,11 @@ pub fn build_request_minimal_valid_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  let assert Ok(connection.DecodedRequest(
+  let assert Ok(headers.DecodedRequest(
     request:,
     content_length: None,
     protocol: None,
-  )) = connection.build_request(headers, Nil, connection.header_patterns())
+  )) = headers.build_request(headers, Nil, headers.header_patterns())
   assert request.method == http.Get
   assert request.scheme == http.Https
   assert request.host == "example.com"
@@ -304,11 +305,11 @@ pub fn build_request_with_query_and_port_test() {
     #(<<":path":utf8>>, <<"/search?q=1":utf8>>),
     #(<<"x-custom":utf8>>, <<"value":utf8>>),
   ]
-  let assert Ok(connection.DecodedRequest(
+  let assert Ok(headers.DecodedRequest(
     request:,
     content_length: None,
     protocol: None,
-  )) = connection.build_request(headers, Nil, connection.header_patterns())
+  )) = headers.build_request(headers, Nil, headers.header_patterns())
   assert request.method == http.Post
   assert request.host == "example.com"
   assert request.port == Some(8080)
@@ -319,8 +320,8 @@ pub fn build_request_with_query_and_port_test() {
 
 pub fn build_request_missing_pseudo_header_test() {
   let headers = [#(<<":method":utf8>>, <<"GET":utf8>>)]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.MissingPseudoHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.MissingPseudoHeader)
 }
 
 pub fn build_request_duplicate_pseudo_header_test() {
@@ -331,8 +332,8 @@ pub fn build_request_duplicate_pseudo_header_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.DuplicatePseudoHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.DuplicatePseudoHeader)
 }
 
 pub fn build_request_pseudo_after_regular_test() {
@@ -343,8 +344,8 @@ pub fn build_request_pseudo_after_regular_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.PseudoHeaderAfterRegular)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.PseudoHeaderAfterRegular)
 }
 
 pub fn build_request_unknown_pseudo_header_test() {
@@ -355,8 +356,8 @@ pub fn build_request_unknown_pseudo_header_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.UnknownPseudoHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.UnknownPseudoHeader)
 }
 
 pub fn build_request_invalid_scheme_test() {
@@ -366,8 +367,8 @@ pub fn build_request_invalid_scheme_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.InvalidScheme)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.InvalidScheme)
 }
 
 pub fn build_request_invalid_authority_port_test() {
@@ -377,8 +378,8 @@ pub fn build_request_invalid_authority_port_test() {
     #(<<":authority":utf8>>, <<"example.com:abc":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.InvalidAuthority)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.InvalidAuthority)
 }
 
 pub fn build_request_empty_path_test() {
@@ -388,8 +389,8 @@ pub fn build_request_empty_path_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.InvalidPath)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.InvalidPath)
 }
 
 pub fn build_request_empty_header_name_test() {
@@ -400,8 +401,8 @@ pub fn build_request_empty_header_name_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<>>, <<"value":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.EmptyHeaderName)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.EmptyHeaderName)
 }
 
 pub fn build_request_uppercase_header_name_test() {
@@ -412,8 +413,8 @@ pub fn build_request_uppercase_header_name_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"X-Custom":utf8>>, <<"value":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.UppercaseHeaderName)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.UppercaseHeaderName)
 }
 
 pub fn build_request_connection_specific_header_test() {
@@ -424,8 +425,8 @@ pub fn build_request_connection_specific_header_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"connection":utf8>>, <<"keep-alive":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.ConnectionSpecificHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.ConnectionSpecificHeader)
 }
 
 pub fn build_request_te_trailers_allowed_test() {
@@ -436,11 +437,11 @@ pub fn build_request_te_trailers_allowed_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"te":utf8>>, <<"trailers":utf8>>),
   ]
-  let assert Ok(connection.DecodedRequest(
+  let assert Ok(headers.DecodedRequest(
     request:,
     content_length: None,
     protocol: None,
-  )) = connection.build_request(headers, Nil, connection.header_patterns())
+  )) = headers.build_request(headers, Nil, headers.header_patterns())
   assert request.headers == [#("te", "trailers")]
 }
 
@@ -452,8 +453,8 @@ pub fn build_request_te_non_trailers_rejected_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"te":utf8>>, <<"gzip":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.ConnectionSpecificHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.ConnectionSpecificHeader)
 }
 
 pub fn build_request_invalid_utf8_header_value_test() {
@@ -464,8 +465,8 @@ pub fn build_request_invalid_utf8_header_value_test() {
     #(<<":path":utf8>>, <<"/":utf8>>),
     #(<<"x-custom":utf8>>, <<0xff, 0xfe>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.InvalidUtf8)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.InvalidUtf8)
 }
 
 pub fn build_request_invalid_method_test() {
@@ -475,8 +476,8 @@ pub fn build_request_invalid_method_test() {
     #(<<":authority":utf8>>, <<"example.com":utf8>>),
     #(<<":path":utf8>>, <<"/":utf8>>),
   ]
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.InvalidMethod)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.InvalidMethod)
 }
 
 pub fn complete_header_block_updates_dynamic_table_test() {
@@ -1366,15 +1367,15 @@ fn extended_connect_state(websocket: Bool) -> connection.State {
 }
 
 pub fn extended_connect_carries_its_protocol_test() {
-  let assert Ok(connection.DecodedRequest(
+  let assert Ok(headers.DecodedRequest(
     request:,
     content_length: None,
     protocol: Some("websocket"),
   )) =
-    connection.build_request(
+    headers.build_request(
       connect_pseudo_headers(),
       Nil,
-      connection.header_patterns(),
+      headers.header_patterns(),
     )
 
   assert request.method == http.Connect
@@ -1390,8 +1391,8 @@ pub fn protocol_without_connect_is_rejected_test() {
     #(<<":protocol":utf8>>, <<"websocket":utf8>>),
   ]
 
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.ProtocolWithoutConnect)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.ProtocolWithoutConnect)
 }
 
 pub fn protocol_with_content_length_is_rejected_test() {
@@ -1400,8 +1401,8 @@ pub fn protocol_with_content_length_is_rejected_test() {
       #(<<"content-length":utf8>>, <<"5":utf8>>),
     ])
 
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.ProtocolWithContentLength)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.ProtocolWithContentLength)
 }
 
 pub fn duplicate_protocol_is_rejected_test() {
@@ -1410,8 +1411,8 @@ pub fn duplicate_protocol_is_rejected_test() {
       #(<<":protocol":utf8>>, <<"websocket":utf8>>),
     ])
 
-  assert connection.build_request(headers, Nil, connection.header_patterns())
-    == Error(connection.DuplicatePseudoHeader)
+  assert headers.build_request(headers, Nil, headers.header_patterns())
+    == Error(headers.DuplicatePseudoHeader)
 }
 
 pub fn extended_connect_is_refused_when_websockets_are_off_test() {

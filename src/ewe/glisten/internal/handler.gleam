@@ -6,7 +6,6 @@ import gleam/erlang/atom
 import gleam/erlang/process.{type Selector, type Subject}
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import gleam/result
 import gleam/string
 import logging
 
@@ -34,12 +33,8 @@ pub type LoopMessage(user_message) {
   Custom(user_message)
 }
 
-pub type ClientIp =
-  Result(socket.SockName, Nil)
-
 pub type LoopState(state, user_message) {
   LoopState(
-    client_ip: ClientIp,
     socket: Socket,
     sender: Subject(Message(user_message)),
     transport: Transport,
@@ -50,7 +45,6 @@ pub type LoopState(state, user_message) {
 
 pub type Connection(user_message) {
   Connection(
-    client_ip: ClientIp,
     socket: Socket,
     transport: Transport,
     sender: Subject(Message(user_message)),
@@ -76,9 +70,10 @@ pub fn with_selector(
   selector: Selector(user_message),
 ) -> Next(user_state, user_message) {
   case next {
-    Continue(state, _, active_state) ->
+    Continue(state, _selector, active_state) ->
       Continue(state, Some(selector), active_state)
-    stop -> stop
+    NormalStop -> NormalStop
+    AbnormalStop(reason) -> AbnormalStop(reason)
   }
 }
 
@@ -87,9 +82,10 @@ pub fn with_active_state(
   active_state: ActiveState,
 ) -> Next(user_state, user_message) {
   case next {
-    Continue(state, selector, _) ->
+    Continue(state, selector, _active_state) ->
       Continue(state, selector, Some(active_state))
-    stop -> stop
+    NormalStop -> NormalStop
+    AbnormalStop(reason) -> AbnormalStop(reason)
   }
 }
 
@@ -107,39 +103,24 @@ fn apply_next(
   packet_consumed: Bool,
 ) -> actor.Next(LoopState(state, user_message), Message(user_message)) {
   case res {
-    Ok(Continue(next_state, selector, Some(new_active_state))) ->
-      case
-        transport.set_opts(state.transport, state.socket, [
-          options.ActiveMode(new_active_state),
-        ])
-      {
-        Ok(Nil) ->
-          actor.continue(
-            LoopState(
-              ..state,
-              state: next_state,
-              active_state: new_active_state,
-            ),
-          )
-          |> apply_selector(state.sender, selector)
-        Error(_) -> actor.stop()
+    Ok(Continue(next_state, selector, active_state)) -> {
+      let state = LoopState(..state, state: next_state)
+
+      case to_arm(state.active_state, active_state, packet_consumed) {
+        None -> actor.continue(state) |> apply_selector(state.sender, selector)
+        Some(active_state) ->
+          case
+            transport.set_opts(state.transport, state.socket, [
+              options.ActiveMode(active_state),
+            ])
+          {
+            Ok(Nil) ->
+              actor.continue(LoopState(..state, active_state:))
+              |> apply_selector(state.sender, selector)
+            Error(_reason) -> actor.stop()
+          }
       }
-    Ok(Continue(next_state, selector, None))
-      if packet_consumed && state.active_state == options.Once
-    ->
-      case
-        transport.set_opts(state.transport, state.socket, [
-          options.ActiveMode(options.Once),
-        ])
-      {
-        Ok(Nil) ->
-          actor.continue(LoopState(..state, state: next_state))
-          |> apply_selector(state.sender, selector)
-        Error(_) -> actor.stop()
-      }
-    Ok(Continue(next_state, selector, None)) ->
-      actor.continue(LoopState(..state, state: next_state))
-      |> apply_selector(state.sender, selector)
+    }
     Ok(NormalStop) -> actor.stop()
     Ok(AbnormalStop(reason)) -> actor.stop_abnormal(reason)
     Error(reason) -> {
@@ -149,6 +130,20 @@ fn apply_next(
       )
       actor.continue(state)
     }
+  }
+}
+
+// A socket left in `Once` goes passive again after every packet, so it has to
+// be re-armed once one has been consumed.
+fn to_arm(
+  current: ActiveState,
+  requested: Option(ActiveState),
+  packet_consumed: Bool,
+) -> Option(ActiveState) {
+  case requested, current, packet_consumed {
+    Some(requested), _current, _packet_consumed -> Some(requested)
+    None, options.Once, True -> Some(options.Once)
+    None, _current, _packet_consumed -> None
   }
 }
 
@@ -177,30 +172,39 @@ fn apply_selector(
   }
 }
 
-// The intenral selector that contains socket events mapped to `Internal` plus 
+// The internal selector that contains socket events mapped to `Internal` plus
 // the connection's own subject.
 fn internal_selector(
   sender: Subject(Message(user_message)),
 ) -> Selector(Message(user_message)) {
   process.new_selector()
-  |> process.select_record(atom.create("tcp"), 2, fn(record) {
-    ReceiveMessage(socket_data(record))
-  })
-  |> process.select_record(atom.create("ssl"), 2, fn(record) {
-    ReceiveMessage(socket_data(record))
-  })
-  |> process.select_record(atom.create("ssl_closed"), 1, fn(_nil) { Closed })
-  |> process.select_record(atom.create("tcp_closed"), 1, fn(_nil) { Closed })
-  |> process.select_record(atom.create("ssl_passive"), 1, fn(_nil) { Passive })
-  |> process.select_record(atom.create("tcp_passive"), 1, fn(_nil) { Passive })
-  |> process.select_record(atom.create("tcp_error"), 2, fn(record) {
-    SocketError(socket_error(record))
-  })
-  |> process.select_record(atom.create("ssl_error"), 2, fn(record) {
-    SocketError(socket_error(record))
-  })
+  |> process.select_record(atom.create("tcp"), 2, data)
+  |> process.select_record(atom.create("ssl"), 2, data)
+  |> process.select_record(atom.create("tcp_closed"), 1, closed)
+  |> process.select_record(atom.create("ssl_closed"), 1, closed)
+  |> process.select_record(atom.create("tcp_passive"), 1, passive)
+  |> process.select_record(atom.create("ssl_passive"), 1, passive)
+  |> process.select_record(atom.create("tcp_error"), 2, error)
+  |> process.select_record(atom.create("ssl_error"), 2, error)
   |> process.map_selector(Internal)
   |> process.merge_selector(process.new_selector() |> process.select(sender))
+}
+
+fn data(record: dynamic.Dynamic) -> InternalMessage {
+  ReceiveMessage(socket_data(record))
+}
+
+fn closed(_record: dynamic.Dynamic) -> InternalMessage {
+  Closed
+}
+
+fn passive(_record: dynamic.Dynamic) -> InternalMessage {
+  Passive
+}
+
+fn error(record: dynamic.Dynamic) -> InternalMessage {
+  socket_error(record)
+  |> SocketError
 }
 
 pub type Loop(state, user_message) =
@@ -213,7 +217,6 @@ pub type Handler(state, user_message) {
     loop: Loop(state, user_message),
     on_init: fn(Connection(user_message)) ->
       #(state, Option(Selector(user_message))),
-    on_close: Option(fn(state) -> Nil),
     transport: Transport,
     active_state: ActiveState,
   )
@@ -224,51 +227,22 @@ pub fn start(
   handler: Handler(state, user_message),
 ) -> Result(actor.Started(Subject(Message(user_message))), actor.StartError) {
   actor.new_with_initialiser(1000, fn(subject) {
-    let client_ip =
-      transport.peername(handler.transport, handler.socket)
-      |> result.replace_error(Nil)
     let connection =
       Connection(
         socket: handler.socket,
-        client_ip: client_ip,
         transport: handler.transport,
         sender: subject,
       )
     let #(initial_state, user_selector) = handler.on_init(connection)
-    let base_selector = process.new_selector() |> process.select(subject)
-    let selector =
-      process.new_selector()
-      |> process.select_record(atom.create("tcp"), 2, fn(record) {
-        ReceiveMessage(socket_data(record))
-      })
-      |> process.select_record(atom.create("ssl"), 2, fn(record) {
-        ReceiveMessage(socket_data(record))
-      })
-      |> process.select_record(atom.create("ssl_closed"), 1, fn(_nil) { Closed })
-      |> process.select_record(atom.create("tcp_closed"), 1, fn(_nil) { Closed })
-      |> process.select_record(atom.create("ssl_passive"), 1, fn(_nil) {
-        Passive
-      })
-      |> process.select_record(atom.create("tcp_passive"), 1, fn(_nil) {
-        Passive
-      })
-      |> process.select_record(atom.create("tcp_error"), 2, fn(record) {
-        SocketError(socket_error(record))
-      })
-      |> process.select_record(atom.create("ssl_error"), 2, fn(record) {
-        SocketError(socket_error(record))
-      })
-      |> process.map_selector(Internal)
-      |> process.merge_selector(base_selector)
+
     let selector = case user_selector {
-      Some(sel) ->
-        sel
-        |> process.map_selector(User)
-        |> process.merge_selector(selector, _)
-      _ -> selector
+      Some(user_selector) ->
+        process.map_selector(user_selector, User)
+        |> process.merge_selector(internal_selector(subject), _)
+      None -> internal_selector(subject)
     }
+
     LoopState(
-      client_ip: client_ip,
       socket: handler.socket,
       sender: subject,
       transport: handler.transport,
@@ -284,61 +258,41 @@ pub fn start(
     let connection =
       Connection(
         socket: state.socket,
-        client_ip: state.client_ip,
         transport: state.transport,
         sender: state.sender,
       )
     case msg {
       Internal(Closed) | Internal(Close) ->
         case transport.close(state.transport, state.socket) {
-          Ok(Nil) -> {
-            let _ = case handler.on_close {
-              Some(on_close) -> on_close(state.state)
-              _ -> Nil
-            }
-            actor.stop()
-          }
-          Error(err) -> actor.stop_abnormal(socket.reason_to_string(err))
+          Ok(Nil) -> actor.stop()
+          Error(reason) -> actor.stop_abnormal(socket.reason_to_string(reason))
         }
       Internal(Ready) ->
         case transport.handshake(state.transport, state.socket) {
-          Error(_) -> actor.stop_abnormal("Failed to handshake socket")
+          Error(Nil) -> actor.stop_abnormal("Failed to handshake socket")
           Ok(_socket) -> {
             case transport.set_buffer_size(state.transport, state.socket) {
-              Ok(_) -> Nil
-              Error(_nil) -> {
+              Ok(Nil) -> Nil
+              Error(Nil) ->
                 logging.log(logging.Warning, "Failed to read `recbuf` size")
-              }
             }
             // Note that the active_state must set to Passive at start of
             // Listener/Accept and not changed until the Ready message is
             // received.
-            let options = [options.ActiveMode(state.active_state)]
-            case transport.set_opts(state.transport, state.socket, options) {
-              Ok(_) -> actor.continue(state)
-              Error(_) -> actor.stop_abnormal("Failed to set socket active")
-            }
+            arm_socket(state)
           }
         }
-      User(msg) -> {
-        let msg = Custom(msg)
-        let res = rescue(fn() { handler.loop(state.state, msg, connection) })
-        apply_next(state, res, False)
+      User(message) -> {
+        let next =
+          rescue(fn() { handler.loop(state.state, Custom(message), connection) })
+        apply_next(state, next, False)
       }
-      Internal(ReceiveMessage(msg)) -> {
-        let msg = Packet(msg)
-        let res = rescue(fn() { handler.loop(state.state, msg, connection) })
-        apply_next(state, res, True)
+      Internal(ReceiveMessage(packet)) -> {
+        let next =
+          rescue(fn() { handler.loop(state.state, Packet(packet), connection) })
+        apply_next(state, next, True)
       }
-      Internal(Passive) -> {
-        let options = [
-          options.ActiveMode(state.active_state),
-        ]
-        case transport.set_opts(state.transport, state.socket, options) {
-          Ok(_) -> actor.continue(state)
-          Error(_) -> actor.stop_abnormal("Failed to set socket active")
-        }
-      }
+      Internal(Passive) -> arm_socket(state)
       Internal(SocketError(reason)) ->
         actor.stop_abnormal(
           "Received socket error " <> socket.reason_to_string(reason),
@@ -346,6 +300,19 @@ pub fn start(
     }
   })
   |> actor.start()
+}
+
+fn arm_socket(
+  state: LoopState(state, user_message),
+) -> actor.Next(LoopState(state, user_message), Message(user_message)) {
+  case
+    transport.set_opts(state.transport, state.socket, [
+      options.ActiveMode(state.active_state),
+    ])
+  {
+    Ok(Nil) -> actor.continue(state)
+    Error(_reason) -> actor.stop_abnormal("Failed to set socket active")
+  }
 }
 
 @external(erlang, "ewe_glisten_ffi", "socket_data")

@@ -1,10 +1,6 @@
-import gleam/bit_array
 import gleam/erlang/process
-import gleam/int
 import gleam/otp/actor
 import gleam/result
-import gleam/string
-import gleam/string_tree
 
 type Message {
   Tick
@@ -15,23 +11,14 @@ const tick_ms = 1000
 pub fn start(_type: a, _args: b) -> Result(process.Pid, actor.StartError) {
   use actor.Started(pid:, ..) <- result.map(
     actor.new_with_initialiser(tick_ms, fn(subject) {
-      now()
-      |> format_date
-      |> set_date
-
-      process.send_after(subject, tick_ms, Tick)
+      tick(subject)
 
       actor.initialised(subject)
       |> actor.returning(subject)
       |> Ok
     })
     |> actor.on_message(fn(subject, _tick) {
-      process.send_after(subject, tick_ms, Tick)
-
-      now()
-      |> format_date
-      |> set_date
-
+      tick(subject)
       actor.continue(subject)
     })
     |> actor.start(),
@@ -44,32 +31,51 @@ pub fn stop(_state: a) -> Nil {
   Nil
 }
 
+fn tick(subject: process.Subject(Message)) -> Nil {
+  set_date(format_date(now()))
+  process.send_after(subject, tick_ms, Tick)
+
+  Nil
+}
+
 pub fn get() -> BitArray {
   case get_date() {
     Ok(date) -> date
-    Error(Nil) -> now() |> format_date
+    Error(Nil) -> format_date(now())
   }
 }
 
 fn format_date(time: #(Int, #(Int, Int, Int), #(Int, Int, Int))) -> BitArray {
   let #(weekday, #(year, month, day), #(hour, minute, second)) = time
-  string_tree.new()
-  |> string_tree.append(weekday_to_string(weekday))
-  |> string_tree.append(", ")
-  |> string_tree.append(int.to_string(day) |> string.pad_start(2, "0"))
-  |> string_tree.append(" ")
-  |> string_tree.append(month_to_string(month))
-  |> string_tree.append(" ")
-  |> string_tree.append(int.to_string(year) |> string.pad_start(4, "0"))
-  |> string_tree.append(" ")
-  |> string_tree.append(int.to_string(hour) |> string.pad_start(2, "0"))
-  |> string_tree.append(":")
-  |> string_tree.append(int.to_string(minute) |> string.pad_start(2, "0"))
-  |> string_tree.append(":")
-  |> string_tree.append(int.to_string(second) |> string.pad_start(2, "0"))
-  |> string_tree.append(" GMT")
-  |> string_tree.to_string
-  |> bit_array.from_string
+
+  <<
+    weekday_to_string(weekday):utf8,
+    ", ":utf8,
+    two_digits(day):bits,
+    " ":utf8,
+    month_to_string(month):utf8,
+    " ":utf8,
+    four_digits(year):bits,
+    " ":utf8,
+    two_digits(hour):bits,
+    ":":utf8,
+    two_digits(minute):bits,
+    ":":utf8,
+    two_digits(second):bits,
+    " GMT":utf8,
+  >>
+}
+
+fn two_digits(value: Int) -> BitArray {
+  <<digit(value / 10), digit(value)>>
+}
+
+fn four_digits(value: Int) -> BitArray {
+  <<digit(value / 1000), digit(value / 100), digit(value / 10), digit(value)>>
+}
+
+fn digit(value: Int) -> Int {
+  0x30 + value % 10
 }
 
 fn weekday_to_string(weekday: Int) -> String {
@@ -81,7 +87,7 @@ fn weekday_to_string(weekday: Int) -> String {
     5 -> "Fri"
     6 -> "Sat"
     7 -> "Sun"
-    _ -> panic as "erlang day_of_the_week outside of 1-7 range"
+    _weekday -> panic as "erlang day_of_the_week outside of 1-7 range"
   }
 }
 
@@ -99,7 +105,7 @@ fn month_to_string(month: Int) -> String {
     10 -> "Oct"
     11 -> "Nov"
     12 -> "Dec"
-    _ -> panic as "erlang month outside of 1-12 range"
+    _month -> panic as "erlang month outside of 1-12 range"
   }
 }
 
