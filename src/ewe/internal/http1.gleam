@@ -19,8 +19,7 @@ import logging
 
 pub type State {
   State(
-    handler: fn(request.Request(connection.Connection)) ->
-      response.Response(connection.Body),
+    handler: connection.Handler,
     buffer: BitArray,
     idle_timer: option.Option(process.Timer),
     options: http1.Options,
@@ -89,14 +88,21 @@ fn handle_request(
 
   let request = to_request(head, connection, body_connection)
 
-  case rescue.handler(fn() { state.handler(request) }) {
+  case rescue.handler(fn() { state.handler.call(request) }) {
     Error(details) -> {
       logging.log(
         logging.Error,
         "Caught a crash in the request handler: " <> details,
       )
 
-      refuse(connection, encoder.internal_server_error())
+      let _sent =
+        respond(
+          connection,
+          state.handler.on_crash,
+          head,
+          http1.CloseAfterResponse,
+          self,
+        )
       Close
     }
     Ok(response) -> {

@@ -3,12 +3,11 @@
 ## Unreleased
 
 - Fix ssl application not starting up.
+- Bring back `on_crash` which sets the response sent when the handler crashes.
 - Support WebSocket over HTTP/2 through the extended `CONNECT` of RFC 8441.
-  `ewe.websocket` serves it with no change to your handler.
-- Add `websocket` to `Http2Options`, which says whether that is offered. It is
-  `False` by default; `True` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` so
-  browsers open WebSockets over HTTP/2 rather than falling back to the HTTP/1
-  handshake.
+- Add `websocket` to `Http2Options`. It is `False` by default. `True` advertises 
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL` so browsers and clients open WebSockets 
+  over HTTP/2.
 - Add `send_buffer_limit` to `Http2Options`, the bytes a WebSocket stream may
   leave queued for a client that is not reading before the stream is reset.
 - Fix the close code a WebSocket answers a broken frame with. Every fault closed

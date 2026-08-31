@@ -14,37 +14,27 @@ pub fn start(
   reply_to: process.Subject(http2.Reply(connection.Body)),
   stream_id: Int,
   request: request.Request(connection.Connection),
-  handler: fn(request.Request(connection.Connection)) ->
-    response.Response(connection.Body),
+  handler: connection.Handler,
 ) -> process.Pid {
   use <- process.spawn
 
   process.trap_exits(True)
 
-  case rescue.handler(fn() { handler(request) }) {
+  case rescue.handler(fn() { handler.call(request) }) {
     Ok(response) -> deliver(reply_to, stream_id, response, request.method)
-    Error(details) -> crashed(reply_to, stream_id, details)
+    Error(details) -> crashed(reply_to, stream_id, handler.on_crash, details)
   }
 }
 
 fn crashed(
   reply_to: process.Subject(http2.Reply(connection.Body)),
   stream_id: Int,
+  on_crash: response.Response(connection.Body),
   details: String,
 ) -> Nil {
   logging.log(logging.Error, "Caught a crash in the handler: " <> details)
 
-  internal_error(reply_to, stream_id)
-}
-
-fn internal_error(
-  reply_to: process.Subject(http2.Reply(connection.Body)),
-  stream_id: Int,
-) -> Nil {
-  response.new(500)
-  |> response.set_body(connection.Empty)
-  |> http2.Respond(stream_id, _)
-  |> process.send(reply_to, _)
+  process.send(reply_to, http2.Respond(stream_id, on_crash))
 }
 
 fn deliver(

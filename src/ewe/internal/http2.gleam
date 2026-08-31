@@ -132,7 +132,7 @@ pub type State {
     hpack_encoder: alpacki.DynamicTable,
     header_assembly: Option(HeaderAssembly),
     reply_subject: process.Subject(http2.Reply(connection.Body)),
-    handler: fn(Request(connection.Connection)) -> Response(connection.Body),
+    handler: connection.Handler,
     streams: Dict(Int, Stream),
     stream_pids: Dict(process.Pid, Int),
     conn_send_window: Int,
@@ -210,7 +210,7 @@ pub fn kill_live_workers(state: State) -> Nil {
 }
 
 pub fn init(
-  handler: fn(Request(connection.Connection)) -> Response(connection.Body),
+  handler: connection.Handler,
   options: http2.Options,
   self: process.Subject(connection.Message),
   reply_subject: process.Subject(http2.Reply(connection.Body)),
@@ -2118,9 +2118,12 @@ pub fn test_state() -> State {
     hpack_encoder: alpacki.new_dynamic(options.header_table_size),
     header_assembly: None,
     reply_subject: process.new_subject(),
-    handler: fn(_request) {
-      response.new(200) |> response.set_body(connection.Empty)
-    },
+    handler: connection.Handler(
+      call: fn(_request) {
+        response.new(200) |> response.set_body(connection.Empty)
+      },
+      on_crash: response.new(500) |> response.set_body(connection.Empty),
+    ),
     streams: dict.new(),
     conn_send_window: default_send_window,
     conn_recv_window: default_send_window,

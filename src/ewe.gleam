@@ -27,7 +27,8 @@
 ////       "default_http2_options",
 ////       "with_client_verification",
 ////       "quiet",
-////       "on_start"
+////       "on_start",
+////       "on_crash"
 ////     ]
 ////   },
 ////   {
@@ -799,6 +800,7 @@ fn to_internal_client_verification(
 pub opaque type Builder {
   Builder(
     handler: fn(request.Request(Connection)) -> response.Response(Body),
+    on_crash: response.Response(Body),
     bind_target: BindTarget,
     tls: Option(Tls),
     client_verification: Option(ClientVerification),
@@ -853,6 +855,7 @@ pub fn new(
 ) {
   Builder(
     handler:,
+    on_crash: response.set_body(response.new(500), Empty),
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
     tls: None,
     client_verification: None,
@@ -980,6 +983,30 @@ pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
 
+/// Set the response sent when the handler crashes. By default that is an empty
+/// 500.
+///
+/// The body must be `Bytes`, `Text` or `Empty`. Any other body is replaced with
+/// `Empty` and logged as a warning when the server starts.
+///
+/// A crashed handler leaves the request body half read so on HTTP/1 the 
+/// connection closes once this has been sent.
+///
+/// # Examples
+///
+/// ```gleam
+/// response.new(500)
+/// |> response.set_header("content-type", "text/html")
+/// |> response.set_body(ewe.Text("<h1>Something went wrong</h1>"))
+/// |> ewe.on_crash(builder, _)
+/// ```
+pub fn on_crash(
+  builder: Builder,
+  on_crash: response.Response(Body),
+) -> Builder {
+  Builder(..builder, on_crash:)
+}
+
 /// Set the limits and timeouts applied to every HTTP/1 connection.
 pub fn with_http1(builder: Builder, options: Http1Options) -> Builder {
   Builder(..builder, http1: options)
@@ -1001,6 +1028,23 @@ pub fn with_client_verification(
   Builder(..builder, client_verification: Some(ca_cert))
 }
 
+fn to_internal_crash_response(
+  crash: response.Response(Body),
+) -> response.Response(connection.Body) {
+  let body = case crash.body {
+    Bytes(_tree) | Text(_text) | Empty -> to_internal_body(crash.body)
+    File(_file) | Streaming(_stream) | Sse(_sse) | Websocket(_websocket) -> {
+      logging.log(
+        logging.Warning,
+        "The on_crash body must be Bytes, Text or Empty, using Empty instead",
+      )
+      connection.Empty
+    }
+  }
+
+  response.set_body(crash, body)
+}
+
 fn to_internal_body(body: Body) -> connection.Body {
   case body {
     Bytes(tree) -> connection.Bytes(tree)
@@ -1020,10 +1064,14 @@ fn to_internal_body(body: Body) -> connection.Body {
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  let handler = fn(request) {
-    let response = builder.handler(request)
-    response.set_body(response, to_internal_body(response.body))
-  }
+  let handler =
+    connection.Handler(
+      call: fn(request) {
+        let response = builder.handler(request)
+        response.set_body(response, to_internal_body(response.body))
+      },
+      on_crash: to_internal_crash_response(builder.on_crash),
+    )
 
   let pool =
     glisten.new(

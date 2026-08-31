@@ -7,8 +7,6 @@ import ewe/internal/http1/connection as http1_connection
 import ewe/internal/http2
 import ewe/internal/http2/connection as http2_connection
 import gleam/erlang/process
-import gleam/http/request
-import gleam/http/response
 import gleam/option
 import logging
 
@@ -19,8 +17,7 @@ pub type State {
 }
 
 pub fn on_init(
-  handler: fn(request.Request(connection.Connection)) ->
-    response.Response(connection.Body),
+  handler: connection.Handler,
   http1_options: http1_connection.Options,
   http2_options: http2_connection.Options,
 ) {
@@ -94,8 +91,7 @@ pub fn loop(
 
 fn start_http2(
   connection: glisten.Connection(connection.Message),
-  handler: fn(request.Request(connection.Connection)) ->
-    response.Response(connection.Body),
+  handler: connection.Handler,
   options: http2_connection.Options,
   remaining: BitArray,
 ) -> glisten.Next(State, glisten.Message(connection.Message)) {

@@ -4,12 +4,21 @@ import ewe/internal/http1/connection as http1
 import ewe/internal/http2/connection as http2
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http/request
+import gleam/http/response
 import gleam/option
 import websocks
 
 pub type Connection {
   Http1(http1.Connection)
   Http2(http2.Connection(Body))
+}
+
+pub type Handler {
+  Handler(
+    call: fn(request.Request(Connection)) -> response.Response(Body),
+    on_crash: response.Response(Body),
+  )
 }
 
 pub type Body {
