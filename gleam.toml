@@ -1,5 +1,5 @@
 name = "ewe"
-version = "6.0.0"
+version = "7.0.0"
 
 description = "🐑 a fluffy HTTP/1 and HTTP/2 web server for Gleam"
 target = "erlang"
@@ -11,7 +11,7 @@ internal_modules = ["ewe/internal/*", "ewe/glisten/*", "ewe/glisten"]
 
 [documentation]
 pages = [
-    { title = "Migrating from v4 to v6", path = "migration.html", source = "./MIGRATING.md" },
+    { title = "Migrating from v4 to latest", path = "migration.html", source = "./MIGRATING.md" },
     { title = "Using ewe with Wisp", path = "wisp.html", source = "./WISP.md" },
     { title = "Benchmarks", path = "benchmarks.html", source = "benchmark/RESULTS.md" },
 ]

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v7.0.0 - 31.08.2026
 
 - Fix ssl application not starting up.
 - Bring back `on_crash` which sets the response sent when the handler crashes.
@@ -10,12 +10,9 @@
   over HTTP/2.
 - Add `send_buffer_limit` to `Http2Options`, the bytes a WebSocket stream may
   leave queued for a client that is not reading before the stream is reset.
-- Fix the close code a WebSocket answers a broken frame with. Every fault closed
-  with 1002: Protocol Error, where RFC 6455 asks for 1007: Invalid Frame Payload
-  Data on a text message that is not UTF-8 or a payload that will not inflate,
-  and 1009: Message Too Big on one past `max_frame_size` or `max_message_size`.
+- Fix the close code a WebSocket answers a broken frame with.
 
-## v6.0.0
+## v6.0.0 - 25.08.2026
 
 - `sse`'s `on_init` function now receives the stream connection and a 
   `process.Selector` and returns the starting state along with that selector.
@@ -23,15 +20,15 @@
   constructors with `continue`, `continue_with_selector`, `stop` and
   `stop_abnormal`.
 
-## v5.0.2
+## v5.0.2 - 25.08.2026
 
 - Fix the previous fix to be an actual fix.
 
-## v5.0.1
+## v5.0.1 - 25.08.2026
 
 - Fix ffi file names to avoid issues with vendored glisten.
 
-## v5.0.0
+## v5.0.0 - 23.08.2026
 
 ### Server
 

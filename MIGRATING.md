@@ -1,58 +1,12 @@
-# Migrating from v4 to v6
+# Migrating from v4 to latest
 
-v6 breaks most of the v4 API so there are quite some changes that needs to be 
-happened when moving on to the version 6. Luckily the compiler will catch most 
-of the changes. It is recommended to see [Behaviour changes](#behaviour-changes) as 
-well.
+Since v5 that breaks most of the v4 API, there are quite some changes that needs 
+to be happened when moving on to the latest version. Luckily the compiler will 
+catch most of the changes. It is recommended to see [Behaviour changes](#behaviour-changes) 
+as well.
 
-Already on v5? Only the two changes in [Coming from v5](#coming-from-v5) apply to
-you.
-
-<h2 id="coming-from-v5">Coming from v5</h2>
-
-`sse` takes the same `on_init` as `websocket`. It receives the stream connection
-and an empty selector to add whatever the rest of your program sends to the
-stream and returns the starting state along with that selector. ewe no longer
-makes the subject for you.
-
-```gleam
-// v5
-on_init: fn(subject) {
-  pubsub.subscribe(pubsub, subject)
-  0
-}
-
-// v6
-on_init: fn(_conn, selector) {
-  let client = process.new_subject()
-  pubsub.subscribe(pubsub, client)
-
-  #(0, process.select(selector, client))
-}
-```
-
-`SseNext` and `WebsocketNext` are one `Next` type and their eight constructors
-are four:
-
-```gleam
-// v5
-ewe.sse_continue(state)
-ewe.sse_stop()
-ewe.sse_stop_abnormal(reason)
-
-ewe.websocket_continue(state)
-ewe.websocket_continue_with_selector(state, selector)
-ewe.websocket_stop()
-ewe.websocket_stop_abnormal(reason)
-
-// v6
-ewe.continue(state)
-ewe.continue_with_selector(state, selector)
-ewe.stop()
-ewe.stop_abnormal(reason)
-```
-
-An SSE stream can now swap its selector mid-stream with `continue_with_selector`.
+Every example below is v4 on one side and the latest version (which is v7) on 
+the other.
 
 ## Builder functions
 
@@ -64,7 +18,7 @@ to its connection factory. Create them once at startup.
 ewe.new(handle_request)
 |> ewe.with_name(listener_name)
 
-// v6
+// latest
 ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
 ```
 
@@ -74,37 +28,38 @@ Labels of `bind` and `listening` got renamed:
 |> ewe.bind(interface: "0.0.0.0")
 |> ewe.listening(port: 8080)
 
-// v6
+// latest
 |> ewe.bind(to: "0.0.0.0")
 |> ewe.listening(on: 8080)
 ```
 The default port changed from 8080 to 3000.
 
-Because of the change with providing names for acceptor pool, `with_name` function 
-is gone.
+Because of the change with providing names for acceptor pool, `with_name` 
+function is gone.
 
-`on_crash` was removed, a crashing handler always answers with 500. This is 
-probably a temporar change and will be available in the next versions.
+`on_crash` still sets the response a crashing handler answers with but its body
+must be `Bytes`, `Text` or `Empty`. Any other body is replaced with `Empty` and
+logged as a warning when the server starts.
 
 The certificate source is now a value rather than two path arguments.
 ```gleam
 // v4
 ewe.enable_tls(builder, certificate_file: "cert.pem", key_file: "key.pem")
 
-// v6
+// latest
 ewe.with_tls(builder, ewe.Disk(cert: "cert.pem", key: "key.pem"))
 ewe.with_tls(builder, ewe.Pem(cert: cert_bits, key: key_bits))
 ewe.with_tls(builder, ewe.Der(cert: cert_bits, key: key_bits, key_type: ewe.RsaPrivateKey))
 ```
 
-v4 exposed only `idle_timeout`. v6 puts every HTTP/1 limit on `Http1Options`,
-built by updating the defaults.
+v4 exposed only `idle_timeout`. Latest version puts every HTTP/1 limit on 
+`Http1Options` built by updating the defaults.
 
 ```gleam
 // v4
 ewe.idle_timeout(builder, 30_000)
 
-// v6
+// latest
 ewe.with_http1(
   builder,
   ewe.Http1Options(..ewe.default_http1_options(), idle_timeout: 30_000),
@@ -122,7 +77,7 @@ pattern match on the type:
 // v4
 let ewe.SocketAddress(ip:, port:) = ewe.get_server_info(listener_name)
 
-// v6
+// latest
 case ewe.get_server_info(process.named_subject(listener_name)) {
   ewe.TcpSocketAddress(ip_address:, port:) -> todo
   ewe.UnixSocketAddress(path:) -> todo
@@ -142,7 +97,7 @@ Argument labels were dropped from `ip_address_to_string`, `get_client_info` and
 ewe.get_client_info(connection:)
 ewe.ip_address_to_string(address:)
 
-// v6
+// latest
 ewe.get_client_info(connection)
 ewe.ip_address_to_string(address)
 ```
@@ -166,7 +121,7 @@ ewe.Chunked
 ewe.SSE
 ewe.Websocket
 
-// with v6:
+// with latest:
 ewe.Text(text)
 ewe.Bytes(tree)
 ewe.Bytes(bytes_tree.from_bit_array(bits))
@@ -185,7 +140,7 @@ directly:
 // v4
 fn handle(request: ewe.Request) -> ewe.Response
 
-// v6
+// latest
 fn handle(
   request: request.Request(ewe.Connection),
 ) -> response.Response(ewe.Body)
@@ -200,7 +155,7 @@ depends on the protocol.
 // v4
 ewe.file("/tmp/report.pdf", offset: None, limit: None)
 
-// v6
+// latest
 let connection = request.body
 ewe.file(connection, "/tmp/report.pdf", offset: None, limit: None)
 ```
@@ -214,7 +169,7 @@ ewe.NoAccess
 ewe.IsDirectory
 ewe.UnknownFileError(dynamic)
 
-// v6
+// latest
 ewe.NotFound
 ewe.AccessDenied
 ewe.IsDirectory
@@ -231,7 +186,7 @@ ewe.InvalidLimit
 // v4
 ewe.read_body(request, bytes_limit: 1_048_576)
 
-// v6
+// latest
 ewe.read_body(request, limit: 1_048_576)
 ```
 
@@ -248,7 +203,7 @@ case consumer(4096) {
   Error(_body_error) -> todo
 }
 
-// v6
+// latest
 fn count(request: request.Request(ewe.Connection), total: Int) -> Int {
   case ewe.read_body_chunk(request, max_chunk_bytes: 4096, limit: 10_000_000) {
     Ok(ewe.Chunk(data:, request:)) ->
@@ -263,8 +218,9 @@ fn count(request: request.Request(ewe.Connection), total: Int) -> Int {
 
 ## Streaming a response
 
-v4 ran a chunked body as an actor with `on_init`/`handler`/`on_close`. v6 hands
-the handler a writer to write to directly with no process spawned per response.
+v4 ran a chunked body as an actor with `on_init`/`handler`/`on_close`. The 
+latest version hands the handler a writer to write to directly with no process 
+spawned per response.
 
 ```gleam
 // v4
@@ -279,7 +235,7 @@ ewe.chunked_body(
   on_close: fn(_body, _state) { Nil },
 )
 
-// v6
+// latest
 response.new(200)
 |> response.set_header("content-type", "text/plain")
 |> ewe.stream_response(fn(writer) {
@@ -312,7 +268,7 @@ ewe.sse(
   on_close: fn(_conn, _sent) { Nil },
 )
 
-// v6
+// latest
 response.new(200)
 |> ewe.sse(
   on_init: fn(_conn, selector) {
@@ -337,7 +293,7 @@ response.new(200)
 // v4
 ewe.upgrade_websocket(request, on_init:, handler:, on_close:)
 
-// v6
+// latest
 ewe.websocket(request:, on_init:, handler:, on_close:)
 ```
 
@@ -348,7 +304,7 @@ ewe.Text(text)
 ewe.Binary(data)
 ewe.User(message)
 
-// v6
+// latest
 ewe.TextFrame(text)
 ewe.BinaryFrame(data)
 ewe.UserMessage(message)
@@ -364,15 +320,15 @@ ewe.websocket_continue_with_selector(state, selector)
 ewe.websocket_stop()
 ewe.websocket_stop_abnormal(reason)
 
-// v6
+// latest
 ewe.continue(state)
 ewe.continue_with_selector(state, selector)
 ewe.stop()
 ewe.stop_abnormal(reason)
 ```
 
-v4 had one `CloseCode` variant per code, each carrying its own description. v6
-splits the code from the description:
+v4 had one `CloseCode` variant per code, each carrying its own description. The 
+latest version splits the code from the description:
 
 ```gleam
 // v4
@@ -380,7 +336,7 @@ ewe.send_close_frame(conn, ewe.NormalClosure("done"))
 ewe.send_close_frame(conn, ewe.CustomCloseCode(4000, "bye"))
 ewe.send_close_frame(conn, ewe.NoCloseReason)
 
-// v6
+// latest
 ewe.send_close_frame(conn, ewe.CloseReason(ewe.NormalClosure, "done"))
 ewe.send_close_frame(conn, ewe.CloseReason(ewe.ApplicationCode(4000), "bye"))
 ewe.send_close_frame(conn, ewe.NoCloseReason)
@@ -392,8 +348,9 @@ ewe.send_close_frame(conn, ewe.NoCloseReason)
 ## Send errors
 
 `send_chunk`, `send_event`, `send_text_frame` and `send_binary_frame` all failed
-with a raw `glisten.SocketReason` in v4. v6 returns its own `SendError`, so
-matching on failures no longer needs `glisten` as a direct dependency.
+with a raw `glisten.SocketReason` in v4. The latest version returns its own 
+`SendError` so matching on failures no longer needs `glisten` as a direct 
+dependency.
 
 ```gleam
 // v4
@@ -402,7 +359,7 @@ case ewe.send_event(conn, event) {
   Error(_glisten_socket_reason) -> todo
 }
 
-// v6
+// latest
 case ewe.send_event(conn, event) {
   Ok(Nil) -> todo
   Error(ewe.ConnectionClosed) -> todo
@@ -421,16 +378,16 @@ These are the changes of what the server does at runtime.
 
 ### Framing headers override the handler. 
 v4 set `content-length` and `date` only when the handler had not set them itself 
-so a handler could override either. v6 drops the handler's `content-length`, 
-`transfer-encoding` and `date` and writes its own, computing `content-length` or 
-`transfer-encoding: chunked` from the body. `connection` is still read for a 
-`close` token.
+so a handler could override either. Since v5 ewe drops the handler's 
+`content-length`, `transfer-encoding` and `date` and writes its own, 
+computing `content-length` or `transfer-encoding: chunked` from the body. 
+`connection` is still read for a `close` token.
 
 ### Responses are no longer gzipped. 
 v4 compressed a response whenever the request carried `accept-encoding: gzip` 
 and the handler had not set `content-encoding`, adding `content-encoding`, `vary` 
-and a recomputed `content-length`. v6 does no content encoding at all so 
-responses go out uncompressed unless the handler compresses them and sets the 
+and a recomputed `content-length`. From v5 ewe does no content encoding at all 
+so responses go out uncompressed unless the handler compresses them and sets the 
 headers itself.
 
 ### Unread request bodies are drained. 
@@ -440,20 +397,23 @@ is 1 MB by default) the connection is closed instead. v4 left the unread bytes
 in the socket where the next read misparsed them as a new request.
 
 ### Streaming, SSE and WebSockets no longer get a process of their own.
-v4 spawned one per response and handed it the socket. v6 runs the desired stream 
-in the request's process (in connection process on HTTP/1 and in stream process 
-on HTTP/2).
+v4 spawned one per response and handed it the socket. From v5 ewe runs the 
+desired stream in the request's process (in connection process on HTTP/1 and in 
+stream process on HTTP/2).
 
 ### HTTP/2 is on by default.
 Plaintext connections opening with the h2c preface are served as HTTP/2 and 
-`h2` is offered over ALPN whenever TLS is configured. WebSockets need extended 
-CONNECT, which ewe does not negotiate yet, so `ewe.websocket` answers 501 on an 
-HTTP/2 connection.
+`h2` is offered over ALPN whenever TLS is configured. WebSockets over HTTP/2 need 
+the extended `CONNECT` of RFC 8441 which is off until `websocket: True` is set 
+on `Http2Options`. Until then such a request is refused as malformed.
 
 ## New since v4
 
 - As HTTP/2 is now available, we have new type `Http2Options` with 
   `default_http2_options` and `with_http2` to adjust HTTP/2 options.
+- WebSockets run over HTTP/2 as well once `websocket` is turned on in 
+  `Http2Options`, with `send_buffer_limit` capping what a stream may leave 
+  queued for a client that is not reading before it is reset.
 - We support unix sockets via `ewe.unix(path)`
 - We can enable client certificate verification via 
   `ewe.with_client_verification` for mTLS.
