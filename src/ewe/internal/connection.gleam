@@ -1,5 +1,3 @@
-import ewe/glisten
-import ewe/glisten/internal/handler
 import ewe/internal/http1/connection as http1
 import ewe/internal/http2/connection as http2
 import gleam/bytes_tree
@@ -7,6 +5,7 @@ import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
 import gleam/option
+import gleam/string
 import websocks
 
 pub type Connection {
@@ -90,6 +89,39 @@ pub type Message {
   Http2StreamClose(pid: process.Pid)
 }
 
+pub type Exit {
+  ParentExited
+  LinkExitedNormally
+  LinkFailed(reason: String)
+}
+
+pub fn select_exits(
+  selector: process.Selector(a),
+  map: fn(Exit) -> a,
+) -> process.Selector(a) {
+  let parent = parent_pid()
+
+  process.select_trapped_exits(selector, fn(exit) {
+    map(classify_exit(exit, parent))
+  })
+}
+
+fn classify_exit(
+  exit: process.ExitMessage,
+  parent: Result(process.Pid, Nil),
+) -> Exit {
+  case parent == Ok(exit.pid), exit.reason {
+    True, _reason -> ParentExited
+    False, process.Normal -> LinkExitedNormally
+    False, process.Killed -> LinkFailed("a linked process was killed")
+    False, process.Abnormal(reason) ->
+      LinkFailed("a linked process exited: " <> string.inspect(reason))
+  }
+}
+
+@external(erlang, "ewe_ffi", "parent_pid")
+pub fn parent_pid() -> Result(process.Pid, Nil)
+
 pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
   case buffer {
     <<>> -> data
@@ -98,10 +130,10 @@ pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
 }
 
 pub fn start_idle_timer(
-  connection: glisten.Connection(Message),
+  self: process.Subject(Message),
   timeout: Int,
 ) -> option.Option(process.Timer) {
-  process.send_after(connection.subject, timeout, handler.User(Timeout))
+  process.send_after(self, timeout, Timeout)
   |> option.Some
 }
 

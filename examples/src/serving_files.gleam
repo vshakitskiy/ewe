@@ -12,13 +12,10 @@ pub fn main() {
   logging.configure()
   logging.set_level(logging.Info)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   // Start a simple file server that serves files from the "public" directory.
   //
   let assert Ok(_) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handler: handle_request)
     |> ewe.bind(to: "0.0.0.0")
     |> ewe.listening(on: 8080)
     |> ewe.start

@@ -1,5 +1,3 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/clock
 import ewe/internal/connection
 import ewe/internal/file
@@ -14,6 +12,7 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import tup/socket
 import websocks
 
 pub type EncodeError {
@@ -273,7 +272,7 @@ pub fn frame(
 pub fn send_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
-) -> Result(ResponseWriter, socket.SocketReason) {
+) -> Result(ResponseWriter, socket.SocketError) {
   frame(bytes_tree.from_bit_array(chunk), writer.framing)
   |> write(writer, _)
   |> result.replace(writer)
@@ -282,7 +281,7 @@ pub fn send_chunk(
 pub fn finish_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   let bytes = case writer.framing {
     http1.ChunkedStream ->
       bytes_tree.append(
@@ -297,7 +296,7 @@ pub fn finish_chunk(
 
 pub fn finish_response(
   writer: ResponseWriter,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   end_stream(writer.transport, writer.socket, writer.framing)
   |> finished(writer, _)
 }
@@ -305,26 +304,26 @@ pub fn finish_response(
 fn write(
   writer: ResponseWriter,
   bytes: bytes_tree.BytesTree,
-) -> Result(Nil, socket.SocketReason) {
-  transport.send(writer.transport, writer.socket, bytes)
+) -> Result(Nil, socket.SocketError) {
+  socket.send(writer.transport, writer.socket, bytes)
 }
 
 pub fn end_stream(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   framing: http1.StreamFraming,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   case framing {
     http1.ChunkedStream ->
-      transport.send(transport, socket, bytes_tree.from_bit_array(last_chunk))
+      socket.send(transport, socket, bytes_tree.from_bit_array(last_chunk))
     http1.CloseDelimitedStream -> Ok(Nil)
   }
 }
 
 fn finished(
   writer: ResponseWriter,
-  sent: Result(Nil, socket.SocketReason),
-) -> Result(Nil, socket.SocketReason) {
+  sent: Result(Nil, socket.SocketError),
+) -> Result(Nil, socket.SocketError) {
   let keep_alive = case sent {
     Ok(Nil) -> writer.keep_alive
     Error(_reason) -> http1.CloseAfterResponse

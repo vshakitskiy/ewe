@@ -59,7 +59,7 @@ lower(Byte) when Byte >= $A, Byte =< $Z -> Byte + 32;
 lower(Byte) -> Byte.
 
 socket_error_reason({_Tag, _Socket, Reason}) ->
-  Reason.
+  tup_socket_ffi:reason(Reason).
 
 bit_array_to_string(Bin) ->
   case ewe_ffi:is_valid_utf8(Bin) of

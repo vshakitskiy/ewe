@@ -29,7 +29,7 @@ pub fn run(
   let handle = connection.Http2Sse(conn)
   let #(state, messages) = on_init(handle, process.new_selector())
 
-  loop(conn, handle, handlers, exit_selector(messages), state)
+  loop(conn, handle, handlers, stream_selector(conn, messages), state)
 }
 
 fn loop(
@@ -40,28 +40,44 @@ fn loop(
   state: user_state,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
-    Interrupted -> ended(handle, handlers, state, connection.Stopped)
+    Exited(connection.ParentExited) ->
+      ended(handle, handlers, state, connection.Stopped)
+    Exited(connection.LinkExitedNormally) ->
+      loop(conn, handle, handlers, selector, state)
+    Exited(connection.LinkFailed(reason)) ->
+      ended(handle, handlers, state, connection.StoppedAbnormal(reason))
+    Signal(http2.Draining) ->
+      halted(conn, handle, handlers, state, connection.Stopped)
     Message(message) ->
       case rescue.handler(fn() { handlers.step(handle, state, message) }) {
         Error(details) -> crashed(handle, handlers, state, details)
         Ok(connection.Proceed(user_state: state, messages:)) -> {
           let selector = case messages {
-            option.Some(messages) -> exit_selector(messages)
+            option.Some(messages) -> stream_selector(conn, messages)
             option.None -> selector
           }
 
           loop(conn, handle, handlers, selector, state)
         }
         Ok(connection.Halt(outcome)) ->
-          case ended(handle, handlers, state, outcome) {
-            connection.Stopped -> {
-              let _sent = stream.finish_response(conn.writer)
-              connection.Stopped
-            }
-            connection.StoppedAbnormal(reason) ->
-              connection.StoppedAbnormal(reason)
-          }
+          halted(conn, handle, handlers, state, outcome)
       }
+  }
+}
+
+fn halted(
+  conn: http2.SseConnection(connection.Body),
+  handle: connection.SseConnection,
+  handlers: Handlers(user_state, user_message),
+  state: user_state,
+  outcome: connection.Outcome,
+) -> connection.Outcome {
+  case ended(handle, handlers, state, outcome) {
+    connection.Stopped -> {
+      let _sent = stream.finish_response(conn.writer)
+      connection.Stopped
+    }
+    connection.StoppedAbnormal(reason) -> connection.StoppedAbnormal(reason)
   }
 }
 
@@ -94,14 +110,17 @@ fn crashed(
 
 type Received(user_message) {
   Message(user_message)
-  Interrupted
+  Signal(http2.StreamSignal)
+  Exited(connection.Exit)
 }
 
-fn exit_selector(
+fn stream_selector(
+  conn: http2.SseConnection(connection.Body),
   messages: process.Selector(user_message),
 ) -> process.Selector(Received(user_message)) {
   process.map_selector(messages, Message)
-  |> process.select_trapped_exits(fn(_exit) { Interrupted })
+  |> process.select_map(conn.signals, Signal)
+  |> connection.select_exits(Exited)
 }
 
 pub fn send(

@@ -10,14 +10,11 @@ pub fn main() {
   logging.configure()
   logging.set_level(logging.Info)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   // A server that logs who every request came from and tells the client its own
   // address, the way `curl ifconfig.me` does.
   //
   let assert Ok(_) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handler: handle_request)
     |> ewe.bind(to: "0.0.0.0")
     |> ewe.listening(on: 8080)
     |> ewe.start
@@ -52,7 +49,7 @@ fn handle_request(
 // See https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For
 fn describe_client(connection: ewe.Connection) -> String {
   case ewe.get_client_info(connection) {
-    Ok(ewe.TcpSocketAddress(ip_address:, port:)) -> {
+    ewe.TcpSocketAddress(ip_address:, port:) -> {
       // An IPv6 address is bracketed so the port stays readable next to the
       // colons the address itself is full of.
       let host = case ip_address {
@@ -64,9 +61,7 @@ fn describe_client(connection: ewe.Connection) -> String {
     }
     // A unix socket client is unnamed unless it bound a path of its own, which
     // clients rarely do, so most of the time there is no path to report.
-    Ok(ewe.UnixSocketAddress(path: "")) -> "unix socket"
-    Ok(ewe.UnixSocketAddress(path:)) -> "unix:" <> path
-    // The socket is already gone, so there is nothing left to report.
-    Error(Nil) -> "unknown"
+    ewe.UnixSocketAddress(path: "") -> "unix socket"
+    ewe.UnixSocketAddress(path:) -> "unix:" <> path
   }
 }

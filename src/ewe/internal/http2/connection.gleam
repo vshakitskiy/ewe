@@ -1,9 +1,9 @@
-import ewe/glisten/socket
 import gleam/dynamic
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/http/response
 import gleam/option
+import tup
 import websocks
 
 pub type Options {
@@ -43,7 +43,7 @@ pub fn default_options() -> Options {
     drain_timeout_ms: 4000,
     recv_window_low_water_mark: 262_144,
     recv_window_high_water_mark: 2_097_152,
-    websocket: False,
+    websocket: True,
     send_buffer_limit: 1_048_576,
     file_read_threshold: 1_048_576,
     body_read_timeout: 10_000,
@@ -59,7 +59,7 @@ pub type Connection(body) {
     pending_trailers: option.Option(List(#(String, String))),
     read: Int,
     body_read_timeout: Int,
-    peer: Result(socket.SockName, Nil),
+    peer: tup.Endpoint,
     protocol: option.Option(String),
   )
 }
@@ -79,7 +79,7 @@ pub type Reply(body) {
 
 pub type ResponseMode {
   PlainStream
-  EventStream
+  EventStream(notify: process.Subject(StreamSignal))
   WebsocketStream(notify: process.Subject(StreamSignal))
 }
 
@@ -112,7 +112,10 @@ pub type ResponseWriter(body) {
 }
 
 pub type SseConnection(body) {
-  SseConnection(writer: ResponseWriter(body))
+  SseConnection(
+    writer: ResponseWriter(body),
+    signals: process.Subject(StreamSignal),
+  )
 }
 
 pub type WebsocketConnection(body) {
@@ -141,9 +144,6 @@ pub fn receive_reply_within(
 
 @external(erlang, "ewe_ffi", "identity")
 pub fn tag(reference: reference.Reference) -> dynamic.Dynamic
-
-@external(erlang, "ewe_http2_ffi", "parent_pid")
-pub fn parent_pid() -> Result(process.Pid, Nil)
 
 @external(erlang, "ewe_http2_ffi", "is_shutdown")
 pub fn is_shutdown(reason: dynamic.Dynamic) -> Bool

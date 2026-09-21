@@ -1,6 +1,3 @@
-import ewe/glisten
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http1/body
@@ -16,10 +13,13 @@ import gleam/http/response
 import gleam/option
 import gleam/result
 import logging
+import tup
+import tup/socket
 
 pub type State {
   State(
     handler: connection.Handler,
+    self: process.Subject(connection.Message),
     buffer: BitArray,
     idle_timer: option.Option(process.Timer),
     options: http1.Options,
@@ -38,10 +38,7 @@ type Sent {
   SentAbnormal(reason: String)
 }
 
-pub fn handle_message(
-  state: State,
-  connection: glisten.Connection(connection.Message),
-) -> Next {
+pub fn handle_message(state: State, connection: tup.Connection) -> Next {
   connection.cancel_timer(state.idle_timer)
 
   case parser.parse(state.buffer, state.options) {
@@ -49,7 +46,7 @@ pub fn handle_message(
       handle_request(state, connection, head, metadata, remaining)
     Ok(parser.Incomplete) -> {
       let idle_timer =
-        connection.start_idle_timer(connection, state.options.idle_timeout)
+        connection.start_idle_timer(state.self, state.options.idle_timeout)
       Continue(State(..state, idle_timer:))
     }
     Error(error) -> {
@@ -58,7 +55,14 @@ pub fn handle_message(
         "Failed to parse HTTP/1.x request: " <> parser.error_to_string(error),
       )
 
-      refuse(connection, encoder.error_response(parser.error_to_status(error)))
+      case error {
+        parser.BadVersion -> Nil
+        _other ->
+          parser.error_to_status(error)
+          |> encoder.error_response
+          |> refuse(connection, _)
+      }
+
       Close
     }
   }
@@ -66,17 +70,19 @@ pub fn handle_message(
 
 fn handle_request(
   state: State,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   head: parser.Head,
   metadata: parser.Metadata,
   remaining: BitArray,
 ) -> Next {
   let self = process.new_subject()
+  let #(transport, socket) = tup.socket(connection)
 
   let body_connection =
     http1.Connection(
-      transport: connection.transport,
-      socket: connection.socket,
+      transport:,
+      socket:,
+      peer: tup.peer(connection),
       self:,
       buffer: remaining,
       framing: metadata.framing,
@@ -122,17 +128,19 @@ fn handle_request(
 }
 
 fn respond(
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   response: response.Response(connection.Body),
   head: parser.Head,
   keep_alive: http1.KeepAlive,
   self: process.Subject(http1.Signal),
-) -> Result(Sent, socket.SocketReason) {
+) -> Result(Sent, socket.SocketError) {
   case
     encoder.encode_response(response, head.method, head.version, keep_alive)
   {
-    Ok(encoded) ->
-      send_response(encoded, connection.transport, connection.socket, self)
+    Ok(encoded) -> {
+      let #(transport, socket) = tup.socket(connection)
+      send_response(encoded, transport, socket, self)
+    }
     Error(encoder.UnsafeHeader(name)) -> {
       logging.log(
         logging.Error,
@@ -146,11 +154,9 @@ fn respond(
   }
 }
 
-fn refuse(
-  connection: glisten.Connection(connection.Message),
-  response: bytes_tree.BytesTree,
-) -> Nil {
-  let _sent = transport.send(connection.transport, connection.socket, response)
+fn refuse(connection: tup.Connection, response: bytes_tree.BytesTree) -> Nil {
+  let #(transport, socket) = tup.socket(connection)
+  let _sent = socket.send(transport, socket, response)
 
   Nil
 }
@@ -158,12 +164,12 @@ fn refuse(
 fn await_next_request(
   state: State,
   buffer: BitArray,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case buffer {
     <<>> -> {
       let idle_timer =
-        connection.start_idle_timer(connection, state.options.idle_timeout)
+        connection.start_idle_timer(state.self, state.options.idle_timeout)
       Continue(State(..state, buffer:, idle_timer:))
     }
     _buffer ->
@@ -174,12 +180,12 @@ fn await_next_request(
 
 fn to_request(
   head: parser.Head,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   body: http1.Connection,
 ) -> request.Request(connection.Connection) {
-  let scheme = case connection.transport {
-    transport.Tcp -> http.Http
-    transport.Ssl -> http.Https
+  let scheme = case tup.socket(connection) {
+    #(socket.Tcp, _socket) -> http.Http
+    #(socket.Ssl, _socket) -> http.Https
   }
 
   request.Request(
@@ -196,19 +202,19 @@ fn to_request(
 
 fn send_response(
   encoded: encoder.Encoded,
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   self: process.Subject(http1.Signal),
-) -> Result(Sent, socket.SocketReason) {
+) -> Result(Sent, socket.SocketError) {
   let encoder.Encoded(head:, keep_alive:, remainder:) = encoded
 
   case remainder {
     encoder.NoRemainder -> {
-      use Nil <- result.try(transport.send(transport, socket, head))
+      use Nil <- result.try(socket.send(transport, socket, head))
       Ok(to_sent(keep_alive))
     }
     encoder.RemainderInline(body) -> {
-      use Nil <- result.try(transport.send(
+      use Nil <- result.try(socket.send(
         transport,
         socket,
         bytes_tree.append_tree(head, body),
@@ -216,7 +222,7 @@ fn send_response(
       Ok(to_sent(keep_alive))
     }
     encoder.RemainderFile(data) ->
-      case transport.send(transport, socket, head) {
+      case socket.send(transport, socket, head) {
         Error(reason) -> {
           file.release(data)
           Error(reason)
@@ -227,7 +233,7 @@ fn send_response(
         }
       }
     encoder.RemainderStream(handler: stream_handler, framing:) -> {
-      use Nil <- result.try(transport.send(transport, socket, head))
+      use Nil <- result.try(socket.send(transport, socket, head))
 
       let writer =
         connection.Http1Writer(http1.ResponseWriter(
@@ -260,7 +266,7 @@ fn send_response(
       }
     }
     encoder.RemainderWebsocket(context:, handler: websocket_handler) -> {
-      use Nil <- result.try(transport.send(transport, socket, head))
+      use Nil <- result.try(socket.send(transport, socket, head))
 
       let outcome =
         http1.WebsocketConnection(transport:, socket:, context:)
@@ -273,7 +279,7 @@ fn send_response(
       }
     }
     encoder.RemainderSse(handler: sse_handler, framing:) -> {
-      use Nil <- result.try(transport.send(transport, socket, head))
+      use Nil <- result.try(socket.send(transport, socket, head))
 
       let outcome =
         http1.SseConnection(transport:, socket:, self:, framing:)

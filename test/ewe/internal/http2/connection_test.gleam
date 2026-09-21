@@ -20,7 +20,7 @@ fn pending_stream(send_window: Int, pending: BitArray) -> connection.Stream {
     writer: None,
     recv_window: 65_535,
     recv_buffer: bytes_tree.new(),
-    request_half_closed: False,
+    request_half_closed: True,
     parked_reader: None,
     content_length: None,
     body_bytes_received: 0,
@@ -570,6 +570,22 @@ pub fn flush_stream_full_drain_test() {
   assert state.conn_send_window == 65_535 - 5
 }
 
+pub fn flush_stream_keeps_finished_stream_while_request_is_open_test() {
+  let state = connection.test_state()
+  let entry =
+    connection.Stream(
+      ..pending_stream(100, <<"hello":utf8>>),
+      request_half_closed: False,
+    )
+
+  let assert connection.FlushAccumulated(state, _out, True) =
+    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
+
+  let assert Ok(finished) = dict.get(state.streams, 1)
+  assert finished.status == connection.Finished
+  assert finished.pending == connection.no_chunks()
+}
+
 pub fn flush_stream_partial_drain_blocks_on_stream_window_test() {
   let state = connection.test_state()
   let entry = pending_stream(3, <<"hello":utf8>>)
@@ -900,7 +916,7 @@ pub fn handle_data_on_idle_stream_is_protocol_error_test() {
   let assert connection.Terminate(Some(frame.ProtocolError)) = result
 }
 
-pub fn handle_data_on_already_closed_stream_is_connection_error_test() {
+pub fn handle_data_on_already_closed_stream_is_stream_error_test() {
   let state =
     connection.State(
       ..connection.test_state(),
@@ -909,7 +925,12 @@ pub fn handle_data_on_already_closed_stream_is_connection_error_test() {
 
   let result = connection.handle_data(state, 3, False, <<"x":utf8>>, 1)
 
-  assert result == connection.Terminate(Some(frame.StreamClosed))
+  let assert connection.ProceedWithOutbound(state, out) = result
+  let assert Ok(#(frame.RstStream(3, frame.StreamClosed), rest)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  let assert Ok(#(frame.WindowUpdate(0, 2_031_618), <<>>)) =
+    frame.decode(rest, 16_384)
+  assert state.conn_recv_window == 2_097_152
 }
 
 pub fn handle_data_buffered_without_reader_still_credits_conn_window_test() {
@@ -935,17 +956,63 @@ pub fn handle_data_buffered_without_reader_still_credits_conn_window_test() {
   assert updated.recv_window == 100_000 - 40_000
 }
 
-pub fn handle_data_on_already_closed_stream_with_large_chunk_is_connection_error_test() {
+pub fn handle_data_on_already_closed_stream_above_low_water_mark_is_not_credited_test() {
   let state =
     connection.State(
       ..connection.test_state(),
       highest_client_stream_id_seen: 5,
+      conn_recv_window: 2_097_152,
     )
   let chunk = <<0:size({ 40_000 * 8 })>>
 
   let result = connection.handle_data(state, 3, False, chunk, 40_000)
 
-  assert result == connection.Terminate(Some(frame.StreamClosed))
+  let assert connection.ProceedWithOutbound(state, out) = result
+  let assert Ok(#(frame.RstStream(3, frame.StreamClosed), <<>>)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  assert state.conn_recv_window == 2_097_152 - 40_000
+}
+
+pub fn handle_data_on_finished_stream_is_dropped_and_credited_test() {
+  let entry =
+    connection.Stream(
+      ..inbound_stream(100_000, None),
+      status: connection.Finished,
+    )
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, entry)]),
+      highest_client_stream_id_seen: 1,
+    )
+
+  let result = connection.handle_data(state, 1, False, <<"close":utf8>>, 5)
+
+  let assert connection.ProceedWithOutbound(state, out) = result
+  let assert Ok(#(frame.WindowUpdate(1, 1_997_157), _rest)) =
+    frame.decode(bytes_tree.to_bit_array(out), 16_384)
+  let assert Ok(finished) = dict.get(state.streams, 1)
+  assert finished.recv_buffer == bytes_tree.new()
+  assert finished.recv_window == 2_097_152
+}
+
+pub fn handle_data_end_stream_on_finished_stream_removes_it_test() {
+  let entry =
+    connection.Stream(
+      ..inbound_stream(65_535, None),
+      status: connection.Finished,
+    )
+  let state =
+    connection.State(
+      ..connection.test_state(),
+      streams: dict.from_list([#(1, entry)]),
+      highest_client_stream_id_seen: 1,
+    )
+
+  let assert connection.ProceedWithOutbound(state, _out) =
+    connection.handle_data(state, 1, True, <<>>, 0)
+
+  assert dict.get(state.streams, 1) == Error(Nil)
 }
 
 pub fn handle_data_on_already_closed_stream_can_exceed_conn_window_test() {

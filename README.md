@@ -24,6 +24,7 @@ ewe [/juː/] - fluffy HTTP/1 and HTTP/2 web server for Gleam.
   - [Connection Limits and Timeouts](#connection-limits-and-timeouts)
   - [Running Under Supervision](#running-under-supervision)
   - [Running as an OTP Application](#running-as-an-otp-application)
+  - [Graceful Shutdown](#graceful-shutdown)
 - [Examples](#examples)
 - [API Reference](#api-reference)
 
@@ -48,7 +49,10 @@ work on.
 
 Instead of a port you can bind a unix domain socket with [`ewe.unix`](https://hexdocs.pm/ewe/ewe.html#unix),
 or let the OS pick a free port with [`ewe.listening_random`](https://hexdocs.pm/ewe/ewe.html#listening_random)
-and ask for the one it picked with [`ewe.get_server_info`](https://hexdocs.pm/ewe/ewe.html#get_server_info).
+and read the one it picked from what [`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start) returns.
+[`ewe.named`](https://hexdocs.pm/ewe/ewe.html#named) gives the server a name that
+is used by 
+[`ewe.get_server_info`](https://hexdocs.pm/ewe/ewe.html#get_server_info) later.
 
 
 ```gleam
@@ -62,15 +66,8 @@ pub fn main() {
   logging.configure()
   logging.set_level(logging.Info)
 
-  // The acceptor pool wires the listener and the connection factory together
-  // through process names. Create them where your program starts and pass them
-  // in here.
-  //
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   let assert Ok(_) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handler: handle_request)
     |> ewe.bind(to: "0.0.0.0")
     |> ewe.listening(on: 8080)
     |> ewe.start
@@ -99,7 +96,7 @@ value. The certificate and key are validated on startup and the server crashes i
 they are missing or invalid.
 
 ```gleam
-ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+ewe.new(handler: handle_request)
 |> ewe.bind(to: "0.0.0.0")
 |> ewe.listening(on: 8080)
 // Certificate and key files on disk.
@@ -275,15 +272,13 @@ case ewe.file(request.body, resolved, offset: None, limit: None) {
 
 [`ewe.get_client_info`](https://hexdocs.pm/ewe/ewe.html#get_client_info) reads the
 address a request came from off its connection as a
-[`ewe.SocketAddress`](https://hexdocs.pm/ewe/ewe.html#SocketAddress). It fails
-only when the socket is already gone.
+[`ewe.SocketAddress`](https://hexdocs.pm/ewe/ewe.html#SocketAddress). The
+address is read once when the client connects.
 
 ```gleam
 fn describe_client(connection: ewe.Connection) -> String {
   case ewe.get_client_info(connection) {
-    Ok(ewe.TcpSocketAddress(ip_address:, port:)) -> {
-      // An IPv6 address is bracketed so the port stays readable next to the
-      // colons the address itself is full of.
+    ewe.TcpSocketAddress(ip_address:, port:) -> {
       let host = case ip_address {
         ewe.IpV6(..) -> "[" <> ewe.ip_address_to_string(ip_address) <> "]"
         ewe.IpV4(..) -> ewe.ip_address_to_string(ip_address)
@@ -291,9 +286,8 @@ fn describe_client(connection: ewe.Connection) -> String {
 
       host <> ":" <> int.to_string(port)
     }
-    Ok(ewe.UnixSocketAddress(path: "")) -> "unix socket"
-    Ok(ewe.UnixSocketAddress(path:)) -> "unix:" <> path
-    Error(Nil) -> "unknown"
+    ewe.UnixSocketAddress(path: "") -> "unix socket"
+    ewe.UnixSocketAddress(path:) -> "unix:" <> path
   }
 }
 ```
@@ -315,17 +309,15 @@ or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame)
 and say what happens next with
 [`ewe.Next`](https://hexdocs.pm/ewe/ewe.html#Next).
 
-The same handler serves both protocols. On HTTP/1 the request is the usual
-`Upgrade: websocket` handshake, and on HTTP/2 it is the extended `CONNECT` of
-[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441).
-
-The HTTP/2 is off until you enable it:
+On HTTP/1 the request is the usual `Upgrade: websocket` handshake and on HTTP/2 
+it is the extended `CONNECT` of 
+[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) which ewe advertises with
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`. To keep WebSockets on HTTP/1 only, turn it
+off:
 
 ```gleam
-|> ewe.with_http2(ewe.Http2Options(..ewe.default_http2_options(), websocket: True))
+|> ewe.with_http2(ewe.Http2Options(..ewe.default_http2_options(), websocket: False))
 ```
-
-With it on, ewe advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
 
 ```gleam
 fn handle_topic(
@@ -461,7 +453,7 @@ let http2 =
     rapid_reset_threshold: 50,
   )
 
-ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+ewe.new(handler: handle_request)
 |> ewe.with_http1(http1)
 |> ewe.with_http2(http2)
 |> ewe.start
@@ -496,10 +488,9 @@ peer:
 | `rapid_reset_window` | `10_000` | Window over which client stream resets are counted. |
 | `rapid_reset_threshold` | `100` | Resets within that window that trip a GOAWAY which is what keeps Rapid Reset (CVE-2023-44487) in check. |
 | `handshake_timeout` | `10_000` | How long a connection may sit in the preface and SETTINGS handshake. |
-| `drain_timeout` | `4000` | How long a draining connection waits for its streams after GOAWAY. |
 | `recv_window_low_water_mark` | `262_144` | Once a receive window falls to this it is topped back up. |
 | `recv_window_high_water_mark` | `2_097_152` | What it is topped up to; a wider gap costs fewer WINDOW_UPDATE round trips. |
-| `websocket` | `False` | Whether a client may open a WebSocket over HTTP/2 with the extended `CONNECT` of RFC 8441. |
+| `websocket` | `True` | Whether a client may open a WebSocket over HTTP/2 with the extended `CONNECT` of RFC 8441. |
 | `send_buffer_limit` | `1_048_576` | Bytes a WebSocket stream may already have queued for a client that is not reading before a further write resets it. One message is always sent whatever its size. |
 | `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
 | `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
@@ -515,7 +506,7 @@ returns a child specification.
 supervisor.new(supervisor.OneForAll)
 |> supervisor.add(pubsub.worker(pubsub_name))
 |> supervisor.add(
-  ewe.new(listener_name:, connection_factory_name:, handler:)
+  ewe.new(handler:)
   |> ewe.bind(to: "0.0.0.0")
   |> ewe.listening(on: 8080)
   |> ewe.supervised,
@@ -554,13 +545,10 @@ import gleam/otp/static_supervisor as supervisor
 /// The Erlang/OTP application start callback. Starts the top supervisor and
 /// hands its pid back to the application controller.
 pub fn start(_type: a, _args: b) -> Result(process.Pid, actor.StartError) {
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   case
     supervisor.new(supervisor.OneForOne)
     |> supervisor.add(
-      ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+      ewe.new(handler: handle_request)
       |> ewe.bind(to: "0.0.0.0")
       |> ewe.listening(on: 8080)
       |> ewe.supervised,
@@ -589,9 +577,30 @@ pub fn main() {
 > `main` still has to sleep. `gleam run` boots the application and then calls it,
 > so without it the node exits as soon as it returns.
 
+<h3 id="graceful-shutdown">Graceful Shutdown</h3>
+
+> [!NOTE]
+> This only happens when the server is in the supervision tree of an OTP
+> application as in [Running as an OTP Application](#running-as-an-otp-application).
+> A server started from `main`, even under a supervisor, is killed with the VM
+> on SIGTERM.
+
+When OTP stops the server each connection gets to finish before it is closed.
+HTTP/1 connections finish the request they are serving, WebSockets are sent a
+going away close frame and HTTP/2 connections send GOAWAY and wait for their
+open streams. 
+[`ewe.shutdown_timeout`](https://hexdocs.pm/ewe/ewe.html#shutdown_timeout) sets 
+how long that may take, 15 seconds by default.
+
+```gleam
+ewe.new(handler: handle_request)
+|> ewe.shutdown_timeout(30_000)
+|> ewe.supervised
+```
+
 <h2 id="examples">Examples</h2>
 
-Most sections above link to a runnable example. They live in
+Most sections above link to a runnable example. They live in 
 [examples](examples/), see [its README](examples/README.md) for how to run them.
 
 <h2 id="api-reference">API Reference</h2>

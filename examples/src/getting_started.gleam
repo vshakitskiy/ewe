@@ -14,13 +14,10 @@ pub fn main() {
   // For the web server setup we need to create process names at the place where 
   // your program starts. These names are required for the acceptor pool working 
   // correctly.
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   // Start the ewe web server binding to all interfaces.
   //
   let assert Ok(_) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handler: handle_request)
     |> ewe.bind(to: "0.0.0.0")
     |> ewe.listening(on: 8080)
     |> ewe.start

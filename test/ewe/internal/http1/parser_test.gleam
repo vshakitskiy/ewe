@@ -198,7 +198,8 @@ pub fn rejections_carry_a_status_test() {
   assert parser.error_to_status(parser.RequestLineTooLong) == 414
   assert parser.error_to_status(parser.TooManyHeaders) == 431
   assert parser.error_to_status(parser.ChunkTooLarge) == 413
-  assert parser.error_to_status(parser.BadVersion) == 505
+  assert parser.error_to_status(parser.UnsupportedVersion) == 505
+  assert parser.error_to_status(parser.BadVersion) == 400
   assert parser.error_to_status(parser.UnsupportedTransferEncoding) == 501
 }
 
@@ -296,8 +297,13 @@ pub fn split_across_reads_test() {
   assert head.path == "/"
 }
 
-pub fn bad_request_line_test() {
+pub fn unsupported_version_test() {
   let buffer = <<"GET /foo HTTP/9.9\r\n\r\n":utf8>>
+  assert parse(buffer) == Error(parser.UnsupportedVersion)
+}
+
+pub fn malformed_version_test() {
+  let buffer = <<"INVALID CONNECTION PREFACE\r\n\r\n":utf8>>
   assert parse(buffer) == Error(parser.BadVersion)
 }
 

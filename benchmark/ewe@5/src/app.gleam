@@ -14,13 +14,11 @@ pub fn main() -> Nil {
   logging.configure()
   logging.set_level(logging.Debug)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
   let payload = payload()
   let handler = handle_request(payload, _)
 
   let assert Ok(_started) =
-    ewe.new(listener_name:, connection_factory_name:, handler:)
+    ewe.new(handler:)
     |> ewe.listening(on: 3006)
     |> ewe.start
 

@@ -1,7 +1,7 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import gleam/erlang/process
 import gleam/option
+import tup
+import tup/socket
 import websocks
 
 pub type Options {
@@ -32,8 +32,9 @@ pub fn default_options() -> Options {
 
 pub type Connection {
   Connection(
-    transport: transport.Transport,
+    transport: socket.Transport,
     socket: socket.Socket,
+    peer: tup.Endpoint,
     self: process.Subject(Signal),
     buffer: BitArray,
     framing: Framing,
@@ -78,7 +79,7 @@ pub type StreamSignal {
 
 pub type ResponseWriter {
   ResponseWriter(
-    transport: transport.Transport,
+    transport: socket.Transport,
     socket: socket.Socket,
     self: process.Subject(Signal),
     framing: StreamFraming,
@@ -105,7 +106,7 @@ pub type StreamFraming {
 
 pub type SseConnection {
   SseConnection(
-    transport: transport.Transport,
+    transport: socket.Transport,
     socket: socket.Socket,
     self: process.Subject(Signal),
     framing: StreamFraming,
@@ -114,7 +115,7 @@ pub type SseConnection {
 
 pub type WebsocketConnection {
   WebsocketConnection(
-    transport: transport.Transport,
+    transport: socket.Transport,
     socket: socket.Socket,
     context: websocks.Context,
   )

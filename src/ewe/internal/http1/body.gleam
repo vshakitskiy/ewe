@@ -1,5 +1,3 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
@@ -8,6 +6,7 @@ import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/int
 import gleam/result
+import tup/socket
 
 pub type BodyError {
   BodyTooLarge
@@ -148,7 +147,7 @@ fn pull_fixed_chunk(
 }
 
 fn read_exact(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   buffer: BitArray,
   length: Int,
@@ -158,11 +157,11 @@ fn read_exact(
     <<data:bytes-size(length), leftover:bits>> -> Ok(#(data, leftover))
     _buffer ->
       case
-        transport.receive_timeout(
+        socket.receive(
           transport,
           socket,
           length - bit_array.byte_size(buffer),
-          timeout,
+          socket.Milliseconds(timeout),
         )
       {
         Ok(more) -> Ok(#(connection.append_buffer(buffer, more), <<>>))
@@ -257,7 +256,7 @@ fn take_chunk_slice(
 }
 
 fn pull_until(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   buffer: BitArray,
   timeout: Int,
@@ -267,7 +266,7 @@ fn pull_until(
     parser.StepDone(value) -> Ok(value)
     parser.ParseError(error) -> Error(error)
     parser.More ->
-      case transport.receive_timeout(transport, socket, 0, timeout) {
+      case socket.receive(transport, socket, 0, socket.Milliseconds(timeout)) {
         Ok(more) ->
           pull_until(
             transport,
