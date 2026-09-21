@@ -10,16 +10,15 @@ the other.
 
 ## Builder functions
 
-`new` takes two `process.Name`s that helps wiring the acceptor pool's listener 
-to its connection factory. Create them once at startup.
-
+`new` have a label now. `with_name` became `named`.
 ```gleam
 // v4
 ewe.new(handle_request)
 |> ewe.with_name(listener_name)
 
 // latest
-ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+ewe.new(handler: handle_request)
+|> ewe.named(name)
 ```
 
 Labels of `bind` and `listening` got renamed:
@@ -78,16 +77,38 @@ pattern match on the type:
 let ewe.SocketAddress(ip:, port:) = ewe.get_server_info(listener_name)
 
 // latest
-case ewe.get_server_info(process.named_subject(listener_name)) {
+case ewe.get_server_info(name) {
+  Ok(ewe.TcpSocketAddress(ip_address:, port:)) -> todo
+  Ok(ewe.UnixSocketAddress(path:)) -> todo
+  Error(Nil) -> todo
+}
+```
+
+`start` returns the address the server listens on as the started data:
+
+```gleam
+let assert Ok(actor.Started(data: ewe.TcpSocketAddress(port:, ..), ..)) =
+  ewe.new(handler: handle_request)
+  |> ewe.listening_random
+  |> ewe.start
+```
+
+`get_server_info` takes the `process.Name` given to `named` and returns a 
+`Result`, which is an error when no server runs under that name, or when it 
+does not answer within a second.
+
+`on_start` receives a `SocketAddress`.
+
+`get_client_info` returns the `SocketAddress`, so there is no `Error` 
+case to handle:
+
+```gleam
+// latest
+case ewe.get_client_info(request.body) {
   ewe.TcpSocketAddress(ip_address:, port:) -> todo
   ewe.UnixSocketAddress(path:) -> todo
 }
 ```
-
-`get_server_info` takes a `process.Subject(listener.Message)` rather than a
-`process.Name`.
-
-`on_start` receives a `SocketAddress`.
 
 Argument labels were dropped from `ip_address_to_string`, `get_client_info` and
 `get_server_info`:
@@ -403,17 +424,14 @@ stream process on HTTP/2).
 
 ### HTTP/2 is on by default.
 Plaintext connections opening with the h2c preface are served as HTTP/2 and 
-`h2` is offered over ALPN whenever TLS is configured. WebSockets over HTTP/2 need 
-the extended `CONNECT` of RFC 8441 which is off until `websocket: True` is set 
-on `Http2Options`. Until then such a request is refused as malformed.
+`h2` is offered over ALPN whenever TLS is configured. WebSockets run over HTTP/2
+too, through the extended `CONNECT` of RFC 8441. Set `websocket: False` on
+`Http2Options` to refuse such requests as malformed.
 
 ## New since v4
 
 - As HTTP/2 is now available, we have new type `Http2Options` with 
   `default_http2_options` and `with_http2` to adjust HTTP/2 options.
-- WebSockets run over HTTP/2 as well once `websocket` is turned on in 
-  `Http2Options`, with `send_buffer_limit` capping what a stream may leave 
-  queued for a client that is not reading before it is reset.
 - We support unix sockets via `ewe.unix(path)`
 - We can enable client certificate verification via 
   `ewe.with_client_verification` for mTLS.

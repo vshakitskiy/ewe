@@ -35,6 +35,7 @@ pub type ParseError {
   BadMethod
   BadTarget
   BadVersion
+  UnsupportedVersion
   HeaderLineTooLong
   BadHeader
   TooManyHeaders
@@ -58,7 +59,8 @@ pub fn error_to_string(error: ParseError) -> String {
     BadRequestLine -> "malformed request line"
     BadMethod -> "invalid request method"
     BadTarget -> "invalid request target"
-    BadVersion -> "unsupported or malformed HTTP version"
+    BadVersion -> "malformed HTTP version"
+    UnsupportedVersion -> "unsupported HTTP version"
     HeaderLineTooLong -> "header line exceeds the configured limit"
     BadHeader -> "malformed header line"
     TooManyHeaders -> "too many headers"
@@ -83,9 +85,10 @@ pub fn error_to_status(error: ParseError) -> Int {
     RequestLineTooLong -> 414
     HeaderLineTooLong | TooManyHeaders -> 431
     ChunkTooLarge -> 413
-    BadVersion -> 505
+    UnsupportedVersion -> 505
     UnsupportedTransferEncoding -> 501
     BadRequestLine
+    | BadVersion
     | BadMethod
     | BadTarget
     | BadHeader
@@ -226,6 +229,15 @@ fn parse_target_version(bits: BitArray) -> Step(#(BitArray, Version)) {
           StepDone(#(target, Http11))
         <<target:bytes-size(target_size), " HTTP/1.0":utf8>> ->
           StepDone(#(target, Http10))
+        <<
+          _target:bytes-size(target_size),
+          " HTTP/":utf8,
+          major,
+          ".":utf8,
+          minor,
+        >>
+          if major >= 48 && major <= 57 && minor >= 48 && minor <= 57
+        -> ParseError(UnsupportedVersion)
         _bits -> ParseError(BadVersion)
       }
     }

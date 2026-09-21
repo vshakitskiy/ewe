@@ -1,5 +1,3 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/stream
@@ -11,6 +9,7 @@ import gleam/http
 import gleam/option
 import gleam/result
 import logging
+import tup/socket
 import websocks
 
 pub type HandshakeError {
@@ -150,9 +149,9 @@ fn socket_failed(
   conn: http1.WebsocketConnection,
   handlers: Handlers(user_state, user_message),
   state: user_state,
-  reason: socket.SocketReason,
+  reason: socket.SocketError,
 ) -> connection.Outcome {
-  socket.reason_to_string(reason)
+  socket.describe_error(reason)
   |> connection.StoppedAbnormal
   |> ended(conn, handlers, state, _)
 }
@@ -170,8 +169,14 @@ fn loop(
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
     stream.Closed -> stopped(conn, handlers, state)
-    stream.Failed(reason) ->
+    stream.Failed(reason) | stream.Exited(connection.LinkFailed(reason)) ->
       ended(conn, handlers, state, connection.StoppedAbnormal(reason))
+    stream.Exited(connection.ParentExited) ->
+      websocks.CloseReason(websocks.GoingAway, "server shutting down")
+      |> close(conn, _)
+      |> resolve(conn, handlers, state, _)
+    stream.Exited(connection.LinkExitedNormally) ->
+      loop(conn, handlers, selector, state)
     stream.Exhausted ->
       case activate(conn) {
         Ok(Nil) -> loop(conn, handlers, selector, state)
@@ -261,7 +266,7 @@ fn resolve(
   conn: http1.WebsocketConnection,
   handlers: Handlers(user_state, user_message),
   state: user_state,
-  sent: Result(Nil, socket.SocketReason),
+  sent: Result(Nil, socket.SocketError),
 ) -> connection.Outcome {
   case sent {
     Ok(Nil) -> stopped(conn, handlers, state)
@@ -272,7 +277,7 @@ fn resolve(
 pub fn send_text(
   conn: http1.WebsocketConnection,
   text: String,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   websocks.encode_text_frame(
     payload: bit_array_from_string(text),
     context: conn.context,
@@ -284,7 +289,7 @@ pub fn send_text(
 pub fn send_binary(
   conn: http1.WebsocketConnection,
   data: BitArray,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   websocks.encode_binary_frame(
     payload: data,
     context: conn.context,
@@ -296,7 +301,7 @@ pub fn send_binary(
 pub fn send_close(
   conn: http1.WebsocketConnection,
   reason: websocks.CloseReason,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   close(conn, reason)
 }
 
@@ -310,21 +315,21 @@ fn with_context(
 fn close(
   conn: http1.WebsocketConnection,
   reason: websocks.CloseReason,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   write(conn, websocks.encode_close_frame(reason:, masking: option.None))
 }
 
 fn write(
   conn: http1.WebsocketConnection,
   frame: BitArray,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   bytes_tree.from_bit_array(frame)
-  |> transport.send(conn.transport, conn.socket, _)
+  |> socket.send(conn.transport, conn.socket, _)
 }
 
 fn activate(
   conn: http1.WebsocketConnection,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   stream.activate(conn.transport, conn.socket)
 }
 

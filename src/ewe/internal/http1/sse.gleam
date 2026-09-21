@@ -1,5 +1,3 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
@@ -9,6 +7,7 @@ import ewe/internal/sse
 import gleam/erlang/process
 import gleam/option
 import logging
+import tup/socket
 
 type Handlers(user_state, user_message) {
   Handlers(
@@ -83,9 +82,9 @@ fn socket_failed(
   handle: connection.SseConnection,
   handlers: Handlers(user_state, user_message),
   state: user_state,
-  reason: socket.SocketReason,
+  reason: socket.SocketError,
 ) -> connection.Outcome {
-  socket.reason_to_string(reason)
+  socket.describe_error(reason)
   |> connection.StoppedAbnormal
   |> abandoned(conn, handle, handlers, state, _)
 }
@@ -111,9 +110,11 @@ fn loop(
         Ok(Nil) -> loop(conn, handle, handlers, selector, state, reuse)
         Error(reason) -> socket_failed(conn, handle, handlers, state, reason)
       }
-    stream.Closed ->
+    stream.Closed | stream.Exited(connection.ParentExited) ->
       abandoned(conn, handle, handlers, state, connection.Stopped)
-    stream.Failed(reason) ->
+    stream.Exited(connection.LinkExitedNormally) ->
+      loop(conn, handle, handlers, selector, state, reuse)
+    stream.Failed(reason) | stream.Exited(connection.LinkFailed(reason)) ->
       connection.StoppedAbnormal(reason)
       |> abandoned(conn, handle, handlers, state, _)
     stream.UserMessage(message) ->
@@ -157,12 +158,12 @@ fn finished(conn: http1.SseConnection, keep_alive: http1.KeepAlive) -> Nil {
 pub fn send(
   conn: http1.SseConnection,
   event: sse.Event,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   sse.encode(event)
   |> encoder.frame(conn.framing)
-  |> transport.send(conn.transport, conn.socket, _)
+  |> socket.send(conn.transport, conn.socket, _)
 }
 
-fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketReason) {
+fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketError) {
   stream.activate(conn.transport, conn.socket)
 }

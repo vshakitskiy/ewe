@@ -1,10 +1,9 @@
-import ewe/glisten/socket
-import ewe/glisten/transport
 import ewe/internal/connection
 import gleam/bytes_tree
 import gleam/int
 import gleam/option
 import gleam/result
+import tup/socket
 
 pub type FileError {
   NotFound
@@ -84,10 +83,10 @@ pub fn release_body(body: connection.Body) -> Nil {
 }
 
 pub fn send(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   file: connection.File,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   case file {
     connection.OpenFile(handle:, offset:, length:) ->
       send_handle(transport, socket, handle, offset, length)
@@ -97,12 +96,12 @@ pub fn send(
 }
 
 fn send_handle(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   handle: connection.FileDescriptor,
   offset: Int,
   length: Int,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   let sent = send_chunk(transport, socket, handle, offset, length)
 
   close(handle)
@@ -110,18 +109,18 @@ fn send_handle(
 }
 
 pub fn send_chunk(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   handle: connection.FileDescriptor,
   offset: Int,
   length: Int,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   case length {
     0 -> Ok(Nil)
     _length ->
       case transport {
-        transport.Tcp -> do_sendfile(handle, socket, offset, length)
-        transport.Ssl -> send_chunks(transport, socket, handle, offset, length)
+        socket.Tcp -> do_sendfile(handle, socket, offset, length)
+        socket.Ssl -> send_chunks(transport, socket, handle, offset, length)
       }
   }
 }
@@ -129,18 +128,18 @@ pub fn send_chunk(
 const chunk_size = 65_536
 
 fn send_chunks(
-  transport: transport.Transport,
+  transport: socket.Transport,
   socket: socket.Socket,
   handle: connection.FileDescriptor,
   offset: Int,
   remaining: Int,
-) -> Result(Nil, socket.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   case remaining {
     0 -> Ok(Nil)
     _remaining -> {
       let amount = int.min(remaining, chunk_size)
       use data <- result.try(pread(handle, offset, amount))
-      use Nil <- result.try(transport.send(
+      use Nil <- result.try(socket.send(
         transport,
         socket,
         bytes_tree.from_bit_array(data),
@@ -173,7 +172,7 @@ fn do_sendfile(
   socket: socket.Socket,
   offset: Int,
   bytes: Int,
-) -> Result(Nil, socket.SocketReason)
+) -> Result(Nil, socket.SocketError)
 
 @external(erlang, "ewe_file_ffi", "open")
 pub fn open(path: String) -> Result(connection.FileDescriptor, FileError)
@@ -186,7 +185,7 @@ fn pread(
   handle: connection.FileDescriptor,
   offset: Int,
   length: Int,
-) -> Result(BitArray, socket.SocketReason)
+) -> Result(BitArray, socket.SocketError)
 
 @external(erlang, "ewe_file_ffi", "close")
 pub fn close(handle: connection.FileDescriptor) -> Nil

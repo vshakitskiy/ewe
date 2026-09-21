@@ -3,6 +3,7 @@ import ewe/internal/http2/body
 import ewe/internal/http2/connection as http2
 import gleam/erlang/process
 import gleam/option
+import tup
 
 fn fill_mailbox(
   conn_subject: process.Subject(http2.Reply(ewe_connection.Body)),
@@ -37,7 +38,7 @@ fn mock_connection(
     pending_trailers: option.None,
     read: 0,
     body_read_timeout: 1000,
-    peer: Error(Nil),
+    peer: tup.TcpEndpoint(tup.Ipv4(127, 0, 0, 1), 0),
     protocol: option.None,
   )
 }
@@ -115,7 +116,7 @@ pub fn read_body_no_body_skips_round_trip_test() {
       pending_trailers: option.None,
       read: 0,
       body_read_timeout: 1000,
-      peer: Error(Nil),
+      peer: tup.TcpEndpoint(tup.Ipv4(127, 0, 0, 1), 0),
       protocol: option.None,
     )
 
@@ -177,7 +178,7 @@ pub fn read_body_chunk_no_body_skips_round_trip_test() {
       pending_trailers: option.None,
       read: 0,
       body_read_timeout: 1000,
-      peer: Error(Nil),
+      peer: tup.TcpEndpoint(tup.Ipv4(127, 0, 0, 1), 0),
       protocol: option.None,
     )
 

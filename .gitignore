@@ -2,8 +2,6 @@
 *.ez
 /build
 erl_crash.dump
-.claude
-CLAUDE.md
 autobahn/server
 # examples
 /bench

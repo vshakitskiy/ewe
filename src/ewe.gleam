@@ -15,6 +15,7 @@
 ////     header: "Builder",
 ////     functions: [
 ////       "new",
+////       "named",
 ////       "bind",
 ////       "listening",
 ////       "listening_random",
@@ -148,12 +149,6 @@
 ////   )
 //// </script>
 
-import ewe/glisten
-import ewe/glisten/internal/handler
-import ewe/glisten/internal/listener
-import ewe/glisten/socket
-import ewe/glisten/socket/options
-import ewe/glisten/transport
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
@@ -179,12 +174,12 @@ import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import gleam/otp/factory_supervisor as factory
-import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import logging
+import tup
+import tup/socket
 import websocks
 
 /// The connection a request arrived on.
@@ -250,27 +245,20 @@ pub type IpAddress {
 /// ```
 pub fn ip_address_to_string(address: IpAddress) -> String {
   to_internal_ip_address(address)
-  |> glisten.ip_address_to_string
+  |> tup.ip_address_to_string
 }
 
-fn to_internal_ip_address(address: IpAddress) -> glisten.IpAddress {
+fn to_internal_ip_address(address: IpAddress) -> tup.IpAddress {
   case address {
-    IpV4(a, b, c, d) -> glisten.IpV4(a, b, c, d)
-    IpV6(a, b, c, d, e, f, g, h) -> glisten.IpV6(a, b, c, d, e, f, g, h)
+    IpV4(a, b, c, d) -> tup.Ipv4(a, b, c, d)
+    IpV6(a, b, c, d, e, f, g, h) -> tup.Ipv6(a, b, c, d, e, f, g, h)
   }
 }
 
-fn from_internal_options_ip_address(address: options.IpAddress) -> IpAddress {
+fn from_internal_ip_address(address: tup.IpAddress) -> IpAddress {
   case address {
-    options.IpV4(a, b, c, d) -> IpV4(a, b, c, d)
-    options.IpV6(a, b, c, d, e, f, g, h) -> IpV6(a, b, c, d, e, f, g, h)
-  }
-}
-
-fn from_internal_ip_address(address: glisten.IpAddress) -> IpAddress {
-  case address {
-    glisten.IpV4(a, b, c, d) -> IpV4(a, b, c, d)
-    glisten.IpV6(a, b, c, d, e, f, g, h) -> IpV6(a, b, c, d, e, f, g, h)
+    tup.Ipv4(a, b, c, d) -> IpV4(a, b, c, d)
+    tup.Ipv6(a, b, c, d, e, f, g, h) -> IpV6(a, b, c, d, e, f, g, h)
   }
 }
 
@@ -282,56 +270,42 @@ pub type SocketAddress {
   UnixSocketAddress(path: String)
 }
 
-// Field order differs between `SocketAddress` and `glisten.SocketAddress`.
-fn convert_socket_address(address: glisten.SocketAddress) -> SocketAddress {
-  case address {
-    glisten.TcpSocketAddress(port:, ip_address:) ->
+fn from_internal_endpoint(endpoint: tup.Endpoint) -> SocketAddress {
+  case endpoint {
+    tup.TcpEndpoint(ip_address:, port:) ->
       TcpSocketAddress(ip_address: from_internal_ip_address(ip_address), port:)
-    glisten.UnixSocketAddress(path:) -> UnixSocketAddress(path:)
+    tup.UnixEndpoint(path:) -> UnixSocketAddress(path:)
   }
 }
 
 /// Get the address of the client at the other end of the connection.
 ///
-/// Returns an error if the address could not be looked up such as when the
-/// connection has already closed.
-pub fn get_client_info(connection: Connection) -> Result(SocketAddress, Nil) {
-  // An HTTP/2 handler runs in a process that has no access to the socket so the
-  // address is resolved once for the connection and carried on every stream.
-  let peername = case connection {
-    connection.Http1(connection) ->
-      transport.peername(connection.transport, connection.socket)
+/// The address is read once when the client connects.
+pub fn get_client_info(connection: Connection) -> SocketAddress {
+  case connection {
+    connection.Http1(connection) -> connection.peer
     connection.Http2(connection) -> connection.peer
   }
-
-  use info <- result.map(over: peername)
-
-  case info {
-    socket.TcpSockName(ip_address:, port:) ->
-      from_internal_options_ip_address(ip_address)
-      |> TcpSocketAddress(port:)
-    socket.UnixSockName(path:) -> UnixSocketAddress(path:)
-  }
+  |> from_internal_endpoint
 }
 
 /// Get the address the server is listening on. This is how you find the port
 /// picked by `listening_random`.
 ///
-/// The server must be running. Pass the subject of the `listener_name` given
-/// to `new`.
+/// Returns an error when no server runs under the name or when it does not 
+/// answer within a second. Pass the name given to `named`.
 ///
 /// # Examples
 ///
 /// ```gleam
-/// process.named_subject(listener_name)
-/// |> ewe.get_server_info
-/// // -> TcpSocketAddress(IpV4(127, 0, 0, 1), 3000)
+/// ewe.get_server_info(name)
+/// // -> Ok(TcpSocketAddress(IpV4(127, 0, 0, 1), 3000))
 /// ```
 pub fn get_server_info(
-  listener: process.Subject(listener.Message),
-) -> SocketAddress {
-  glisten.get_server_info(listener, 1000)
-  |> convert_socket_address
+  name: process.Name(tup.Server),
+) -> Result(SocketAddress, Nil) {
+  tup.listen_endpoint(name, within: 1000)
+  |> result.map(from_internal_endpoint)
 }
 
 type BindTarget {
@@ -361,12 +335,37 @@ pub type TlsKeyType {
   PrivateKeyInfo
 }
 
-fn to_internal_tls_key_type(key_type: TlsKeyType) -> options.TlsKeyType {
+fn to_internal_key(key_type: TlsKeyType, key: BitArray) -> tup.TlsPrivateKey {
   case key_type {
-    RsaPrivateKey -> options.RsaPrivateKey
-    EcPrivateKey -> options.EcPrivateKey
-    DsaPrivateKey -> options.DsaPrivateKey
-    PrivateKeyInfo -> options.PrivateKeyInfo
+    RsaPrivateKey -> tup.RsaPrivateKey(key)
+    EcPrivateKey -> tup.EcPrivateKey(key)
+    DsaPrivateKey -> tup.DsaPrivateKey(key)
+    PrivateKeyInfo -> tup.PrivateKeyInfo(key)
+  }
+}
+
+fn to_internal_tls(
+  tls: Tls,
+  client_verification: Option(ClientVerification),
+) -> tup.Tls {
+  let certificate = case tls {
+    Disk(cert:, key:) -> tup.Disk(cert:, key:)
+    Pem(cert:, key:) -> tup.Pem(cert:, key:)
+    Der(cert:, key:, key_type:) ->
+      tup.Der(chain: [cert], key: to_internal_key(key_type, key))
+  }
+
+  let tls =
+    tup.tls(certificate)
+    |> tup.with_alpn(["h2", "http/1.1"])
+
+  case client_verification {
+    Some(verification) ->
+      tup.verifying_clients(
+        tls,
+        tup.Required(trusting: to_internal_trust_store(verification)),
+      )
+    None -> tls
   }
 }
 
@@ -546,7 +545,7 @@ fn to_internal_http1_options(options: Http1Options) -> http1.Options {
   )
 }
 
-const max_window_size = 2_147_483_647
+const max_window_size: Int = 2_147_483_647
 
 /// The limits and timeouts applied to every HTTP/2 connection.
 ///
@@ -588,9 +587,6 @@ pub type Http2Options {
     /// How long a connection may sit in the preface and SETTINGS handshake
     /// before it is dropped.
     handshake_timeout: Int,
-    /// How long a draining connection waits for its streams to finish after
-    /// GOAWAY before closing.
-    drain_timeout: Int,
     /// Once a receive window falls to this it is topped straight back up to
     /// `recv_window_high_water_mark` rather than trickling small updates.
     recv_window_low_water_mark: Int,
@@ -603,7 +599,7 @@ pub type Http2Options {
     /// How long a single read of a request body waits for the client.
     body_read_timeout: Int,
     /// Whether a client may open a WebSocket over HTTP/2 with the extended
-    /// `CONNECT` of RFC 8441. `True` advertises 
+    /// `CONNECT` of RFC 8441. `True`, the default, advertises
     /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`; `False` refuses a request carrying
     /// `:protocol` as malformed.
     websocket: Bool,
@@ -628,7 +624,7 @@ pub fn default_http2_options() -> Http2Options {
     rapid_reset_window_ms:,
     rapid_reset_threshold:,
     handshake_timeout_ms:,
-    drain_timeout_ms:,
+    drain_timeout_ms: _drain_timeout,
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     file_read_threshold:,
@@ -648,7 +644,6 @@ pub fn default_http2_options() -> Http2Options {
     rapid_reset_window: rapid_reset_window_ms,
     rapid_reset_threshold:,
     handshake_timeout: handshake_timeout_ms,
-    drain_timeout: drain_timeout_ms,
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     file_read_threshold:,
@@ -658,7 +653,10 @@ pub fn default_http2_options() -> Http2Options {
   )
 }
 
-fn to_internal_http2_options(options: Http2Options) -> http2.Options {
+fn to_internal_http2_options(
+  options: Http2Options,
+  shutdown_timeout: Int,
+) -> http2.Options {
   let defaults = http2.default_options()
 
   let #(recv_window_low_water_mark, recv_window_high_water_mark) = case
@@ -745,12 +743,7 @@ fn to_internal_http2_options(options: Http2Options) -> http2.Options {
       defaults.handshake_timeout_ms,
       "handshake_timeout",
     ),
-    drain_timeout_ms: at_least(
-      options.drain_timeout,
-      1,
-      defaults.drain_timeout_ms,
-      "drain_timeout",
-    ),
+    drain_timeout_ms: shutdown_timeout - shutdown_timeout / 10,
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     websocket: options.websocket,
@@ -784,12 +777,10 @@ pub type ClientVerification {
   CaCertData(certs: List(BitArray))
 }
 
-fn to_internal_client_verification(
-  verification: ClientVerification,
-) -> glisten.CaCert {
+fn to_internal_trust_store(verification: ClientVerification) -> tup.TrustStore {
   case verification {
-    CaCertFile(path:) -> glisten.CaCertFile(path)
-    CaCertData(certs:) -> glisten.CaCertData(certs)
+    CaCertFile(path:) -> tup.TrustDisk(path)
+    CaCertData(certs:) -> tup.TrustDer(certs)
   }
 }
 
@@ -806,36 +797,29 @@ pub opaque type Builder {
     client_verification: Option(ClientVerification),
     http1: Http1Options,
     http2: Http2Options,
-    listener_name: process.Name(listener.Message),
-    connection_factory_name: process.Name(
-      factory.Message(
-        socket.Socket,
-        process.Subject(handler.Message(connection.Message)),
-      ),
-    ),
+    name: Option(process.Name(tup.Server)),
     on_start: fn(http.Scheme, SocketAddress) -> Nil,
+    shutdown_timeout: Int,
   )
 }
+
+const default_shutdown_timeout: Int = 15_000
 
 /// Create a new server configuration. The handler is called for every request
 /// and the response it returns is sent to the client.
 ///
-/// The two names are used by the acceptor pool to wire its listener and its
-/// connection factory together. Create them once where your program starts
-/// and pass them in here.
-///
 /// The server listens on 127.0.0.1:3000 and prints its address once started.
 /// Use `bind`, `listening` and `on_start` to change that.
+///
+/// `start` hands back the address the server listens on. Give the server a
+/// name with `named` to look it up with `get_server_info`.
 ///
 /// # Examples
 ///
 /// ```gleam
 /// pub fn main() {
-///   let listener_name = process.new_name("listener_name")
-///   let connection_factory_name = process.new_name("connection_factory_name")
-///
 ///   let assert Ok(_) =
-///     ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+///     ewe.new(handler: handle_request)
 ///     |> ewe.bind(to: "0.0.0.0")
 ///     |> ewe.listening(on: 8080)
 ///     |> ewe.start
@@ -844,15 +828,8 @@ pub opaque type Builder {
 /// }
 /// ```
 pub fn new(
-  listener_name listener_name: process.Name(listener.Message),
-  connection_factory_name connection_factory_name: process.Name(
-    factory.Message(
-      socket.Socket,
-      process.Subject(handler.Message(connection.Message)),
-    ),
-  ),
   handler handler: fn(request.Request(Connection)) -> response.Response(Body),
-) {
+) -> Builder {
   Builder(
     handler:,
     on_crash: response.set_body(response.new(500), Empty),
@@ -861,8 +838,7 @@ pub fn new(
     client_verification: None,
     http1: default_http1_options(),
     http2: default_http2_options(),
-    listener_name:,
-    connection_factory_name:,
+    name: None,
     on_start: fn(scheme, address) {
       case address {
         TcpSocketAddress(ip_address:, port:) -> {
@@ -883,7 +859,29 @@ pub fn new(
         UnixSocketAddress(path:) -> io.println("Listening on unix:" <> path)
       }
     },
+    shutdown_timeout: default_shutdown_timeout,
   )
+}
+
+/// Register the running server under a name. Create the name once where your 
+/// program starts.
+///
+/// # Examples
+///
+/// ```gleam
+/// let name = process.new_name("ewe")
+///
+/// let assert Ok(_) =
+///   ewe.new(handler: handle_request)
+///   |> ewe.named(name)
+///   |> ewe.listening_random
+///   |> ewe.start
+///
+/// ewe.get_server_info(name)
+/// // -> Ok(TcpSocketAddress(IpV4(127, 0, 0, 1), 54321))
+/// ```
+pub fn named(builder: Builder, name: process.Name(tup.Server)) -> Builder {
+  Builder(..builder, name: Some(name))
 }
 
 /// Set the network interface the server listens on. `"127.0.0.1"` and
@@ -920,9 +918,6 @@ pub fn listening(builder: Builder, on port: Int) -> Builder {
 
 /// Listen on port 0, which asks the operating system for any free port. This
 /// is useful in tests where a fixed port would clash.
-///
-/// Use `get_server_info` once the server is running to find the port it was
-/// given.
 pub fn listening_random(builder: Builder) -> Builder {
   listening(builder, on: 0)
 }
@@ -981,6 +976,20 @@ pub fn on_start(
 /// function with one that does nothing.
 pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
+}
+
+/// Set how long each connection gets to finish when the server shuts down in
+/// milliseconds. 15 seconds by default.
+///
+/// HTTP/1 connections finish the request they are serving, WebSockets are sent
+/// a going-away close frame and HTTP/2 connections send GOAWAY and wait for
+/// their open streams. A connection still open once the time is up is closed.
+///
+/// This only happens when the server runs in the supervision tree of an OTP
+/// application. One started from `main`, even under a supervisor, is killed
+/// with the VM instead.
+pub fn shutdown_timeout(builder: Builder, milliseconds: Int) -> Builder {
+  Builder(..builder, shutdown_timeout: milliseconds)
 }
 
 /// Set the response sent when the handler crashes. By default that is an empty
@@ -1059,11 +1068,25 @@ fn to_internal_body(body: Body) -> connection.Body {
 
 /// Start the server, running the `on_start` function once it is listening.
 ///
-/// The supervisor returned holds the acceptor pool. To put the server under a
-/// supervision tree use `supervised` instead.
+/// The started data is the address the server listens on, including the port
+/// the operating system picked for `listening_random`. To put the server under
+/// a supervision tree use `supervised` instead.
+///
+/// # Examples
+///
+/// ```gleam
+/// let assert Ok(actor.Started(data: address, ..)) =
+///   ewe.new(handler: handle_request)
+///   |> ewe.listening_random
+///   |> ewe.quiet
+///   |> ewe.start
+///
+/// address
+/// // -> TcpSocketAddress(IpV4(127, 0, 0, 1), 54321)
+/// ```
 pub fn start(
   builder: Builder,
-) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
+) -> Result(actor.Started(SocketAddress), actor.StartError) {
   let handler =
     connection.Handler(
       call: fn(request) {
@@ -1073,74 +1096,68 @@ pub fn start(
       on_crash: to_internal_crash_response(builder.on_crash),
     )
 
+  let shutdown_timeout =
+    at_least(
+      builder.shutdown_timeout,
+      1,
+      default_shutdown_timeout,
+      "shutdown_timeout",
+    )
+
   let pool =
-    glisten.new(
-      listener_name: builder.listener_name,
-      connection_factory_name: builder.connection_factory_name,
+    tup.new(
       on_init: handler_.on_init(
         handler,
         to_internal_http1_options(builder.http1),
-        to_internal_http2_options(builder.http2),
+        to_internal_http2_options(builder.http2, shutdown_timeout),
       ),
-      loop: handler_.loop,
+      handler: handler_.loop,
+      on_close: fn(_state) { Nil },
     )
-    |> glisten.with_http2
+    |> tup.shutdown_timeout(shutdown_timeout)
+
+  let pool = case builder.name {
+    Some(name) -> tup.named(pool, name)
+    None -> pool
+  }
 
   let pool = case builder.tls {
-    Some(Disk(cert:, key:)) ->
-      glisten.with_tls(pool, certfile: cert, keyfile: key)
-    Some(Pem(cert:, key:)) -> glisten.with_tls_pem(pool, cert:, key:)
-    Some(Der(cert:, key:, key_type:)) ->
-      glisten.with_tls_der(
-        pool,
-        cert:,
-        key_type: to_internal_tls_key_type(key_type),
-        key:,
-      )
+    Some(tls) ->
+      to_internal_tls(tls, builder.client_verification)
+      |> tup.with_tls(pool, _)
     None -> pool
   }
 
-  let pool = case builder.client_verification {
-    Some(ca_cert) ->
-      glisten.with_client_verification(
-        pool,
-        to_internal_client_verification(ca_cert),
-      )
-    None -> pool
-  }
-
-  use started <- result.map(over: case builder.bind_target {
+  let pool = case builder.bind_target {
     TcpBind(interface:, port:, ipv6:) -> {
-      let pool = glisten.bind(pool, interface)
+      let pool = tup.listening(pool, on: tup.Tcp(interface:, port:))
 
-      let pool = case ipv6 {
-        True -> glisten.with_ipv6(pool)
+      case ipv6 {
+        True -> tup.force_ipv6(pool)
         False -> pool
       }
-
-      glisten.start(pool, port)
     }
-    UnixBind(path:) -> glisten.start_unix(pool, path)
-  })
+    UnixBind(path:) -> tup.listening(pool, on: tup.Unix(path:))
+  }
+
+  use started <- result.map(over: tup.start(pool))
+  let actor.Started(pid:, data: endpoint) = started
+  let address = from_internal_endpoint(endpoint)
 
   let scheme = case builder.tls {
     Some(_tls) -> http.Https
     None -> http.Http
   }
-  let address =
-    process.named_subject(builder.listener_name)
-    |> get_server_info
-
   builder.on_start(scheme, address)
 
-  started
+  actor.Started(pid:, data: address)
 }
 
 /// Create a child specification for the server so that it can be added to a
 /// supervision tree.
 pub fn supervised(
   builder: Builder,
-) -> supervision.ChildSpecification(supervisor.Supervisor) {
+) -> supervision.ChildSpecification(SocketAddress) {
   fn() { start(builder) }
   |> supervision.supervisor
 }
@@ -1439,8 +1456,8 @@ fn from_interrupted(interrupted: http2.Interrupted) -> SendError {
   }
 }
 
-fn to_send_error(reason: socket.SocketReason) -> SendError {
-  case reason {
+fn to_send_error(error: socket.SocketError) -> SendError {
+  case error {
     socket.Closed
     | socket.Econnaborted
     | socket.Econnreset
@@ -1448,8 +1465,7 @@ fn to_send_error(reason: socket.SocketReason) -> SendError {
     | socket.Epipe
     | socket.Etimedout
     | socket.Einval
-    | socket.Ebadf
-    | socket.Terminated -> ConnectionClosed
+    | socket.Ebadf -> ConnectionClosed
     socket.Timeout -> SendTimedOut
     socket.Enobufs | socket.Enomem -> SocketError(OutOfBuffers)
     socket.Emfile | socket.Enfile -> SocketError(TooManyOpenFiles)
@@ -1460,12 +1476,12 @@ fn to_send_error(reason: socket.SocketReason) -> SendError {
     socket.Eacces | socket.Eperm -> SocketError(PermissionDenied)
     socket.Eagain | socket.Ewouldblock -> SocketError(WouldBlock)
     socket.Eintr -> SocketError(Interrupted)
-    socket.Enotsup | socket.Eopnotsupp -> SocketError(NotSupported)
+    socket.Enotsup | socket.Unsupported -> SocketError(NotSupported)
     socket.Eio -> SocketError(IoError)
-    reason -> {
+    _remaining -> {
       logging.log(
         logging.Warning,
-        "The socket refused a write: " <> socket.reason_to_string(reason),
+        "The socket refused a write: " <> socket.describe_error(error),
       )
 
       SocketError(UnknownReason)

@@ -6,6 +6,7 @@
     set_http_date/1,
     get_http_date/0,
     rescue_handler/1,
+    parent_pid/0,
     is_valid_utf8/1
 ]).
 
@@ -21,6 +22,12 @@ rescue_handler(Func) ->
     Class:Reason:Stacktrace ->
       Formatted = erl_error:format_exception(Class, Reason, Stacktrace),
       {error, unicode:characters_to_binary(Formatted)}
+  end.
+
+parent_pid() ->
+  case erlang:process_info(self(), parent) of
+    {parent, Pid} when is_pid(Pid) -> {ok, Pid};
+    _Other -> {error, nil}
   end.
 
 now_datetime() ->

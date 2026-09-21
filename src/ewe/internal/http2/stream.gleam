@@ -76,15 +76,20 @@ fn deliver(
         Error(_interrupted) -> Nil
         Ok(writer) -> handler(connection.Http2Writer(writer))
       }
-    connection.Sse(connection.SseMetadata(handler:)), _method ->
-      case begin(reply_to, stream_id, response, http2.EventStream) {
+    connection.Sse(connection.SseMetadata(handler:)), _method -> {
+      let signals = process.new_subject()
+
+      case begin(reply_to, stream_id, response, http2.EventStream(signals)) {
         Error(_interrupted) -> Nil
         Ok(writer) ->
-          case handler(connection.Http2Sse(http2.SseConnection(writer))) {
+          case
+            handler(connection.Http2Sse(http2.SseConnection(writer:, signals:)))
+          {
             connection.Stopped -> Nil
             connection.StoppedAbnormal(reason) -> abort(reason)
           }
       }
+    }
     connection.Bytes(_tree), _method
     | connection.Text(_text), _method
     | connection.Empty, _method

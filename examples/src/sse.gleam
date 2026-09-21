@@ -23,9 +23,6 @@ pub fn main() -> Nil {
   let pubsub_name = process.new_name("pubsub")
   let pubsub = process.named_subject(pubsub_name)
 
-  let listener_name = process.new_name("listener_name")
-  let connection_factory_name = process.new_name("connection_factory_name")
-
   // Remember, `handle_request(_, pubsub)` is the same as:
   // fn(request) { handle_request(request, pubsub) }
   let handler = handle_request(_, pubsub)
@@ -37,7 +34,7 @@ pub fn main() -> Nil {
     supervisor.new(supervisor.OneForAll)
     |> supervisor.add(pubsub.worker(pubsub_name))
     |> supervisor.add(
-      ewe.new(listener_name:, connection_factory_name:, handler:)
+      ewe.new(handler:)
       |> ewe.bind(to: "0.0.0.0")
       |> ewe.listening(on: 8080)
       // Use ewe.supervised instead of ewe.start to run under supervision.

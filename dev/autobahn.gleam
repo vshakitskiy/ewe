@@ -10,16 +10,10 @@ pub fn main() -> Nil {
   logging.configure()
   logging.set_level(logging.Warning)
 
-  let listener_name = process.new_name("autobahn_listener")
-  let connection_factory_name = process.new_name("autobahn_factory")
-
   let assert Ok(_started) =
-    ewe.new(listener_name:, connection_factory_name:, handler: handle_request)
+    ewe.new(handler: handle_request)
     |> ewe.bind("0.0.0.0")
     |> ewe.listening(on: 8080)
-    |> ewe.with_http2(
-      ewe.Http2Options(..ewe.default_http2_options(), websocket: True),
-    )
     |> ewe.start
 
   process.sleep_forever()

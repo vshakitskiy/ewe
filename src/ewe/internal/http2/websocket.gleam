@@ -113,7 +113,11 @@ fn loop(
   state: user_state,
 ) -> connection.Outcome {
   case process.selector_receive_forever(selector) {
-    Interrupted -> stopped(conn, handlers, state)
+    Exited(connection.ParentExited) -> stopped(conn, handlers, state)
+    Exited(connection.LinkExitedNormally) ->
+      loop(conn, handlers, selector, state)
+    Exited(connection.LinkFailed(reason)) ->
+      ended(conn, handlers, state, connection.StoppedAbnormal(reason))
     Signal(http2.Draining) ->
       close(
         conn,
@@ -123,7 +127,7 @@ fn loop(
     Received(message) ->
       websocket.UserMessage(message)
       |> deliver(conn, handlers, selector, state, Await, _)
-    Body(http2.DoneEvent(_trailers)) -> stopped(conn, handlers, state)
+    Body(http2.DoneEvent(_trailers)) -> finished(conn, handlers, state)
     Body(http2.ChunkEvent(data)) ->
       websocks.push_data(conn.context, data)
       |> with_context(conn, _)
@@ -155,7 +159,7 @@ fn drain(
       let conn = with_context(conn, context)
 
       case resume {
-        Halt -> stopped(conn, handlers, state)
+        Halt -> finished(conn, handlers, state)
         Await -> {
           read(conn)
           loop(conn, handlers, selector, state)
@@ -198,7 +202,9 @@ fn deliver(
 
   case rescue.handler(fn() { handlers.step(handle, state, message) }) {
     Error(details) -> crashed(conn, handlers, state, details)
-    Ok(connection.Halt(outcome)) -> ended(conn, handlers, state, outcome)
+    Ok(connection.Halt(connection.Stopped)) -> finished(conn, handlers, state)
+    Ok(connection.Halt(connection.StoppedAbnormal(..) as outcome)) ->
+      ended(conn, handlers, state, outcome)
     Ok(connection.Proceed(user_state: state, messages:)) -> {
       let selector = case messages {
         option.Some(messages) -> stream_selector(conn, messages)
@@ -231,6 +237,14 @@ fn stopped(
   state: user_state,
 ) -> connection.Outcome {
   ended(conn, handlers, state, connection.Stopped)
+}
+
+fn finished(
+  conn: Connection,
+  handlers: Handlers(user_state, user_message),
+  state: user_state,
+) -> connection.Outcome {
+  finish(conn, <<>>) |> resolve(conn, handlers, state, _)
 }
 
 fn crashed(
@@ -300,13 +314,16 @@ fn close(
   conn: Connection,
   reason: websocks.CloseReason,
 ) -> Result(Nil, http2.Interrupted) {
-  let frame = websocks.encode_close_frame(reason:, masking: option.None)
+  websocks.encode_close_frame(reason:, masking: option.None)
+  |> finish(conn, _)
+}
 
+fn finish(conn: Connection, bytes: BitArray) -> Result(Nil, http2.Interrupted) {
   process.send(
     conn.writer.connection,
     http2.PushData(
       conn.writer.stream_id,
-      http2.Finish(frame, option.Some(conn.writer.ack)),
+      http2.Finish(bytes, option.Some(conn.writer.ack)),
     ),
   )
 
@@ -322,7 +339,7 @@ type Received(user_message) {
   Received(user_message)
   Body(http2.BodyEvent)
   Signal(http2.StreamSignal)
-  Interrupted
+  Exited(connection.Exit)
 }
 
 fn stream_selector(
@@ -332,11 +349,7 @@ fn stream_selector(
   process.map_selector(messages, Received)
   |> process.select_map(conn.body, Body)
   |> process.select_map(conn.signals, Signal)
-  |> process.select_trapped_exits(interrupted)
-}
-
-fn interrupted(_exit: process.ExitMessage) -> Received(user_message) {
-  Interrupted
+  |> connection.select_exits(Exited)
 }
 
 @external(erlang, "ewe_ffi", "identity")

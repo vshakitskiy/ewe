@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Replace the vendored `glisten` fork with `tup` as the acceptor pool.
+- `new` takes only the handler.
+- Add `named` which registers the server under a name.
+- `get_server_info` takes the name and returns a `Result`.
+- `start` hand back the `SocketAddress` the server listens on.
+- `get_client_info` returns the `SocketAddress` instead of a `Result`.
+- `websocket` in `Http2Options` is now `True` by default.
+- Add `shutdown_timeout`, replacing `drain_timeout` in `Http2Options`.
+- Fix a crashed HTTP/2 stream taking its whole connection down.
+- Fix HTTP/2 not sending GOAWAY on shutdown.
+- Fix WebSockets and SSE not ending on shutdown.
+- Fix a linked process exiting ending HTTP/2 WebSockets and SSE.
+- Fix HTTP/2 WebSockets not ending the stream on close.
+- Fix client data after an ended HTTP/2 response failing the connection.
+- Respect the protocol negotiated through ALPN.
+- Close connections with an invalid HTTP/2 preface instead of answering over
+  HTTP/1.
+
 ## v7.0.0 - 31.08.2026
 
 - Fix ssl application not starting up.

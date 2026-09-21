@@ -30,13 +30,11 @@ const max_body_size = 8_000_000
 /// ```gleam
 /// pub fn main() {
 ///   let secret_key_base = "..."
-///   let listener_name = process.new_name("ewe_listener")
-///   let connection_factory_name = process.new_name("ewe_connection_factory")
 ///
 ///   let assert Ok(_) =
 ///     handle_request
 ///     |> wisp_ewe.handler(secret_key_base)
-///     |> ewe.new(listener_name:, connection_factory_name:, handler: _)
+///     |> ewe.new(handler: _)
 ///     |> ewe.listening(on: 8000)
 ///     |> ewe.start
 ///

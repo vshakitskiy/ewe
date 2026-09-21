@@ -1,6 +1,4 @@
 import alpacki
-import ewe/glisten
-import ewe/glisten/socket
 import ewe/internal/clock
 import ewe/internal/connection
 import ewe/internal/file
@@ -20,6 +18,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import logging
+import tup
+import tup/socket
 
 @internal
 pub type PeerSettings {
@@ -91,6 +91,7 @@ pub type HeaderAssembly {
 pub type StreamStatus {
   Computing(pid: process.Pid)
   Flushing
+  Finished
 }
 
 @internal
@@ -147,7 +148,7 @@ pub type State {
     options: http2.Options,
     settings_frame: bytes_tree.BytesTree,
     patterns: headers.HeaderPatterns,
-    peer: Result(socket.SockName, Nil),
+    peer: tup.Endpoint,
     parent: Result(process.Pid, Nil),
   )
 }
@@ -200,7 +201,7 @@ pub fn kill_live_workers(state: State) -> Nil {
 
   case entry.status {
     Computing(pid) -> process.send_abnormal_exit(pid, "connection_closed")
-    Flushing -> Nil
+    Flushing | Finished -> Nil
   }
 
   case entry.pending {
@@ -214,7 +215,7 @@ pub fn init(
   options: http2.Options,
   self: process.Subject(connection.Message),
   reply_subject: process.Subject(http2.Reply(connection.Body)),
-  peer: Result(socket.SockName, Nil),
+  peer: tup.Endpoint,
   parent: Result(process.Pid, Nil),
 ) -> State {
   let table = alpacki.new_dynamic(options.header_table_size)
@@ -257,21 +258,21 @@ pub fn init(
 
 pub fn handle_message(
   state: State,
-  message: glisten.Message(connection.Message),
-  connection: glisten.Connection(connection.Message),
+  message: tup.Message(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case message {
-    glisten.Packet(bytes) -> handle_packet(state, bytes, connection)
-    glisten.User(connection.Http2Handshake) ->
+    tup.Incoming(bytes) -> handle_packet(state, bytes, connection)
+    tup.User(connection.Http2Handshake) ->
       handle_handshake_timeout(state, connection)
-    glisten.User(connection.Http2Stream(reply)) ->
+    tup.User(connection.Http2Stream(reply)) ->
       handle_stream_reply(state, reply, connection)
-    glisten.User(connection.Http2Exit(exit)) ->
+    tup.User(connection.Http2Exit(exit)) ->
       handle_stream_exit(state, exit, connection)
-    glisten.User(connection.Http2Drain) -> stop_connection(state)
-    glisten.User(connection.Http2StreamClose(pid)) ->
+    tup.User(connection.Http2Drain) -> stop_connection(state)
+    tup.User(connection.Http2StreamClose(pid)) ->
       finish_or_continue(handle_stream_close_timeout(state, pid))
-    glisten.User(connection.Timeout) -> Continue(state)
+    tup.User(connection.Timeout) -> Continue(state)
   }
 }
 
@@ -281,10 +282,7 @@ fn stop_connection(state: State) -> Next {
   Close
 }
 
-fn handle_handshake_timeout(
-  state: State,
-  connection: glisten.Connection(connection.Message),
-) -> Next {
+fn handle_handshake_timeout(state: State, connection: tup.Connection) -> Next {
   case state.handshake {
     AwaitingSettings ->
       terminate(state, connection, Some(frame.SettingsTimeout))
@@ -295,22 +293,19 @@ fn handle_handshake_timeout(
 fn handle_packet(
   state: State,
   bytes: BitArray,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   State(..state, buffer: <<state.buffer:bits, bytes:bits>>)
   |> process_frames(connection)
 }
 
-fn process_frames(
-  state: State,
-  connection: glisten.Connection(connection.Message),
-) -> Next {
+fn process_frames(state: State, connection: tup.Connection) -> Next {
   case frame.decode(state.buffer, state.options.max_frame_size) {
     Ok(#(frame, remaining)) ->
       case handle_frame(State(..state, buffer: remaining), frame, connection) {
         Proceed(state) -> process_frames(state, connection)
         ProceedWithOutbound(state, out) ->
-          case glisten.send(connection, out) {
+          case tup.send(connection, out) {
             Ok(Nil) -> process_frames(state, connection)
             Error(_reason) -> terminate(state, connection, None)
           }
@@ -324,7 +319,7 @@ fn process_frames(
 }
 
 fn reject_stream(
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   state: State,
   stream_id: Int,
   code: frame.ErrorCode,
@@ -358,7 +353,7 @@ fn reset_and_remove_stream(
 
       Nil
     }
-    Flushing -> Nil
+    Flushing | Finished -> Nil
   }
 
   case entry.pending {
@@ -390,7 +385,7 @@ pub type FrameResult {
 fn handle_frame(
   state: State,
   frame: frame.Frame,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case state.header_assembly {
     Some(assembly) -> handle_continuation(state, assembly, frame)
@@ -401,7 +396,7 @@ fn handle_frame(
 fn handle_new_frame(
   state: State,
   frame: frame.Frame,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case frame {
     frame.Settings(0, True, _params) -> Proceed(state)
@@ -447,7 +442,7 @@ fn handle_ping(
   stream_id: Int,
   ack: Bool,
   opaque_data: BitArray,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case stream_id != 0, ack {
     True, _ack -> Terminate(Some(frame.ProtocolError))
@@ -502,10 +497,38 @@ fn monotonic_ms() -> Int
 fn remove_stream(state: State, stream_id: Int, entry: Stream) -> State {
   let stream_pids = case entry.status {
     Computing(pid) -> dict.delete(state.stream_pids, pid)
-    Flushing -> state.stream_pids
+    Flushing | Finished -> state.stream_pids
   }
 
   State(..state, streams: dict.delete(state.streams, stream_id), stream_pids:)
+}
+
+fn finish_stream(state: State, stream_id: Int, entry: Stream) -> State {
+  Stream(
+    ..entry,
+    status: Finished,
+    pending: no_chunks(),
+    recv_buffer: bytes_tree.new(),
+    parked_reader: None,
+  )
+  |> store_stream(state, stream_id, _)
+}
+
+fn unfinished_stream(state: State, stream_id: Int) -> Result(Stream, Nil) {
+  case dict.get(state.streams, stream_id) {
+    Ok(Stream(status: Finished, ..)) -> Error(Nil)
+    lookup -> lookup
+  }
+}
+
+fn store_stream(state: State, stream_id: Int, entry: Stream) -> State {
+  let streams = case entry.status, entry.request_half_closed {
+    Finished, True -> dict.delete(state.streams, stream_id)
+    Finished, False | Computing(_pid), _half_closed | Flushing, _half_closed ->
+      dict.insert(state.streams, stream_id, entry)
+  }
+
+  State(..state, streams:)
 }
 
 fn clear_stream_pid(state: State, pid: process.Pid) -> State {
@@ -597,7 +620,8 @@ pub fn handle_data(
   {
     True, _lookup, _is_new_stream -> Terminate(Some(frame.ProtocolError))
     False, Error(Nil), True -> Terminate(Some(frame.ProtocolError))
-    False, Error(Nil), False -> reject_closed_stream_data(state, size)
+    False, Error(Nil), False ->
+      reject_closed_stream_data(state, stream_id, size)
     False, Ok(entry), _is_new_stream if entry.request_half_closed ->
       reject_data_after_half_close(state, stream_id, size)
     False, Ok(entry), _is_new_stream ->
@@ -605,10 +629,25 @@ pub fn handle_data(
   }
 }
 
-fn reject_closed_stream_data(state: State, size: Int) -> FrameResult {
-  case state.conn_recv_window - size < 0 {
+fn reject_closed_stream_data(
+  state: State,
+  stream_id: Int,
+  size: Int,
+) -> FrameResult {
+  let conn_recv_window = state.conn_recv_window - size
+
+  case conn_recv_window < 0 {
     True -> Terminate(Some(frame.FlowControlError))
-    False -> Terminate(Some(frame.StreamClosed))
+    False -> {
+      let #(state, conn_increment) =
+        conn_recv_credit(State(..state, conn_recv_window:))
+
+      frame.RstStream(stream_id, frame.StreamClosed)
+      |> frame.encode
+      |> bytes_tree.from_bit_array
+      |> append_window_update(0, conn_increment)
+      |> ProceedWithOutbound(state, _)
+    }
   }
 }
 
@@ -649,17 +688,22 @@ fn apply_data(
           let body_bytes_received =
             entry.body_bytes_received + bit_array.byte_size(payload)
           let #(state, conn_increment) = conn_recv_credit(state)
-          let #(entry, delivered_to_reader) =
-            Stream(..entry, recv_window:, body_bytes_received:)
-            |> deliver_data(payload, end_stream, [])
+          let entry = Stream(..entry, recv_window:, body_bytes_received:)
+          let #(entry, consumed) = case entry.status {
+            Finished -> #(
+              Stream(..entry, request_half_closed: end_stream),
+              True,
+            )
+            Computing(_pid) | Flushing ->
+              deliver_data(entry, payload, end_stream, [])
+          }
 
-          let #(entry, stream_increment) = case delivered_to_reader {
+          let #(entry, stream_increment) = case consumed {
             True -> stream_recv_credit(entry, state.options)
             False -> #(entry, 0)
           }
 
-          let streams = dict.insert(state.streams, stream_id, entry)
-          let state = State(..state, streams:)
+          let state = store_stream(state, stream_id, entry)
 
           let out =
             bytes_tree.new()
@@ -887,7 +931,7 @@ fn finish_trailers(
       let #(entry, _delivered_to_reader) =
         deliver_data(entry, <<>>, True, trailers)
 
-      State(..state, streams: dict.insert(state.streams, stream_id, entry))
+      store_stream(state, stream_id, entry)
     }
   }
 }
@@ -957,7 +1001,7 @@ fn track_stream(
 fn handle_client_settings(
   state: State,
   params: List(frame.Setting),
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case send_frame(connection, frame.settings_ack) {
     Error(_reason) -> Terminate(None)
@@ -1002,7 +1046,7 @@ pub fn adjust_stream_windows(state: State, delta: Int) -> State {
 
 fn terminate(
   state: State,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   code: Option(frame.ErrorCode),
 ) -> Next {
   case code {
@@ -1021,18 +1065,15 @@ fn terminate(
 }
 
 fn send_frame(
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   frame: frame.Frame,
-) -> Result(Nil, glisten.SocketReason) {
+) -> Result(Nil, socket.SocketError) {
   frame.encode(frame)
   |> bytes_tree.from_bit_array
-  |> glisten.send(connection, _)
+  |> tup.send(connection, _)
 }
 
-fn begin_drain(
-  state: State,
-  connection: glisten.Connection(connection.Message),
-) -> Next {
+fn begin_drain(state: State, connection: tup.Connection) -> Next {
   case state.draining {
     True -> Continue(state)
     False -> {
@@ -1085,11 +1126,11 @@ fn finish_or_continue(state: State) -> Next {
 fn handle_stream_reply(
   state: State,
   reply: http2.Reply(connection.Body),
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case reply {
     http2.Respond(stream_id, response) ->
-      case dict.get(state.streams, stream_id) {
+      case unfinished_stream(state, stream_id) {
         Error(Nil) -> Continue(state)
         Ok(entry) -> respond(state, stream_id, entry, response, connection)
       }
@@ -1114,9 +1155,9 @@ fn handle_read_body(
   state: State,
   stream_id: Int,
   reply_to: process.Subject(http2.BodyEvent),
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
-  case dict.get(state.streams, stream_id) {
+  case unfinished_stream(state, stream_id) {
     Error(Nil) -> Continue(state)
     Ok(entry) -> {
       let buffered = bytes_tree.to_bit_array(entry.recv_buffer)
@@ -1151,7 +1192,7 @@ fn handle_read_body(
               let out =
                 bytes_tree.new()
                 |> append_window_update(stream_id, stream_increment)
-              case glisten.send(connection, out) {
+              case tup.send(connection, out) {
                 Ok(Nil) -> Continue(state)
                 Error(_reason) -> terminate(state, connection, None)
               }
@@ -1258,7 +1299,7 @@ fn respond(
   stream_id: Int,
   entry: Stream,
   response: Response(connection.Body),
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case entry.method {
     http.Head ->
@@ -1319,7 +1360,7 @@ fn send_response(
   response_headers: List(#(String, String)),
   content_length: Option(Int),
   pending: Pending,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   let fields = headers.build_response_headers(response_headers, state.patterns)
   let content_length_fields = case status, content_length {
@@ -1347,8 +1388,8 @@ fn send_response(
 
   case has_body {
     False -> {
-      let state = State(..state, streams: dict.delete(state.streams, stream_id))
-      case glisten.send(connection, out) {
+      let state = finish_stream(state, stream_id, entry)
+      case tup.send(connection, out) {
         Ok(Nil) -> finish_or_continue(state)
         Error(_reason) -> terminate(state, connection, None)
       }
@@ -1424,26 +1465,26 @@ fn handle_write_headers(
   status: Int,
   response_headers: List(#(String, String)),
   mode: http2.ResponseMode,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
-  case dict.get(state.streams, stream_id) {
+  case unfinished_stream(state, stream_id) {
     Error(Nil) -> Continue(state)
     Ok(entry) -> {
       let response_headers = case mode {
         http2.PlainStream | http2.WebsocketStream(..) -> response_headers
-        http2.EventStream -> drop_sse_headers(response_headers)
+        http2.EventStream(..) -> drop_sse_headers(response_headers)
       }
       let fields =
         headers.build_response_headers(response_headers, state.patterns)
       let reserved_fields = case mode {
         http2.PlainStream | http2.WebsocketStream(..) -> []
-        http2.EventStream -> sse_fields()
+        http2.EventStream(..) -> sse_fields()
       }
 
       let #(state, out) =
         encode_head(state, stream_id, False, status, reserved_fields, fields)
 
-      case glisten.send(connection, out) {
+      case tup.send(connection, out) {
         Ok(Nil) -> {
           process.send(ack, http2.WriteAck)
           Continue(register_writer(state, stream_id, entry, mode))
@@ -1461,8 +1502,8 @@ fn register_writer(
   mode: http2.ResponseMode,
 ) -> State {
   case mode {
-    http2.PlainStream | http2.EventStream -> state
-    http2.WebsocketStream(notify:) -> {
+    http2.PlainStream -> state
+    http2.EventStream(notify:) | http2.WebsocketStream(notify:) -> {
       let entry = Stream(..entry, writer: Some(notify))
 
       State(..state, streams: dict.insert(state.streams, stream_id, entry))
@@ -1474,9 +1515,9 @@ fn handle_push_data(
   state: State,
   stream_id: Int,
   chunk: http2.Chunk,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
-  case dict.get(state.streams, stream_id) {
+  case unfinished_stream(state, stream_id) {
     Error(Nil) -> Continue(state)
     Ok(entry) -> {
       let over_limit = over_send_buffer_limit(entry, state.options)
@@ -1518,12 +1559,12 @@ pub fn over_send_buffer_limit(entry: Stream, options: http2.Options) -> Bool {
 fn resolve_frame_result(
   result: FrameResult,
   state: State,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case result {
     Proceed(state) -> finish_or_continue(state)
     ProceedWithOutbound(state, out) ->
-      case glisten.send(connection, out) {
+      case tup.send(connection, out) {
         Ok(Nil) -> finish_or_continue(state)
         Error(_reason) -> terminate(state, connection, None)
       }
@@ -1597,7 +1638,7 @@ pub fn do_flush_stream(
     PendingFile(descriptor, _offset, 0) -> {
       file.close(descriptor)
 
-      State(..state, streams: dict.delete(state.streams, stream_id))
+      finish_stream(state, stream_id, entry)
       |> FlushAccumulated(out, wrote)
     }
     PendingFile(descriptor, offset, remaining) -> {
@@ -1703,7 +1744,7 @@ fn flush_bytes(
 
           case end_stream {
             True ->
-              State(..state, streams: dict.delete(state.streams, stream_id))
+              finish_stream(state, stream_id, entry)
               |> FlushAccumulated(out, True)
             False ->
               Stream(
@@ -1755,7 +1796,7 @@ fn acknowledge(ack: Option(process.Subject(http2.WriteAck))) -> Nil {
 }
 
 fn send_if_any(
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
   state: State,
   out: bytes_tree.BytesTree,
   wrote: Bool,
@@ -1763,7 +1804,7 @@ fn send_if_any(
   case wrote {
     False -> Proceed(state)
     True ->
-      case glisten.send(connection, out) {
+      case tup.send(connection, out) {
         Ok(Nil) -> Proceed(state)
         Error(_reason) -> Terminate(None)
       }
@@ -1775,7 +1816,7 @@ fn flush_many(
   streams: List(#(Int, Stream)),
   out: bytes_tree.BytesTree,
   wrote: Bool,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case streams {
     [] -> send_if_any(connection, state, out, wrote)
@@ -1819,25 +1860,19 @@ fn send_file_chunk(
   file: File,
   chunk_size: Int,
   rest: List(#(Int, Stream)),
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   let File(descriptor:, offset:, remaining:) = file
 
-  case glisten.send(connection, out) {
+  case tup.send(connection, out) {
     Error(_reason) -> {
       file.close(descriptor)
       Terminate(None)
     }
-    Ok(Nil) ->
-      case
-        file.send_chunk(
-          connection.transport,
-          connection.socket,
-          descriptor,
-          offset,
-          chunk_size,
-        )
-      {
+    Ok(Nil) -> {
+      let #(transport, socket) = tup.socket(connection)
+
+      case file.send_chunk(transport, socket, descriptor, offset, chunk_size) {
         Error(_reason) -> {
           file.close(descriptor)
           Terminate(None)
@@ -1853,7 +1888,7 @@ fn send_file_chunk(
             True -> {
               file.close(descriptor)
 
-              State(..state, streams: dict.delete(state.streams, stream_id))
+              finish_stream(state, stream_id, entry)
               |> flush_many(rest, bytes_tree.new(), False, connection)
             }
             False -> {
@@ -1879,6 +1914,7 @@ fn send_file_chunk(
           }
         }
       }
+    }
   }
 }
 
@@ -1888,7 +1924,7 @@ pub fn flush_stream(
   stream_id: Int,
   entry: Stream,
   out: bytes_tree.BytesTree,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   flush_many(state, [#(stream_id, entry)], out, False, connection)
 }
@@ -1944,8 +1980,8 @@ fn drop_chunk(pending: Pending) -> Pending {
   case pending {
     PendingChunks(front: [chunk], back:, bytes:) ->
       PendingChunks(list.reverse(back), [], bytes - chunk_byte_size(chunk))
-    PendingChunks(front: [chunk, ..rest], back:, bytes:) ->
-      PendingChunks(rest, back, bytes - chunk_byte_size(chunk))
+    PendingChunks(front: [chunk, ..remaining], back:, bytes:) ->
+      PendingChunks(remaining, back, bytes - chunk_byte_size(chunk))
     PendingChunks(front: [], ..) -> pending
     PendingFile(..) -> pending
   }
@@ -1953,8 +1989,8 @@ fn drop_chunk(pending: Pending) -> Pending {
 
 fn keep_chunk(pending: Pending, chunk: http2.Chunk, written: Int) -> Pending {
   case pending {
-    PendingChunks(front: [_drained, ..rest], back:, bytes:) ->
-      PendingChunks([chunk, ..rest], back, bytes - written)
+    PendingChunks(front: [_drained, ..remaining], back:, bytes:) ->
+      PendingChunks([chunk, ..remaining], back, bytes - written)
     PendingChunks(front: [], ..) -> pending
     PendingFile(..) -> pending
   }
@@ -1979,7 +2015,7 @@ fn handle_window_update(
   state: State,
   stream_id: Int,
   increment: Int,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case increment > 0, stream_id {
     False, 0 -> Terminate(Some(frame.ProtocolError))
@@ -1993,7 +2029,7 @@ fn handle_window_update(
 fn connection_window_update(
   state: State,
   increment: Int,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   let new_window = state.conn_send_window + increment
 
@@ -2011,7 +2047,7 @@ fn stream_window_update(
   state: State,
   stream_id: Int,
   increment: Int,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case
     dict.get(state.streams, stream_id),
@@ -2028,7 +2064,7 @@ fn stream_window_update(
           let entry = Stream(..entry, send_window: new_window)
 
           case entry.status, has_pending(entry) {
-            Computing(_pid), False -> {
+            Computing(_pid), False | Finished, _has_pending -> {
               let streams = dict.insert(state.streams, stream_id, entry)
               Proceed(State(..state, streams:))
             }
@@ -2049,7 +2085,7 @@ fn stream_window_update(
 
 fn flush_pending_streams(
   state: State,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> FrameResult {
   case rotated_pending(state) {
     [] -> Proceed(state)
@@ -2073,7 +2109,7 @@ pub fn rotated_pending(state: State) -> List(#(Int, Stream)) {
 fn handle_stream_exit(
   state: State,
   exit: process.ExitMessage,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case state.parent == Ok(exit.pid), exit.reason {
     True, process.Abnormal(reason) ->
@@ -2089,7 +2125,7 @@ fn handle_stream_exit(
 fn handle_child_exit(
   state: State,
   pid: process.Pid,
-  connection: glisten.Connection(connection.Message),
+  connection: tup.Connection,
 ) -> Next {
   case dict.get(state.stream_pids, pid) {
     Error(Nil) -> finish_or_continue(state)
@@ -2138,7 +2174,7 @@ pub fn test_state() -> State {
     options:,
     settings_frame: build_settings_frame(options),
     patterns: headers.header_patterns(),
-    peer: Error(Nil),
+    peer: tup.TcpEndpoint(tup.Ipv4(127, 0, 0, 1), 0),
     parent: Error(Nil),
   )
 }
