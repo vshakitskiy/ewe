@@ -495,6 +495,11 @@ peer:
 | `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
 | `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
 
+Both protocols read the socket through one buffer, 64 KiB by default. Set it with
+[`ewe.buffer_size`](https://hexdocs.pm/ewe/ewe.html#buffer_size). A larger one
+lets one read take in more at once which pays off when clients send large
+bodies.
+
 <h3 id="running-under-supervision">Running Under Supervision</h3>
 
 [`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start) runs the server on its own.

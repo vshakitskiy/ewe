@@ -800,10 +800,13 @@ pub opaque type Builder {
     name: Option(process.Name(tup.Server)),
     on_start: fn(http.Scheme, SocketAddress) -> Nil,
     shutdown_timeout: Int,
+    buffer_size: Int,
   )
 }
 
 const default_shutdown_timeout: Int = 15_000
+
+const default_buffer_size: Int = 65_536
 
 /// Create a new server configuration. The handler is called for every request
 /// and the response it returns is sent to the client.
@@ -860,6 +863,7 @@ pub fn new(
       }
     },
     shutdown_timeout: default_shutdown_timeout,
+    buffer_size: default_buffer_size,
   )
 }
 
@@ -992,6 +996,14 @@ pub fn shutdown_timeout(builder: Builder, milliseconds: Int) -> Builder {
   Builder(..builder, shutdown_timeout: milliseconds)
 }
 
+/// Set the most bytes a single socket read takes in. 64 KiB by default.
+///
+/// A larger buffer lets one read take in more at once which pays off when
+/// clients send large bodies.
+pub fn buffer_size(builder: Builder, bytes: Int) -> Builder {
+  Builder(..builder, buffer_size: bytes)
+}
+
 /// Set the response sent when the handler crashes. By default that is an empty
 /// 500.
 ///
@@ -1115,6 +1127,12 @@ pub fn start(
       on_close: fn(_state) { Nil },
     )
     |> tup.shutdown_timeout(shutdown_timeout)
+    |> tup.buffer_size(at_least(
+      builder.buffer_size,
+      1,
+      default_buffer_size,
+      "buffer_size",
+    ))
 
   let pool = case builder.name {
     Some(name) -> tup.named(pool, name)
