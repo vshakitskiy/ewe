@@ -10,6 +10,7 @@
 - `get_client_info` returns the `SocketAddress` instead of a `Result`.
 - `websocket` in `Http2Options` is now `True` by default.
 - Add `shutdown_timeout`, replacing `drain_timeout` in `Http2Options`.
+- Add `buffer_size`, 64 KiB by default.
 - Fix a crashed HTTP/2 stream taking its whole connection down.
 - Fix HTTP/2 not sending GOAWAY on shutdown.
 - Fix WebSockets and SSE not ending on shutdown.
