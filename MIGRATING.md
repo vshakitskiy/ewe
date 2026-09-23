@@ -5,7 +5,7 @@ to be happened when moving on to the latest version. Luckily the compiler will
 catch most of the changes. It is recommended to see [Behaviour changes](#behaviour-changes) 
 as well.
 
-Every example below is v4 on one side and the latest version (which is v7) on 
+Every example below is v4 on one side and the latest version (which is v8) on 
 the other.
 
 ## Builder functions
@@ -435,7 +435,7 @@ too, through the extended `CONNECT` of RFC 8441. Set `websocket: False` on
 - We support unix sockets via `ewe.unix(path)`
 - We can enable client certificate verification via 
   `ewe.with_client_verification` for mTLS.
-- In-memory TLS certificates are now alloed with `ewe.Pem` and `ewe.Der`.
+- In-memory TLS certificates are now allowed with `ewe.Pem` and `ewe.Der`.
 - For SSE keepalives there is now `ewe.comment`.
 - For sending the last chunk and closing the body in one write for streaming we
   can use `ewe.finish_chunk`.

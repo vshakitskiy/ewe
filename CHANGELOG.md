@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v8.0.0 - 23.09.2026
 
 - Replace the vendored `glisten` fork with `tup` as the acceptor pool.
 - `new` takes only the handler.

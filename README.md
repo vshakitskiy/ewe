@@ -34,7 +34,7 @@ based on.
 <h2 id="installation">Installation</h2>
 
 ```sh
-gleam add ewe@7 gleam_erlang gleam_otp gleam_http logging
+gleam add ewe@8 gleam_erlang gleam_otp gleam_http logging
 ```
 
 <h2 id="usage">Usage</h2>
