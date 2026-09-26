@@ -152,16 +152,15 @@
 import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/handler as handler_
-import ewe/internal/http1/body as http1_body
-import ewe/internal/http1/connection as http1
+import ewe/internal/http1
+import ewe/internal/http1/connection as http1_connection
 import ewe/internal/http1/encoder
 import ewe/internal/http1/sse as http1_sse
 import ewe/internal/http1/websocket as http1_websocket
-import ewe/internal/http2/body as http2_body
 import ewe/internal/http2/connection as http2
 import ewe/internal/http2/sse as http2_sse
-import ewe/internal/http2/stream as http2_stream
 import ewe/internal/http2/websocket as http2_websocket
+import ewe/internal/http2/worker as http2_worker
 import ewe/internal/sse
 import ewe/internal/websocket
 import gleam/bytes_tree
@@ -184,16 +183,12 @@ import websocks
 
 /// The connection a request arrived on.
 ///
-/// This is the body of the request given to your handler. Pass it to `read_body` 
-/// or `read_body_chunk` to read the request body, or to `file` to send a file 
-/// back.
+/// This is the body of the request given to your handler. Pass it to `read_body`
+/// or `read_body_chunk` to read the request body, or to `file` to send a file.
 pub type Connection =
   connection.Connection
 
 /// The body of a HTTP response to be sent to the client.
-///
-/// The `Streaming`, `Sse` and `Websocket` variants are created by the functions 
-/// rather than directly.
 pub type Body {
   /// A body of binary data stored as a `BytesTree`.
   ///
@@ -202,37 +197,28 @@ pub type Body {
   Bytes(bytes_tree.BytesTree)
   /// A body of unicode text sent as UTF-8.
   Text(String)
-  /// No body. The response is sent with a `content-length` of 0.
+  /// No body.
   Empty
   /// A body of the contents of a file created with the `file` function.
-  ///
-  /// Large files are safe to send this way as they are never held in memory
-  /// whole. See `file` for how each protocol sends them.
   File(connection.File)
-  /// A body written a chunk at a time created with the `stream_response` 
+  /// A body written a chunk at a time created with the `stream_response`
   /// function.
   Streaming(connection.Streaming)
   /// A Server-Sent Events stream created with the `sse` function.
   Sse(connection.Sse)
   /// A WebSocket created with the `websocket` function.
-  ///
-  /// On HTTP/1 the connection stops being HTTP once the handshake has been
-  /// sent so it will never carry another request.
   Websocket(connection.Websocket)
 }
 
 /// An IP address.
 pub type IpAddress {
-  /// An IPv4 address, represented as its four bytes. `127.0.0.1` is 
-  /// `IpV4(127, 0, 0, 1)`.
+  /// An IPv4 address, represented as four bytes.
   IpV4(Int, Int, Int, Int)
-  /// An IPv6 address, represented as its eight groups. `::1` is
-  /// `IpV6(0, 0, 0, 0, 0, 0, 0, 1)`.
+  /// An IPv6 address, represented as eight groups.
   IpV6(Int, Int, Int, Int, Int, Int, Int, Int)
 }
 
-/// Convert an IP address to the string form. IPv6 addresses are written in 
-/// lowercase, with the longest run of zero groups collapsed to `::`.
+/// Convert an IP address to the string form.
 ///
 /// # Examples
 ///
@@ -292,7 +278,7 @@ pub fn get_client_info(connection: Connection) -> SocketAddress {
 /// Get the address the server is listening on. This is how you find the port
 /// picked by `listening_random`.
 ///
-/// Returns an error when no server runs under the name or when it does not 
+/// Returns an error when no server runs under the name or when it does not
 /// answer within a second. Pass the name given to `named`.
 ///
 /// # Examples
@@ -371,8 +357,8 @@ fn to_internal_tls(
 
 /// The limits and timeouts applied to every HTTP/1 connection.
 ///
-/// Sizes are in bytes and timeouts in milliseconds. Build one by updating
-/// `default_http1_options` so you only state the ones you care about.
+/// Sizes are in bytes and timeouts in milliseconds. Build the options by 
+/// updating `default_http1_options`.
 ///
 /// A value outside the range a field accepts is replaced with the default and
 /// logged as a warning when the server starts.
@@ -384,35 +370,35 @@ fn to_internal_tls(
 /// ```
 pub type Http1Options {
   Http1Options(
-    /// The longest request line accepted. A longer one is refused with status
-    /// code 414: URI Too Long.
+    /// The longest request line accepted. A longer request line is refused with 
+    /// status code 414: URI Too Long.
     max_request_line: Int,
-    /// The longest single header line accepted. A longer one is refused with
-    /// status code 431: Request Header Fields Too Large.
-    max_header_line: Int,
-    /// The most header fields a request may carry. More than this is refused
+    /// The longest single header line accepted. A longer header line is refused 
     /// with status code 431: Request Header Fields Too Large.
+    max_header_line: Int,
+    /// The maximum amount of header fields a request may carry. More than this 
+    /// limit is refused with status code 431: Request Header Fields Too Large.
     max_headers: Int,
-    /// The longest chunk size line accepted in a chunked body. A longer one is
-    /// refused with status code 413: Content Too Large.
+    /// The longest chunk size line accepted in a chunked body. A longer chunk 
+    /// line is refused with status code 413: Content Too Large.
     max_chunk_size_line: Int,
-    /// How long a connection may sit without sending anything before it is
-    /// closed.
+    /// How long a connection may stay idle before it is closed.
     idle_timeout: Int,
-    /// How long a single read of a request body waits for the client.
+    /// How long `read_body` and `read_body_chunk` wait for the client to send
+    /// more of the body before they fail.
     body_read_timeout: Int,
-    /// How much of a body the handler never read is drained so that the
-    /// connection can be reused. A larger body closes the connection instead.
+    /// The largest request body the server reads and discards when the handler
+    /// left it unread, so that the connection can be reused. A larger unread 
+    /// body closes the connection instead.
     auto_drain_limit: Int,
-    /// How much of that drain is read at a time.
+    /// How many bytes are read at a time while an unread body is discarded.
     auto_drain_chunk_bytes: Int,
   )
 }
 
-/// Get the default HTTP/1 limits and timeouts to be adjusted and given to
-/// `with_http1`.
+/// Get the default HTTP/1 limits and timeouts.
 pub fn default_http1_options() -> Http1Options {
-  let http1.Options(
+  let http1_connection.Options(
     max_request_line:,
     max_header_line:,
     max_headers:,
@@ -421,7 +407,7 @@ pub fn default_http1_options() -> Http1Options {
     body_read_timeout:,
     auto_drain_limit:,
     auto_drain_chunk_bytes:,
-  ) = http1.default_options()
+  ) = http1_connection.default_options()
 
   Http1Options(
     max_request_line:,
@@ -490,10 +476,12 @@ fn limit_to_string(limit: Option(Int)) -> String {
   }
 }
 
-fn to_internal_http1_options(options: Http1Options) -> http1.Options {
-  let defaults = http1.default_options()
+fn to_internal_http1_options(
+  options: Http1Options,
+) -> http1_connection.Options {
+  let defaults = http1_connection.default_options()
 
-  http1.Options(
+  http1_connection.Options(
     max_request_line: at_least(
       options.max_request_line,
       1,
@@ -549,10 +537,10 @@ const max_window_size: Int = 2_147_483_647
 
 /// The limits and timeouts applied to every HTTP/2 connection.
 ///
-/// Sizes are in bytes and timeouts in milliseconds. Build one by updating
-/// `default_http2_options` so you only state the ones you care about.
+/// Sizes are in bytes and timeouts in milliseconds. Build the options by 
+/// updating `default_http2_options`.
 ///
-/// A value outside the range a field accepts is replaced with the default and 
+/// A value outside the range a field accepts is replaced with the default and
 /// logged as a warning when the server starts.
 ///
 /// # Examples
@@ -562,56 +550,55 @@ const max_window_size: Int = 2_147_483_647
 /// ```
 pub type Http2Options {
   Http2Options(
-    /// The most streams a client may have open at once. `None` leaves it
-    /// unlimited.
+    /// The most streams a client may have open at once. The default is 100.
+    /// `None` means no limit.
     max_concurrent_streams: Option(Int),
-    /// How much response body a stream may have in flight before the client
-    /// has to allow more. Must be within 0 and 2147483647.
+    /// How much request body a client may send on a new stream before the
+    /// server allows more. Must be within 0 and 2147483647.
     initial_window_size: Int,
     /// The largest frame the server accepts. Must be within 16384 and 16777215.
     max_frame_size: Int,
-    /// The largest header list the server accepts. `None` leaves it unlimited.
+    /// The largest header list the server accepts. `None` means no limit.
     max_header_list_size: Option(Int),
     /// How much HPACK dynamic table the server keeps for decoding.
     header_table_size: Int,
-    /// The most CONTINUATION frames one header sequence may span.
+    /// The most CONTINUATION frames one header block may use.
     max_continuation_frames: Int,
-    /// The most bytes of HEADERS and CONTINUATION one header block may total,
-    /// counted before it is decoded.
+    /// The most bytes one header block may have in HEADERS and CONTINUATION
+    /// frames together.
     max_header_block_bytes: Int,
-    /// The window over which client stream resets are counted.
+    /// The window over which stream resets are counted.
     rapid_reset_window: Int,
-    /// How many resets within that window trip a GOAWAY which is what stops
-    /// Rapid Reset (CVE-2023-44487) costing more than it should.
+    /// The most streams that may be reset while their handler is still running,
+    /// within `rapid_reset_window`. More resets lead to GOAWAY. Guards against 
+    /// Rapid Reset (CVE-2023-44487) and MadeYouReset (CVE-2025-8671).
     rapid_reset_threshold: Int,
-    /// How long a connection may sit in the preface and SETTINGS handshake
-    /// before it is dropped.
+    /// How long the client has to send its SETTINGS and acknowledge ours
+    /// before the connection is closed.
     handshake_timeout: Int,
-    /// Once a receive window falls to this it is topped straight back up to
-    /// `recv_window_high_water_mark` rather than trickling small updates.
+    /// How long a connection can stay idle before it is sent GOAWAY and closed.
+    idle_timeout: Int,
+    /// When a client can send only this much more on a stream, the server lets
+    /// it send more.
     recv_window_low_water_mark: Int,
-    /// What a receive window is topped up to. The wider the gap from the low
-    /// mark the fewer WINDOW_UPDATE round trips a large body costs.
+    /// How much request body a stream holds before the handler reads it.
     recv_window_high_water_mark: Int,
-    /// Files at or below this size are read into memory and framed like any
-    /// other body. Larger ones are streamed from disk instead.
+    /// Files up to this size are allowed to be read fully into memory.
     file_read_threshold: Int,
-    /// How long a single read of a request body waits for the client.
+    /// How long `read_body` and `read_body_chunk` wait for the client to send
+    /// more of the body before they fail.
     body_read_timeout: Int,
     /// Whether a client may open a WebSocket over HTTP/2 with the extended
-    /// `CONNECT` of RFC 8441. `True`, the default, advertises
-    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`; `False` refuses a request carrying
-    /// `:protocol` as malformed.
+    /// `CONNECT` of RFC 8441. By default the server advertises
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
     websocket: Bool,
-    /// How many bytes a WebSocket stream may already have queued for a client
-    /// that is not reading before a further write makes the server give up and
-    /// reset it.
+    /// How many bytes a streamed body, SSE or WebSocket may have queued. Past 
+    /// this limit, each write waits until the queue drains.
     send_buffer_limit: Int,
   )
 }
 
-/// Get the default HTTP/2 limits and timeouts to be adjusted and given to
-/// `with_http2`.
+/// Get the default HTTP/2 limits and timeouts.
 pub fn default_http2_options() -> Http2Options {
   let http2.Options(
     max_concurrent_streams:,
@@ -625,6 +612,7 @@ pub fn default_http2_options() -> Http2Options {
     rapid_reset_threshold:,
     handshake_timeout_ms:,
     drain_timeout_ms: _drain_timeout,
+    idle_timeout_ms:,
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     file_read_threshold:,
@@ -644,6 +632,7 @@ pub fn default_http2_options() -> Http2Options {
     rapid_reset_window: rapid_reset_window_ms,
     rapid_reset_threshold:,
     handshake_timeout: handshake_timeout_ms,
+    idle_timeout: idle_timeout_ms,
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     file_read_threshold:,
@@ -744,6 +733,12 @@ fn to_internal_http2_options(
       "handshake_timeout",
     ),
     drain_timeout_ms: shutdown_timeout - shutdown_timeout / 10,
+    idle_timeout_ms: at_least(
+      options.idle_timeout,
+      1,
+      defaults.idle_timeout_ms,
+      "idle_timeout",
+    ),
     recv_window_low_water_mark:,
     recv_window_high_water_mark:,
     websocket: options.websocket,
@@ -768,8 +763,7 @@ fn to_internal_http2_options(
   )
 }
 
-/// The certificate authority a client's certificate has to be signed by, given
-/// to `with_client_verification`.
+/// The certificate authority a client's certificate has to be signed by.
 pub type ClientVerification {
   /// Path to a PEM file holding the CA certificate.
   CaCertFile(path: String)
@@ -811,11 +805,11 @@ const default_buffer_size: Int = 65_536
 /// Create a new server configuration. The handler is called for every request
 /// and the response it returns is sent to the client.
 ///
-/// The server listens on 127.0.0.1:3000 and prints its address once started.
-/// Use `bind`, `listening` and `on_start` to change that.
+/// By default, the server listens on 127.0.0.1:3000 and prints its address once 
+/// started.
 ///
-/// `start` hands back the address the server listens on. Give the server a
-/// name with `named` to look it up with `get_server_info`.
+/// `start` returns the address the server listens on. You can give the server a
+/// name with `named` to look the address with `get_server_info`.
 ///
 /// # Examples
 ///
@@ -867,8 +861,8 @@ pub fn new(
   )
 }
 
-/// Register the running server under a name. Create the name once where your 
-/// program starts.
+/// Register the running server under a name. Create the name once where your
+/// program starts!
 ///
 /// # Examples
 ///
@@ -890,15 +884,13 @@ pub fn named(builder: Builder, name: process.Name(tup.Server)) -> Builder {
 
 /// Set the network interface the server listens on. `"127.0.0.1"` and
 /// `"localhost"` are the loopback, `"0.0.0.0"` is every IPv4 interface, `"::1"`
-/// is the IPv6 loopback, and `"::"` is every IPv6 interface.
+/// is the IPv6 loopback and `"::"` is every IPv6 interface.
 ///
 /// A server listens on either a network interface or a Unix socket so this
 /// undoes a previous call to `unix`.
 ///
-/// # Panics
-///
-/// Starting the server will panic if the interface is not `"localhost"` or a
-/// valid IPv4 or IPv6 address.
+/// `start` returns an error if the interface is not `"localhost"` or a valid
+/// IPv4 or IPv6 address.
 pub fn bind(builder: Builder, to interface: String) -> Builder {
   let bind_target = case builder.bind_target {
     TcpBind(port:, ipv6:, ..) -> TcpBind(interface:, port:, ipv6:)
@@ -920,18 +912,16 @@ pub fn listening(builder: Builder, on port: Int) -> Builder {
   Builder(..builder, bind_target:)
 }
 
-/// Listen on port 0, which asks the operating system for any free port. This
-/// is useful in tests where a fixed port would clash.
+/// Listen on port 0 which asks the operating system for any free port.
 pub fn listening_random(builder: Builder) -> Builder {
   listening(builder, on: 0)
 }
 
-/// Serve over IPv6.
+/// Serve over IPv6 only. IPv4 clients are refused.
 ///
-/// `bind` must have been given an IPv6 address, or one of `"localhost"`,
-/// `"127.0.0.1"` and `"0.0.0.0"`, which are bound so that they work over either
-/// address family. The server crashes on start with any other IPv4 address and
-/// with any address at all if the system has no IPv6 support.
+/// `"localhost"` and `"127.0.0.1"` will mean the IPv6 loopback `::1` and
+/// `"0.0.0.0"` mean every IPv6 interface. `start` returns an error for binded
+/// IPv4 address or when the system has no IPv6 support.
 pub fn force_ipv6(builder: Builder) -> Builder {
   let bind_target = case builder.bind_target {
     TcpBind(interface:, port:, ..) -> TcpBind(interface:, port:, ipv6: True)
@@ -966,9 +956,10 @@ pub fn with_tls(builder: Builder, tls: Tls) -> Builder {
 }
 
 /// Set the function to run once the server is listening. It is given the
-/// scheme and the address the server ended up on.
+/// scheme and the address the server listens on.
 ///
-/// By default this prints the address. Use `quiet` to say nothing instead.
+/// By default the function prints the address. Use `quiet` for empty silet 
+/// start.
 pub fn on_start(
   builder: Builder,
   on_start: fn(http.Scheme, SocketAddress) -> Nil,
@@ -976,8 +967,7 @@ pub fn on_start(
   Builder(..builder, on_start:)
 }
 
-/// Print nothing when the server starts by replacing the default `on_start`
-/// function with one that does nothing.
+/// Print nothing when the server starts.
 pub fn quiet(builder: Builder) -> Builder {
   Builder(..builder, on_start: fn(_scheme, _address) { Nil })
 }
@@ -996,7 +986,7 @@ pub fn shutdown_timeout(builder: Builder, milliseconds: Int) -> Builder {
   Builder(..builder, shutdown_timeout: milliseconds)
 }
 
-/// Set the most bytes a single socket read takes in. 64 KiB by default.
+/// Set the most bytes a single socket read buffers. 64 KiB by default.
 ///
 /// A larger buffer lets one read take in more at once which pays off when
 /// clients send large bodies.
@@ -1009,9 +999,6 @@ pub fn buffer_size(builder: Builder, bytes: Int) -> Builder {
 ///
 /// The body must be `Bytes`, `Text` or `Empty`. Any other body is replaced with
 /// `Empty` and logged as a warning when the server starts.
-///
-/// A crashed handler leaves the request body half read so on HTTP/1 the 
-/// connection closes once this has been sent.
 ///
 /// # Examples
 ///
@@ -1039,9 +1026,9 @@ pub fn with_http2(builder: Builder, options: Http2Options) -> Builder {
 }
 
 /// Require clients to present a certificate signed by the given authority.
-/// Clients that do not are refused.
+/// Clients that do not provide the certificates are refused.
 ///
-/// This needs TLS which `with_tls` sets up.
+/// This requires the TLS enabled.
 pub fn with_client_verification(
   builder: Builder,
   ca_cert: ClientVerification,
@@ -1080,9 +1067,8 @@ fn to_internal_body(body: Body) -> connection.Body {
 
 /// Start the server, running the `on_start` function once it is listening.
 ///
-/// The started data is the address the server listens on, including the port
-/// the operating system picked for `listening_random`. To put the server under
-/// a supervision tree use `supervised` instead.
+/// The started data is the address the server listens on. To put the server 
+/// under a supervision tree use `supervised` instead.
 ///
 /// # Examples
 ///
@@ -1101,7 +1087,7 @@ pub fn start(
 ) -> Result(actor.Started(SocketAddress), actor.StartError) {
   let handler =
     connection.Handler(
-      call: fn(request) {
+      respond: fn(request) {
         let response = builder.handler(request)
         response.set_body(response, to_internal_body(response.body))
       },
@@ -1124,7 +1110,7 @@ pub fn start(
         to_internal_http2_options(builder.http2, shutdown_timeout),
       ),
       handler: handler_.loop,
-      on_close: fn(_state) { Nil },
+      on_close: handler_.on_close,
     )
     |> tup.shutdown_timeout(shutdown_timeout)
     |> tup.buffer_size(at_least(
@@ -1207,21 +1193,16 @@ fn from_internal_file_error(error: file.FileError) -> FileError {
   }
 }
 
-/// Create a response body from a file on the disc. Large files are safe to
-/// send this way as they are never held in memory whole.
+/// Create a response body from a file on the disc.
 ///
 /// The offset and limit are in bytes and serve a range of the file. Leave
 /// either as `None` to start at the beginning or to run to the end.
 ///
-/// How the file reaches the client depends on the protocol. HTTP/1 lets the 
-/// kernel copy it straight to the socket and falls back to reading it in 64kb 
-/// pieces when TLS is in the way. HTTP/2 reads a file at or below the 
-/// `file_read_threshold` of `Http2Options` into memory and frames it like any 
-/// other body, and streams anything larger from the disc.
-///
-/// On HTTP/1 the file is opened here and stays open until the response has been
-/// written so only create a body you go on to return. One that is created and
-/// then thrown away holds its file open until it is garbage collected.
+/// How the file reaches the client depends on the protocol. HTTP/1 lets the
+/// kernel copy it straight to the socket and falls back to reading it in 64kb
+/// pieces when TLS is enabled. HTTP/2 reads a file at or below the 
+/// `file_read_threshold` of `Http2Options` into memory and frames it and 
+/// streams anything larger from the disc.
 ///
 /// # Examples
 ///
@@ -1254,10 +1235,10 @@ pub type BodyError {
   InvalidBody
 }
 
-fn from_internal_http1_body_error(error: http1_body.BodyError) -> BodyError {
+fn from_internal_http1_body_error(error: http1.BodyError) -> BodyError {
   case error {
-    http1_body.BodyTooLarge -> BodyTooLarge
-    http1_body.InvalidBody -> InvalidBody
+    http1.BodyTooLarge -> BodyTooLarge
+    http1.InvalidBody -> InvalidBody
   }
 }
 
@@ -1282,10 +1263,10 @@ pub fn read_body(
 ) -> Result(request.Request(BitArray), BodyError) {
   let read = case req.body {
     connection.Http1(connection) ->
-      http1_body.read_body(connection, limit)
+      http1.read_body(connection, limit)
       |> result.map_error(from_internal_http1_body_error)
     connection.Http2(connection) ->
-      http2_body.read_body(connection, limit)
+      http2.read_body(connection, limit)
       |> result.map_error(from_internal_http2_body_error)
   }
 
@@ -1304,10 +1285,10 @@ fn with_trailers(
   }
 }
 
-fn from_internal_http2_body_error(error: http2_body.BodyError) -> BodyError {
+fn from_internal_http2_body_error(error: http2.BodyError) -> BodyError {
   case error {
-    http2_body.BodyTooLarge -> BodyTooLarge
-    http2_body.InvalidBody -> InvalidBody
+    http2.BodyTooLarge -> BodyTooLarge
+    http2.InvalidBody -> InvalidBody
   }
 }
 
@@ -1318,16 +1299,15 @@ pub type ReadEvent {
   /// The body has been read to the end.
   ///
   /// Any trailer fields are appended to the request's headers and the request
-  /// no longer carries a connection as there is nothing left to read from it.
+  /// no longer carries a connection.
   Done(request: request.Request(Nil))
 }
 
-/// Read the request body a chunk at a time rather than holding all of it in
-/// memory taking up to `max_chunk_bytes` per call and refusing a body larger
-/// than `limit` bytes in total.
+/// Read the request body a chunk at a time, taking up to `max_chunk_bytes` per 
+/// call and refusing a body larger than `limit` bytes in total.
 ///
 /// Each `Chunk` carries the request to use for the next call. Keep going until
-/// you get `Done`.
+/// you receive `Done`.
 ///
 /// # Examples
 ///
@@ -1350,17 +1330,17 @@ pub fn read_body_chunk(
 
   case req.body {
     connection.Http1(connection) ->
-      case http1_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
-        Ok(http1_body.Chunk(data, connection)) ->
+      case http1.read_body_chunk(connection, max_chunk_bytes:, limit:) {
+        Ok(http1.Chunk(data, connection)) ->
           Ok(chunk_read(req, data, connection.Http1(connection)))
-        Ok(http1_body.Done(trailers)) -> Ok(done_read(req, trailers))
+        Ok(http1.Done(trailers)) -> Ok(done_read(req, trailers))
         Error(error) -> Error(from_internal_http1_body_error(error))
       }
     connection.Http2(connection) ->
-      case http2_body.read_body_chunk(connection, max_chunk_bytes:, limit:) {
-        Ok(http2_body.Chunk(data, connection)) ->
+      case http2.read_body_chunk(connection, max_chunk_bytes:, limit:) {
+        Ok(http2.Chunk(data, connection)) ->
           Ok(chunk_read(req, data, connection.Http2(connection)))
-        Ok(http2_body.Done(trailers)) -> Ok(done_read(req, trailers))
+        Ok(http2.Done(trailers)) -> Ok(done_read(req, trailers))
         Error(error) -> Error(from_internal_http2_body_error(error))
       }
   }
@@ -1381,15 +1361,15 @@ fn done_read(
   Done(request.Request(..req, headers: with_trailers(req, trailers), body: Nil))
 }
 
-/// The reason a write to the client did not go through.
+/// The reason a write to the client is not successful.
 pub type SendError {
-  /// The client is gone so nothing further can be written.
+  /// The client is gone or the response has already ended.
   ConnectionClosed
   /// The client cancelled this HTTP/2 stream while the rest of the connection
   /// carries on.
   StreamReset
-  /// The client stopped reading for long enough that the write gave up which
-  /// takes the connection with it.
+  /// Over HTTP/1, the client stopped reading for so long that the write timed 
+  /// out. The connection is closed. Over HTTP/2 this is `ConnectionClosed`.
   SendTimedOut
   /// The socket refused the write for a reason of its own.
   SocketError(reason: SocketReason)
@@ -1470,7 +1450,8 @@ pub fn socket_reason_to_string(reason: SocketReason) -> String {
 fn from_interrupted(interrupted: http2.Interrupted) -> SendError {
   case interrupted {
     http2.StreamReset -> StreamReset
-    http2.ConnectionClosed | http2.TimedOut -> ConnectionClosed
+    http2.ConnectionClosed | http2.TimedOut | http2.StreamEnded ->
+      ConnectionClosed
   }
 }
 
@@ -1507,18 +1488,15 @@ fn to_send_error(error: socket.SocketError) -> SendError {
   }
 }
 
-/// A handle for writing the body of a streamed response, given to the handler
-/// by `stream_response`.
+/// A handle for writing the body of a streamed response.
 pub type ResponseWriter =
   connection.ResponseWriter
 
-/// Set the body of a response to one written a chunk at a time so that each
-/// chunk reaches the client as it is produced.
+/// Set the body of a response to be a streamed body.
 ///
-/// The handler is given a writer to send through and must finish the body with
-/// `finish_chunk` or `finish_response`. A handler that returns without calling
-/// either still has its body closed off but the connection is dropped instead
-/// of being reused for the next request.
+/// The handler is given a writer and must finish the body with `finish_chunk` 
+/// or `finish_response`. A handler that returns without calling either still 
+/// has its body closed but the connection is not reused for the next request.
 ///
 /// # Examples
 ///
@@ -1545,8 +1523,8 @@ pub fn stream_response(
 /// Send one chunk of a streamed response body. The writer is handed back so
 /// that it can be threaded into the next call.
 ///
-/// For the last chunk use `finish_chunk` instead, which closes the body off in
-/// the same write.
+/// For the last chunk use `finish_chunk` instead which closes the body in the 
+/// same write.
 pub fn send_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
@@ -1557,13 +1535,13 @@ pub fn send_chunk(
       |> result.map(connection.Http1Writer)
       |> result.map_error(to_send_error)
     connection.Http2Writer(writer) ->
-      http2_stream.send_chunk(writer, chunk)
+      http2_worker.send_chunk(writer, chunk)
       |> result.map(connection.Http2Writer)
       |> result.map_error(from_interrupted)
   }
 }
 
-/// Send the last chunk of a streamed response body and close the body off.
+/// Send the last chunk of a streamed response body and close the body.
 pub fn finish_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
@@ -1572,19 +1550,19 @@ pub fn finish_chunk(
     connection.Http1Writer(writer) ->
       encoder.finish_chunk(writer, chunk) |> result.map_error(to_send_error)
     connection.Http2Writer(writer) ->
-      http2_stream.finish_chunk(writer, chunk)
+      http2_worker.finish_chunk(writer, chunk)
       |> result.map_error(from_interrupted)
   }
 }
 
-/// Close off a streamed response body without sending any more data. Use
+/// Close a streamed response body without sending any more data. Use 
 /// `finish_chunk` instead if there is one last chunk to send.
 pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
   case writer {
     connection.Http1Writer(writer) ->
       encoder.finish_response(writer) |> result.map_error(to_send_error)
     connection.Http2Writer(writer) ->
-      http2_stream.finish_response(writer) |> result.map_error(from_interrupted)
+      http2_worker.finish_response(writer) |> result.map_error(from_interrupted)
   }
 }
 
@@ -1599,14 +1577,13 @@ pub opaque type Next(user_state, user_message) {
   StopAbnormal(reason: String)
 }
 
-/// Carry on, handling further messages with the given state and the selector
-/// the connection already has.
+/// Carry on handling further messages with the given state and the selector
+/// the connection already uses.
 pub fn continue(user_state: user_state) -> Next(user_state, user_message) {
   Continue(user_state, None)
 }
 
-/// Carry on, listening on the given selector from here on instead of the one
-/// the connection was started with.
+/// Carry on using the given selector from here on.
 pub fn continue_with_selector(
   user_state: user_state,
   selector: process.Selector(user_message),
@@ -1614,8 +1591,8 @@ pub fn continue_with_selector(
   Continue(user_state, Some(selector))
 }
 
-/// End the connection. To tell a WebSocket client why, use `send_close_frame` 
-/// instead.
+/// End the connection. To tell a WebSocket client the reason use 
+/// `send_close_frame` instead.
 pub fn stop() -> Next(user_state, user_message) {
   Stop
 }
@@ -1625,13 +1602,13 @@ pub fn stop_abnormal(reason: String) -> Next(user_state, user_message) {
   StopAbnormal(reason)
 }
 
-fn to_internal_step(
+fn to_internal_next(
   next: Next(user_state, user_message),
-) -> connection.Step(user_state, user_message) {
+) -> connection.Next(user_state, user_message) {
   case next {
-    Continue(state, messages) -> connection.Proceed(state, messages)
-    Stop -> connection.Halt(connection.Stopped)
-    StopAbnormal(reason) -> connection.Halt(connection.StoppedAbnormal(reason))
+    Continue(user_state, selector) -> connection.Continue(user_state, selector)
+    Stop -> connection.Stop
+    StopAbnormal(reason) -> connection.StopAbnormal(reason)
   }
 }
 
@@ -1662,7 +1639,7 @@ pub fn event(data: String) -> SseEvent {
   sse.Event(..sse.new(), data: Some(data))
 }
 
-/// Create a comment, which clients ignore.
+/// Create a comment.
 ///
 /// Sending one every so often is the usual way to keep an idle stream from
 /// being closed by a proxy in between.
@@ -1702,17 +1679,18 @@ pub fn send_event(
 /// Set the body of a response to a Server-Sent Events stream which runs until
 /// the handler stops it or the client goes away.
 ///
-/// - `on_init` is called once with a selector to add whatever the rest of your 
-///   program sends this stream to and returns the starting state along with 
+/// - `on_init` is called once with a selector to add whatever the rest of your
+///   program sends this stream to and returns the starting state along with
 ///   that selector.
-/// - `handler` is called for each message the selector picks up.
-/// - `on_close` is called once, however the stream ended.
+/// - `handler` is called for each message the selector selects.
+/// - `on_close` is called once when the stream ends.
 ///
 /// The `content-type` and `cache-control` headers the stream needs are set by
 /// ewe.
 ///
-/// On HTTP/1.1 the connection can carry another request afterwards as long as 
-/// the handler ended the stream itself and the client sent nothing during it.
+/// On HTTP/1.1 the connection can carry another request afterwards as long as
+/// the handler ended the stream itself and the client sent nothing during the
+/// connection.
 ///
 /// # Examples
 ///
@@ -1741,14 +1719,16 @@ pub fn sse(
     Next(user_state, user_message),
   on_close on_close: fn(SseConnection, user_state) -> Nil,
 ) -> response.Response(Body) {
-  let step = fn(conn, state, message) {
-    handler(conn, state, message) |> to_internal_step
+  let handler = fn(conn, state, message) {
+    handler(conn, state, message) |> to_internal_next
   }
 
   let stream = fn(conn) {
     case conn {
-      connection.Http1Sse(conn) -> http1_sse.run(conn, on_init, step, on_close)
-      connection.Http2Sse(conn) -> http2_sse.run(conn, on_init, step, on_close)
+      connection.Http1Sse(conn) ->
+        http1_sse.run(conn, on_init, handler, on_close)
+      connection.Http2Sse(conn) ->
+        http2_sse.run(conn, on_init, handler, on_close)
     }
   }
 
@@ -1759,17 +1739,15 @@ pub fn sse(
 pub type WebsocketConnection =
   connection.WebsocketConnection
 
-/// A message reaching a WebSocket handler either from the client or from the
-/// rest of your program.
+/// A message reaching a WebSocket handler.
 ///
-/// Ping and pong frames are answered by the server and never reach the handler.
+/// Ping and pong frames are answered by the server.
 pub type WebsocketMessage(user_message) {
   /// A text frame from the client with the valid UTF-8 payload.
   TextFrame(text: String)
   /// A binary frame from the client.
   BinaryFrame(data: BitArray)
-  /// A message picked up by the selector given to `on_init`, sent by the rest
-  /// of your program.
+  /// A message picked up by the selector.
   UserMessage(message: user_message)
 }
 
@@ -1788,26 +1766,22 @@ fn from_internal_websocket_message(
 pub type CloseReason {
   /// Close without saying why.
   NoCloseReason
-  /// Close with a status code and a description, which may be empty.
+  /// Close with a status code and a description.
   CloseReason(code: CloseCode, reason: String)
 }
 
 /// The status code a close frame carries.
-///
-/// The codes that exist only to be reported locally, such as 1005 and 1006,
-/// are absent, as sending one is a protocol violation.
 pub type CloseCode {
-  /// The connection did what it was for and is closing normally (1000).
+  /// The connection is closing normally (1000).
   NormalClosure
-  /// The endpoint is going away, from a server shutdown or a client navigating
+  /// The endpoint is going away, can be a server shutdown or a client going 
   /// away (1001).
   GoingAway
   /// The other end broke the protocol (1002).
   ProtocolError
   /// Data arrived that this endpoint cannot accept (1003).
   UnsupportedData
-  /// A message did not match the type it declared such as a text frame that
-  /// is not UTF-8 (1007).
+  /// A message's data did not fit its type (1007).
   InvalidPayloadData
   /// The other end broke your rules when no more specific code applies (1008).
   PolicyViolation
@@ -1815,7 +1789,7 @@ pub type CloseCode {
   MessageTooBig
   /// An extension the client required was not negotiated (1010).
   MandatoryExtension
-  /// Something went wrong on this side (1011).
+  /// Something went wrong (1011).
   InternalError
   /// The server is restarting and clients may reconnect shortly (1012).
   ServiceRestart
@@ -1861,7 +1835,9 @@ pub fn send_text_frame(
   case conn {
     connection.Http1Websocket(conn) ->
       http1_websocket.send_text(conn, text) |> result.map_error(to_send_error)
-    connection.Http2Websocket(conn) -> Ok(http2_websocket.send_text(conn, text))
+    connection.Http2Websocket(conn) ->
+      http2_websocket.send_text(conn, text)
+      |> result.map_error(from_interrupted)
   }
 }
 
@@ -1874,7 +1850,8 @@ pub fn send_binary_frame(
     connection.Http1Websocket(conn) ->
       http1_websocket.send_binary(conn, data) |> result.map_error(to_send_error)
     connection.Http2Websocket(conn) ->
-      Ok(http2_websocket.send_binary(conn, data))
+      http2_websocket.send_binary(conn, data)
+      |> result.map_error(from_interrupted)
   }
 }
 
@@ -1898,8 +1875,11 @@ pub fn send_close_frame(
         http1_websocket.send_close(conn, to_internal_close_reason(reason))
       Nil
     }
-    connection.Http2Websocket(conn) ->
-      http2_websocket.send_close(conn, to_internal_close_reason(reason))
+    connection.Http2Websocket(conn) -> {
+      let _sent =
+        http2_websocket.send_close(conn, to_internal_close_reason(reason))
+      Nil
+    }
   }
 
   Stop
@@ -1908,18 +1888,15 @@ pub fn send_close_frame(
 /// Upgrade the request to a WebSocket which runs until the handler stops it or
 /// the client goes away.
 ///
-/// - `on_init` is called once with a selector to add whatever the rest of your 
-///   program sends this connection to, and returns the starting state along 
+/// - `on_init` is called once with a selector to add whatever the rest of your
+///   program sends this connection to and returns the starting state along
 ///   with that selector.
 /// - `handler` is called for each frame from the client and each message the
 ///   selector picks up.
-/// - `on_close` is called once, however the WebSocket ended.
+/// - `on_close` is called when the WebSocket ends.
 ///
 /// A request that is not a valid handshake is answered with status code 400:
-/// Bad Request, and the handler is never run.
-///
-/// On HTTP/1 the handshake is an `Upgrade` and the connection stops being HTTP
-/// once it has been sent so it will never carry another request.
+/// Bad Request.
 ///
 /// # Examples
 ///
@@ -1951,17 +1928,17 @@ pub fn websocket(
   ) -> Next(user_state, user_message),
   on_close on_close: fn(WebsocketConnection, user_state) -> Nil,
 ) -> response.Response(Body) {
-  let step = fn(conn, state, message) {
+  let handler = fn(conn, state, message) {
     handler(conn, state, from_internal_websocket_message(message))
-    |> to_internal_step
+    |> to_internal_next
   }
 
   let socket = fn(conn) {
     case conn {
       connection.Http1Websocket(conn) ->
-        http1_websocket.run(conn, on_init, step, on_close)
+        http1_websocket.run(conn, on_init, handler, on_close)
       connection.Http2Websocket(conn) ->
-        http2_websocket.run(conn, on_init, step, on_close)
+        http2_websocket.run(conn, on_init, handler, on_close)
     }
   }
 

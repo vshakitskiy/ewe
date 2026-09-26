@@ -1,92 +1,23 @@
 import ewe/internal/connection
-import ewe/internal/http1/connection as http1
+import ewe/internal/http1
+import ewe/internal/http1/connection as http1_connection
 import ewe/internal/http1/encoder
-import ewe/internal/http1/stream
 import ewe/internal/rescue
 import ewe/internal/sse
 import gleam/erlang/process
 import gleam/option
-import logging
 import tup/socket
 
-type Handlers(user_state, user_message) {
-  Handlers(
-    step: fn(connection.SseConnection, user_state, user_message) ->
-      connection.Step(user_state, user_message),
+type Session(user_state, user_message) {
+  Session(
+    conn: http1_connection.SseConnection,
+    handler: fn(connection.SseConnection, user_state, user_message) ->
+      connection.Next(user_state, user_message),
     on_close: fn(connection.SseConnection, user_state) -> Nil,
+    selector: process.Selector(http1.SocketEvent(user_message)),
+    state: user_state,
+    reuse: Reuse,
   )
-}
-
-pub fn run(
-  conn: http1.SseConnection,
-  on_init: fn(connection.SseConnection, process.Selector(user_message)) ->
-    #(user_state, process.Selector(user_message)),
-  step: fn(connection.SseConnection, user_state, user_message) ->
-    connection.Step(user_state, user_message),
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
-) -> connection.Outcome {
-  let handlers = Handlers(step:, on_close:)
-  let handle = connection.Http1Sse(conn)
-  let #(state, messages) = on_init(handle, process.new_selector())
-
-  case activate(conn) {
-    Ok(Nil) ->
-      loop(conn, handle, handlers, stream.selector(messages), state, Clean)
-    Error(reason) -> socket_failed(conn, handle, handlers, state, reason)
-  }
-}
-
-fn ended(
-  conn: http1.SseConnection,
-  handle: connection.SseConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  keep_alive: http1.KeepAlive,
-  outcome: connection.Outcome,
-) -> connection.Outcome {
-  rescue.logged("server-sent events close handler", fn() {
-    handlers.on_close(handle, state)
-  })
-  finished(conn, keep_alive)
-  outcome
-}
-
-fn abandoned(
-  conn: http1.SseConnection,
-  handle: connection.SseConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  outcome: connection.Outcome,
-) -> connection.Outcome {
-  ended(conn, handle, handlers, state, http1.CloseAfterResponse, outcome)
-}
-
-fn crashed(
-  conn: http1.SseConnection,
-  handle: connection.SseConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  details: String,
-) -> connection.Outcome {
-  logging.log(
-    logging.Error,
-    "Caught a crash in the server-sent events handler: " <> details,
-  )
-
-  connection.StoppedAbnormal("the handler crashed")
-  |> abandoned(conn, handle, handlers, state, _)
-}
-
-fn socket_failed(
-  conn: http1.SseConnection,
-  handle: connection.SseConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  reason: socket.SocketError,
-) -> connection.Outcome {
-  socket.describe_error(reason)
-  |> connection.StoppedAbnormal
-  |> abandoned(conn, handle, handlers, state, _)
 }
 
 type Reuse {
@@ -94,69 +25,111 @@ type Reuse {
   Spoiled
 }
 
-fn loop(
-  conn: http1.SseConnection,
-  handle: connection.SseConnection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(stream.Event(user_message)),
-  state: user_state,
-  reuse: Reuse,
+pub fn run(
+  conn: http1_connection.SseConnection,
+  on_init: fn(connection.SseConnection, process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
+  handler: fn(connection.SseConnection, user_state, user_message) ->
+    connection.Next(user_state, user_message),
+  on_close: fn(connection.SseConnection, user_state) -> Nil,
 ) -> connection.Outcome {
-  case process.selector_receive_forever(selector) {
-    stream.Packet(_data) ->
-      loop(conn, handle, handlers, selector, state, Spoiled)
-    stream.Exhausted ->
-      case activate(conn) {
-        Ok(Nil) -> loop(conn, handle, handlers, selector, state, reuse)
-        Error(reason) -> socket_failed(conn, handle, handlers, state, reason)
-      }
-    stream.Closed | stream.Exited(connection.ParentExited) ->
-      abandoned(conn, handle, handlers, state, connection.Stopped)
-    stream.Exited(connection.LinkExitedNormally) ->
-      loop(conn, handle, handlers, selector, state, reuse)
-    stream.Failed(reason) | stream.Exited(connection.LinkFailed(reason)) ->
-      connection.StoppedAbnormal(reason)
-      |> abandoned(conn, handle, handlers, state, _)
-    stream.UserMessage(message) ->
-      case rescue.handler(fn() { handlers.step(handle, state, message) }) {
-        Error(details) -> crashed(conn, handle, handlers, state, details)
-        Ok(connection.Proceed(user_state: state, messages:)) -> {
-          let selector = case messages {
-            option.Some(messages) -> stream.selector(messages)
-            option.None -> selector
-          }
+  let #(state, messages) =
+    on_init(connection.Http1Sse(conn), process.new_selector())
+  let session =
+    Session(
+      conn:,
+      handler:,
+      on_close:,
+      selector: http1.socket_selector(messages),
+      state:,
+      reuse: Clean,
+    )
 
-          loop(conn, handle, handlers, selector, state, reuse)
+  case activate(conn) {
+    Ok(Nil) -> loop(session)
+    Error(reason) -> socket_failed(session, reason)
+  }
+}
+
+fn loop(session: Session(user_state, user_message)) -> connection.Outcome {
+  case process.selector_receive_forever(session.selector) {
+    http1.Packet(_data) -> loop(Session(..session, reuse: Spoiled))
+    http1.Exhausted ->
+      case activate(session.conn) {
+        Ok(Nil) -> loop(session)
+        Error(reason) -> socket_failed(session, reason)
+      }
+    http1.Closed | http1.Exited(connection.ParentExited) ->
+      abandoned(session, connection.Stopped)
+    http1.Exited(connection.LinkExitedNormally) -> loop(session)
+    http1.Failed(reason) | http1.Exited(connection.LinkFailed(reason)) ->
+      abandoned(session, connection.StoppedAbnormal(reason))
+    http1.UserMessage(message) -> {
+      let handle = connection.Http1Sse(session.conn)
+
+      case
+        rescue.next("server-sent events handler", fn() {
+          session.handler(handle, session.state, message)
+        })
+      {
+        connection.Continue(user_state: state, selector:) -> {
+          let selector =
+            option.map(selector, http1.socket_selector)
+            |> option.unwrap(session.selector)
+
+          loop(Session(..session, state:, selector:))
         }
-        Ok(connection.Halt(outcome)) ->
-          ended(
-            conn,
-            handle,
-            handlers,
-            state,
-            keep_alive(outcome, reuse),
-            outcome,
-          )
+        connection.Stop ->
+          ended(session, connection.Stopped, keep_alive(session.reuse))
+        connection.StopAbnormal(reason) ->
+          abandoned(session, connection.StoppedAbnormal(reason))
       }
+    }
   }
 }
 
-fn keep_alive(outcome: connection.Outcome, reuse: Reuse) -> http1.KeepAlive {
-  case outcome, reuse {
-    connection.Stopped, Clean -> http1.KeepAlive
-    connection.Stopped, Spoiled -> http1.CloseAfterResponse
-    connection.StoppedAbnormal(..), _reuse -> http1.CloseAfterResponse
+fn keep_alive(reuse: Reuse) -> http1_connection.KeepAlive {
+  case reuse {
+    Clean -> http1_connection.KeepAlive
+    Spoiled -> http1_connection.CloseAfterResponse
   }
 }
 
-fn finished(conn: http1.SseConnection, keep_alive: http1.KeepAlive) -> Nil {
-  http1.StreamFinished(keep_alive:)
-  |> http1.StreamSignal
-  |> process.send(conn.self, _)
+fn socket_failed(
+  session: Session(user_state, user_message),
+  reason: socket.SocketError,
+) -> connection.Outcome {
+  socket.describe_error(reason)
+  |> connection.StoppedAbnormal
+  |> abandoned(session, _)
+}
+
+fn abandoned(
+  session: Session(user_state, user_message),
+  outcome: connection.Outcome,
+) -> connection.Outcome {
+  ended(session, outcome, http1_connection.CloseAfterResponse)
+}
+
+fn ended(
+  session: Session(user_state, user_message),
+  outcome: connection.Outcome,
+  keep_alive: http1_connection.KeepAlive,
+) -> connection.Outcome {
+  let handle = connection.Http1Sse(session.conn)
+  rescue.logged("server-sent events close handler", fn() {
+    session.on_close(handle, session.state)
+  })
+
+  http1_connection.StreamFinished(keep_alive:)
+  |> http1_connection.StreamSignal
+  |> process.send(session.conn.self, _)
+
+  outcome
 }
 
 pub fn send(
-  conn: http1.SseConnection,
+  conn: http1_connection.SseConnection,
   event: sse.Event,
 ) -> Result(Nil, socket.SocketError) {
   sse.encode(event)
@@ -164,6 +137,8 @@ pub fn send(
   |> socket.send(conn.transport, conn.socket, _)
 }
 
-fn activate(conn: http1.SseConnection) -> Result(Nil, socket.SocketError) {
-  stream.activate(conn.transport, conn.socket)
+fn activate(
+  conn: http1_connection.SseConnection,
+) -> Result(Nil, socket.SocketError) {
+  http1.activate(conn.transport, conn.socket)
 }

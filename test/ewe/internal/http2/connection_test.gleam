@@ -1,1537 +1,993 @@
-import alpacki
-import ewe/internal/http2 as connection
-import ewe/internal/http2/connection as http2
+import ewe
+import ewe/internal/http2/client.{Response}
 import ewe/internal/http2/frame
-import ewe/internal/http2/headers
 import gleam/bit_array
 import gleam/bytes_tree
-import gleam/dict
 import gleam/erlang/process
 import gleam/http
+import gleam/http/request
+import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
+import gleam/string
 
-fn pending_stream(send_window: Int, pending: BitArray) -> connection.Stream {
-  connection.Stream(
-    status: connection.Flushing,
-    send_window:,
-    pending: connection.closed_chunks(pending),
-    writer: None,
-    recv_window: 65_535,
-    recv_buffer: bytes_tree.new(),
-    request_half_closed: True,
-    parked_reader: None,
-    content_length: None,
-    body_bytes_received: 0,
-    trailers: [],
-    method: http.Get,
-  )
+fn app(req: request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
+  case request.path_segments(req) {
+    ["hello"] -> text(200, "hello")
+    ["echo"] ->
+      case ewe.read_body(req, 10_000_000) {
+        Ok(req) ->
+          response.new(200)
+          |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(req.body)))
+        Error(_error) -> text(400, "")
+      }
+    ["trailer"] ->
+      case ewe.read_body(req, 10_000_000) {
+        Ok(req) ->
+          text(200, result.unwrap(request.get_header(req, "x-trailer"), ""))
+        Error(_error) -> text(400, "")
+      }
+    ["file"] -> {
+      let assert Ok(body) =
+        ewe.file(req.body, served_file, offset: None, limit: None)
+      response.set_body(response.new(200), body)
+    }
+    ["big", size] -> {
+      let assert Ok(size) = int.parse(size)
+      response.new(200)
+      |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(filler(size))))
+    }
+    ["headers"] ->
+      response.Response(
+        status: 200,
+        headers: [#("cache-control", "no-store"), #("set-cookie", "a=b")],
+        body: ewe.Empty,
+      )
+    ["large-header"] ->
+      response.new(200)
+      |> response.set_header("x-large", string.repeat("~", 20_000))
+      |> response.set_body(ewe.Empty)
+    ["no-content"] -> text(204, "never sent")
+    ["streamed-no-content"] -> {
+      use writer <- ewe.stream_response(response.new(204))
+      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+    }
+    ["informational"] -> text(103, "")
+    ["unsafe"] -> text(200, "") |> response.set_header("x-a", "a\r\nb")
+    ["unsafe-stream"] -> {
+      use writer <- ewe.stream_response(
+        response.new(200) |> response.set_header("x-a", "a\r\nb"),
+      )
+      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+    }
+    ["stream"] -> {
+      use writer <- ewe.stream_response(response.new(200))
+      use writer <- result.try(ewe.send_chunk(writer, <<"a":utf8>>))
+      use writer <- result.try(ewe.send_chunk(writer, <<"b":utf8>>))
+      ewe.finish_chunk(writer, <<"c":utf8>>)
+    }
+    ["hang"] -> {
+      process.sleep_forever()
+      text(200, "")
+    }
+    ["crash"] -> panic as "the handler crashed on purpose"
+    _path ->
+      case req.method {
+        http.Connect -> text(200, "tunnel to " <> req.host)
+        _method -> text(404, "")
+      }
+  }
 }
 
-fn inbound_stream(
-  recv_window: Int,
-  parked_reader: option.Option(process.Subject(http2.BodyEvent)),
-) -> connection.Stream {
-  connection.Stream(
-    status: connection.Flushing,
-    send_window: 65_535,
-    pending: connection.no_chunks(),
-    writer: None,
-    recv_window:,
-    recv_buffer: bytes_tree.new(),
-    request_half_closed: False,
-    parked_reader:,
-    content_length: None,
-    body_bytes_received: 0,
-    trailers: [],
-    method: http.Get,
-  )
+const served_file = "build/ewe_http2_served_file.bin"
+
+@external(erlang, "ewe_http2_client_ffi", "write_file")
+fn write_file(path: String, data: BitArray) -> Nil
+
+fn text(status: Int, body: String) -> response.Response(ewe.Body) {
+  response.new(status) |> response.set_body(ewe.Text(body))
 }
 
-fn encode(fields: List(alpacki.HeaderField)) -> BitArray {
-  let #(payload, _) =
-    alpacki.encode_header_block(fields, alpacki.new_dynamic(4096), False)
-  payload
+fn filler(size: Int) -> BitArray {
+  bit_array.concat(list.repeat(<<"x":utf8>>, size))
 }
 
-fn method_get() -> alpacki.HeaderField {
-  alpacki.HeaderField(
-    <<":method":utf8>>,
-    <<"GET":utf8>>,
-    alpacki.WithoutIndexing,
-  )
+fn ready() -> client.Client {
+  client.serve(app) |> client.handshake([])
 }
 
-fn minimal_headers() -> List(alpacki.HeaderField) {
-  [
-    method_get(),
-    alpacki.HeaderField(
-      <<":scheme":utf8>>,
-      <<"https":utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-    alpacki.HeaderField(
-      <<":authority":utf8>>,
-      <<"example.com":utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-    alpacki.HeaderField(<<":path":utf8>>, <<"/":utf8>>, alpacki.WithoutIndexing),
-  ]
+fn ready_with(options: ewe.Http2Options) -> client.Client {
+  client.serve_with(app, options) |> client.handshake([])
 }
 
-fn custom_field() -> alpacki.HeaderField {
-  alpacki.HeaderField(
-    <<"x-custom":utf8>>,
-    <<"some-longer-header-value-here":utf8>>,
-    alpacki.WithoutIndexing,
-  )
+fn options() -> ewe.Http2Options {
+  ewe.default_http2_options()
 }
 
-fn headers_with_content_length(length: String) -> List(alpacki.HeaderField) {
-  list.append(minimal_headers(), [
-    alpacki.HeaderField(
-      <<"content-length":utf8>>,
-      <<length:utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-  ])
+fn expect_goaway(client: client.Client, error: frame.ErrorCode) -> Nil {
+  let #(received, client) =
+    client.skip_until(client, fn(received) {
+      case received {
+        frame.Goaway(..) -> True
+        _frame -> False
+      }
+    })
+  let assert frame.Goaway(error: sent, ..) = received
+  assert sent == error
+  assert client.is_closed(client)
 }
 
-pub fn headers_single_frame_completes_test() {
-  let payload = encode(minimal_headers())
-  let result =
-    connection.handle_headers(connection.test_state(), 1, True, True, payload)
-  let assert connection.Proceed(state) = result
-  assert state.header_assembly == None
-  assert state.highest_client_stream_id_seen == 1
+fn expect_reset(
+  client: client.Client,
+  stream_id: Int,
+  error: frame.ErrorCode,
+) -> client.Client {
+  let #(received, client) = client.receive(client)
+  assert received == frame.RstStream(stream_id:, error:)
+  client
 }
 
-pub fn headers_end_stream_marks_new_stream_half_closed_test() {
-  let payload = encode(minimal_headers())
-  let result =
-    connection.handle_headers(connection.test_state(), 1, True, True, payload)
-  let assert connection.Proceed(state) = result
-  let assert Ok(entry) = dict.get(state.streams, 1)
-  assert entry.request_half_closed == True
+pub fn server_preface_is_settings_then_connection_window_test() {
+  let client =
+    client.serve(app)
+    |> client.connect
+    |> client.send(frame.Settings(ack: False, settings: []))
+
+  let #(settings, client) = client.receive_any(client)
+  let assert frame.Settings(ack: False, settings:) = settings
+  assert list.contains(settings, frame.MaxConcurrentStreams(100))
+  assert list.contains(settings, frame.EnableConnectProtocol(True))
+  assert list.contains(settings, frame.InitialWindowSize(262_144))
+
+  let #(window, client) = client.receive_any(client)
+  assert window == frame.WindowUpdate(0, 100 * 262_144 - 65_535)
+
+  let #(ack, _client) = client.receive_any(client)
+  assert ack == frame.Settings(ack: True, settings: [])
 }
 
-pub fn headers_without_end_stream_leaves_stream_open_test() {
-  let payload = encode(minimal_headers())
-  let result =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-  let assert connection.Proceed(state) = result
-  let assert Ok(entry) = dict.get(state.streams, 1)
-  assert entry.request_half_closed == False
+pub fn frame_before_client_settings_is_protocol_error_test() {
+  client.serve(app)
+  |> client.connect
+  |> client.get(1, "/hello")
+  |> expect_goaway(frame.ProtocolError)
 }
 
-pub fn headers_even_stream_id_is_protocol_error_test() {
-  let payload = encode(minimal_headers())
-  let result =
-    connection.handle_headers(connection.test_state(), 2, True, True, payload)
-  assert result == connection.Terminate(Some(frame.ProtocolError))
+pub fn missing_client_settings_times_out_as_protocol_error_test() {
+  client.serve_with(app, ewe.Http2Options(..options(), handshake_timeout: 50))
+  |> client.connect
+  |> expect_goaway(frame.ProtocolError)
 }
 
-pub fn headers_reused_stream_id_on_half_closed_remote_is_stream_error_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 3, True, True, payload)
+pub fn unacknowledged_settings_time_out_test() {
+  let client =
+    client.serve_with(app, ewe.Http2Options(..options(), handshake_timeout: 50))
+    |> client.connect
+    |> client.send(frame.Settings(ack: False, settings: []))
 
-  let result = connection.handle_headers(state, 3, True, True, payload)
-  let assert connection.RejectStream(_, 3, frame.StreamClosed) = result
+  expect_goaway(client, frame.SettingsTimeout)
 }
 
-pub fn headers_decreasing_stream_id_is_protocol_error_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 5, True, True, payload)
+pub fn simple_request_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/hello")
+    |> client.response(1)
 
-  let result = connection.handle_headers(state, 3, True, True, payload)
-  assert result == connection.Terminate(Some(frame.ProtocolError))
+  let assert Response(status: 200, headers:, body: <<"hello":utf8>>) = received
+  assert list.key_find(headers, "content-length") == Ok("5")
+  assert result.is_ok(list.key_find(headers, "date"))
 }
 
-pub fn headers_increasing_stream_id_after_reject_still_advances_test() {
-  let malformed = encode([method_get()])
-  let assert connection.RejectStream(state, 1, _) =
-    connection.handle_headers(connection.test_state(), 1, True, True, malformed)
+pub fn response_body_respects_peer_max_frame_size_test() {
+  let client = ready() |> client.get(1, "/big/40000")
+  let #(_headers, client) = client.receive(client)
+  let #(first, client) = client.receive(client)
+  let #(second, client) = client.receive(client)
+  let #(third, _client) = client.receive(client)
 
-  let payload = encode(minimal_headers())
-  let result = connection.handle_headers(state, 1, True, True, payload)
-  assert result == connection.Terminate(Some(frame.ProtocolError))
+  let assert frame.Data(size: 16_384, end_stream: False, ..) = first
+  let assert frame.Data(size: 16_384, end_stream: False, ..) = second
+  let assert frame.Data(size: 7232, end_stream: True, ..) = third
 }
 
-pub fn headers_while_draining_refuses_new_stream_test() {
-  let state = connection.State(..connection.test_state(), draining: True)
-  let payload = encode(minimal_headers())
+pub fn large_response_field_block_continues_in_continuation_test() {
+  let client = ready() |> client.get(1, "/large-header")
+  let #(headers, client) = client.receive(client)
+  let #(continuation, _client) = client.receive_any(client)
 
-  let result = connection.handle_headers(state, 1, True, True, payload)
-
-  let assert connection.RejectStream(state, 1, frame.RefusedStream) = result
-  assert dict.get(state.streams, 1) == Error(Nil)
+  let assert frame.Headers(end_headers: False, end_stream: True, ..) = headers
+  let assert frame.Continuation(stream_id: 1, end_headers: True, ..) =
+    continuation
 }
 
-pub fn headers_without_end_headers_starts_assembly_test() {
-  let payload = encode([method_get()])
-  let result =
-    connection.handle_headers(connection.test_state(), 1, True, False, payload)
-  let assert connection.Proceed(state) = result
-  assert state.header_assembly
-    == Some(connection.HeaderAssembly(1, True, 1, payload, False))
-}
+pub fn discarded_field_block_still_updates_hpack_test() {
+  let client =
+    client.headers(ready(), 1, client.request_fields("GET", "/hang"), True)
+  let client = client.headers(client, 1, [#("x-indexed", "value")], True)
+  let client = expect_reset(client, 1, frame.StreamClosed)
 
-pub fn oversized_headers_frame_is_enhance_your_calm_test() {
-  let huge = <<0:size({ 65_537 * 8 })>>
-  let result =
-    connection.handle_headers(connection.test_state(), 1, True, True, huge)
-  assert result == connection.Terminate(Some(frame.EnhanceYourCalm))
-}
-
-pub fn continuation_completes_split_block_test() {
-  let payload = encode(list.append(minimal_headers(), [custom_field()]))
-  let assert <<first:bytes-size(5), second:bits>> = payload
-
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, True, False, first)
-  let assert Some(assembly) = state.header_assembly
-
-  let result =
-    connection.handle_continuation(
-      state,
-      assembly,
-      frame.Continuation(1, True, second),
+  let #(received, _client) =
+    client.headers(
+      client,
+      3,
+      list.append(client.request_fields("GET", "/hello"), [
+        #("x-indexed", "value"),
+      ]),
+      True,
     )
-  let assert connection.Proceed(final_state) = result
-  assert final_state.header_assembly == None
+    |> client.response(3)
+
+  let assert Response(status: 200, ..) = received
 }
 
-pub fn continuation_wrong_stream_is_protocol_error_test() {
-  let assembly = connection.HeaderAssembly(1, True, 1, <<>>, False)
-  let result =
-    connection.handle_continuation(
-      connection.test_state(),
-      assembly,
-      frame.Continuation(2, True, <<>>),
+pub fn header_table_size_from_client_is_honoured_test() {
+  let client =
+    client.serve(app)
+    |> client.handshake([frame.HeaderTableSize(0)])
+    |> client.get(1, "/hello")
+  let #(received, _client) = client.receive(client)
+
+  let assert frame.Headers(fragment: <<0x20, _rest:bits>>, ..) = received
+}
+
+pub fn repeated_response_fields_are_indexed_test() {
+  let client = ready() |> client.get(1, "/headers")
+  let #(first, client) = client.receive(client)
+  let #(second, _client) = client.get(client, 3, "/headers") |> client.receive
+
+  let assert frame.Headers(fragment: first, ..) = first
+  let assert frame.Headers(fragment: second, ..) = second
+  assert bit_array.byte_size(second) < bit_array.byte_size(first)
+}
+
+pub fn streams_beyond_the_limit_are_refused_test() {
+  ready_with(ewe.Http2Options(..options(), max_concurrent_streams: Some(2)))
+  |> client.get(1, "/hang")
+  |> client.get(3, "/hang")
+  |> client.get(5, "/hang")
+  |> expect_reset(5, frame.RefusedStream)
+}
+
+pub fn handlers_still_stopping_count_toward_the_limit_test() {
+  let parent = process.new_subject()
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    process.send(parent, Nil)
+    process.trap_exits(True)
+    process.sleep(1000)
+    app(req)
+  }
+
+  let client =
+    client.serve_with(
+      handler,
+      ewe.Http2Options(..options(), max_concurrent_streams: Some(1)),
     )
-  assert result == connection.Terminate(Some(frame.ProtocolError))
-}
-
-pub fn non_continuation_mid_assembly_is_protocol_error_test() {
-  let assembly = connection.HeaderAssembly(1, True, 1, <<>>, False)
-  let result =
-    connection.handle_continuation(
-      connection.test_state(),
-      assembly,
-      frame.Ping(0, False, <<0, 0, 0, 0, 0, 0, 0, 0>>),
-    )
-  assert result == connection.Terminate(Some(frame.ProtocolError))
-}
-
-pub fn add_fragment_within_limits_test() {
-  let assembly = connection.HeaderAssembly(1, True, 1, <<"a":utf8>>, False)
-  let assert Ok(updated) =
-    connection.add_fragment(assembly, <<"b":utf8>>, http2.default_options())
-  assert updated == connection.HeaderAssembly(1, True, 2, <<"ab":utf8>>, False)
-}
-
-pub fn add_fragment_over_count_cap_is_enhance_your_calm_test() {
-  let assembly = connection.HeaderAssembly(1, True, 100, <<>>, False)
-  let result = connection.add_fragment(assembly, <<>>, http2.default_options())
-  assert result == Error(frame.EnhanceYourCalm)
-}
-
-pub fn add_fragment_over_byte_cap_is_enhance_your_calm_test() {
-  let assembly =
-    connection.HeaderAssembly(1, True, 1, <<0:size({ 65_536 * 8 })>>, False)
-  let result =
-    connection.add_fragment(assembly, <<"x":utf8>>, http2.default_options())
-  assert result == Error(frame.EnhanceYourCalm)
-}
-
-pub fn complete_header_block_invalid_hpack_is_compression_error_test() {
-  let assembly = connection.HeaderAssembly(1, True, 1, <<0xff, 0xff>>, False)
-  let result =
-    connection.complete_header_block(connection.test_state(), assembly)
-  assert result == connection.Terminate(Some(frame.CompressionError))
-}
-
-pub fn complete_header_block_oversized_list_is_enhance_your_calm_test() {
-  let big_value = <<0:size({ 20_000 * 8 })>>
-  let field =
-    alpacki.HeaderField(<<"x":utf8>>, big_value, alpacki.WithoutIndexing)
-  let assembly = connection.HeaderAssembly(1, True, 1, encode([field]), False)
-  let options =
-    http2.Options(..http2.default_options(), max_header_list_size: Some(16_384))
-  let state = connection.State(..connection.test_state(), options:)
-  let result = connection.complete_header_block(state, assembly)
-  assert result == connection.Terminate(Some(frame.EnhanceYourCalm))
-}
-
-pub fn complete_header_block_oversized_list_unlimited_by_default_test() {
-  let big_value = <<0:size({ 20_000 * 8 })>>
-  let field =
-    alpacki.HeaderField(<<"x":utf8>>, big_value, alpacki.WithoutIndexing)
-  let assembly = connection.HeaderAssembly(1, True, 1, encode([field]), False)
-  let result =
-    connection.complete_header_block(connection.test_state(), assembly)
-  assert result != connection.Terminate(Some(frame.EnhanceYourCalm))
-}
-
-pub fn build_request_minimal_valid_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  let assert Ok(headers.DecodedRequest(
-    request:,
-    content_length: None,
-    protocol: None,
-  )) = headers.build_request(headers, Nil, headers.header_patterns())
-  assert request.method == http.Get
-  assert request.scheme == http.Https
-  assert request.host == "example.com"
-  assert request.port == None
-  assert request.path == "/"
-  assert request.query == None
-  assert request.headers == []
-}
-
-pub fn build_request_with_query_and_port_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"POST":utf8>>),
-    #(<<":scheme":utf8>>, <<"http":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com:8080":utf8>>),
-    #(<<":path":utf8>>, <<"/search?q=1":utf8>>),
-    #(<<"x-custom":utf8>>, <<"value":utf8>>),
-  ]
-  let assert Ok(headers.DecodedRequest(
-    request:,
-    content_length: None,
-    protocol: None,
-  )) = headers.build_request(headers, Nil, headers.header_patterns())
-  assert request.method == http.Post
-  assert request.host == "example.com"
-  assert request.port == Some(8080)
-  assert request.path == "/search"
-  assert request.query == Some("q=1")
-  assert request.headers == [#("x-custom", "value")]
-}
-
-pub fn build_request_missing_pseudo_header_test() {
-  let headers = [#(<<":method":utf8>>, <<"GET":utf8>>)]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.MissingPseudoHeader)
-}
-
-pub fn build_request_duplicate_pseudo_header_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":method":utf8>>, <<"POST":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.DuplicatePseudoHeader)
-}
-
-pub fn build_request_pseudo_after_regular_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<"x-custom":utf8>>, <<"value":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.PseudoHeaderAfterRegular)
-}
-
-pub fn build_request_unknown_pseudo_header_test() {
-  let headers = [
-    #(<<":bogus":utf8>>, <<"x":utf8>>),
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.UnknownPseudoHeader)
-}
-
-pub fn build_request_invalid_scheme_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"ftp":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.InvalidScheme)
-}
-
-pub fn build_request_invalid_authority_port_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com:abc":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.InvalidAuthority)
-}
-
-pub fn build_request_empty_path_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.InvalidPath)
-}
-
-pub fn build_request_empty_header_name_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<>>, <<"value":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.EmptyHeaderName)
-}
-
-pub fn build_request_uppercase_header_name_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<"X-Custom":utf8>>, <<"value":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.UppercaseHeaderName)
-}
-
-pub fn build_request_connection_specific_header_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<"connection":utf8>>, <<"keep-alive":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.ConnectionSpecificHeader)
-}
-
-pub fn build_request_te_trailers_allowed_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<"te":utf8>>, <<"trailers":utf8>>),
-  ]
-  let assert Ok(headers.DecodedRequest(
-    request:,
-    content_length: None,
-    protocol: None,
-  )) = headers.build_request(headers, Nil, headers.header_patterns())
-  assert request.headers == [#("te", "trailers")]
-}
-
-pub fn build_request_te_non_trailers_rejected_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<"te":utf8>>, <<"gzip":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.ConnectionSpecificHeader)
-}
-
-pub fn build_request_invalid_utf8_header_value_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-    #(<<"x-custom":utf8>>, <<0xff, 0xfe>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.InvalidUtf8)
-}
-
-pub fn build_request_invalid_method_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"bad method":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/":utf8>>),
-  ]
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.InvalidMethod)
-}
-
-pub fn complete_header_block_updates_dynamic_table_test() {
-  let field =
-    alpacki.HeaderField(
-      <<"x-custom":utf8>>,
-      <<"value":utf8>>,
-      alpacki.WithIndexing,
-    )
-  let payload = encode(list.append(minimal_headers(), [field]))
-  let assembly = connection.HeaderAssembly(1, True, 1, payload, False)
-  let result =
-    connection.complete_header_block(connection.test_state(), assembly)
-  let assert connection.Proceed(state) = result
-  assert alpacki.dynamic_length(state.hpack_decoder) == 1
-}
-
-pub fn complete_header_block_invalid_request_rejects_stream_test() {
-  let assembly =
-    connection.HeaderAssembly(1, True, 1, encode([method_get()]), False)
-  let result =
-    connection.complete_header_block(connection.test_state(), assembly)
-  let assert connection.RejectStream(_, stream_id, code) = result
-  assert stream_id == 1
-  assert code == frame.ProtocolError
-}
-
-pub fn client_reset_under_threshold_continues_test() {
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      highest_client_stream_id_seen: 1,
-    )
-  let result = connection.handle_client_reset(state, 1)
-  let assert connection.Proceed(_) = result
-}
-
-pub fn client_reset_on_idle_stream_is_protocol_error_test() {
-  let result = connection.handle_client_reset(connection.test_state(), 1)
-  assert result == connection.Terminate(Some(frame.ProtocolError))
-}
-
-pub fn rapid_reset_trips_enhance_your_calm_test() {
-  let state =
-    int.range(
-      from: 1,
-      to: 101,
-      with: connection.test_state(),
-      run: fn(state, stream_id) {
-        let state =
-          connection.State(..state, highest_client_stream_id_seen: stream_id)
-        let assert connection.Proceed(state) =
-          connection.handle_client_reset(state, stream_id)
-        state
-      },
-    )
-
-  let result = connection.handle_client_reset(state, 101)
-  let assert connection.Terminate(Some(frame.EnhanceYourCalm)) = result
-}
-
-pub fn append_header_frames_splits_into_continuation_test() {
-  let block = <<0:size(120)>>
-  let out =
-    connection.append_header_frames(bytes_tree.new(), 1, True, block, 10)
-    |> bytes_tree.to_bit_array
-
-  let assert Ok(#(frame.Headers(1, True, False, first_chunk), rest)) =
-    frame.decode(out, 16_384)
-  let assert Ok(#(frame.Continuation(1, True, second_chunk), rest)) =
-    frame.decode(rest, 16_384)
-
-  assert bit_array.byte_size(first_chunk) == 10
-  assert bit_array.byte_size(second_chunk) == 5
-  assert rest == <<>>
-}
-
-pub fn flush_stream_full_drain_test() {
-  let state = connection.test_state()
-  let entry = pending_stream(100, <<"hello":utf8>>)
-
-  let assert connection.FlushAccumulated(state, out, wrote) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  assert wrote == True
-  let assert Ok(#(frame.Data(1, True, <<"hello":utf8>>, 5), rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  assert rest == <<>>
-  assert dict.get(state.streams, 1) == Error(Nil)
-  assert state.conn_send_window == 65_535 - 5
-}
-
-pub fn flush_stream_keeps_finished_stream_while_request_is_open_test() {
-  let state = connection.test_state()
-  let entry =
-    connection.Stream(
-      ..pending_stream(100, <<"hello":utf8>>),
-      request_half_closed: False,
-    )
-
-  let assert connection.FlushAccumulated(state, _out, True) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  let assert Ok(finished) = dict.get(state.streams, 1)
-  assert finished.status == connection.Finished
-  assert finished.pending == connection.no_chunks()
-}
-
-pub fn flush_stream_partial_drain_blocks_on_stream_window_test() {
-  let state = connection.test_state()
-  let entry = pending_stream(3, <<"hello":utf8>>)
-
-  let assert connection.FlushAccumulated(state, out, wrote) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  assert wrote == True
-  let assert Ok(#(frame.Data(1, False, <<"hel":utf8>>, 3), rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  assert rest == <<>>
-  let assert Ok(remaining) = dict.get(state.streams, 1)
-  assert remaining.status == connection.Flushing
-  assert remaining.send_window == 0
-  assert remaining.pending == connection.closed_chunks(<<"lo":utf8>>)
-  assert state.conn_send_window == 65_535 - 3
-}
-
-pub fn flush_stream_zero_window_defers_everything_test() {
-  let state = connection.State(..connection.test_state(), conn_send_window: 0)
-  let entry = pending_stream(100, <<"hello":utf8>>)
-
-  let assert connection.FlushAccumulated(state, out, wrote) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  assert wrote == False
-  assert out == bytes_tree.new()
-  let assert Ok(unchanged) = dict.get(state.streams, 1)
-  assert unchanged == entry
-}
-
-pub fn flush_stream_sends_multiple_frames_in_one_call_when_window_allows_test() {
-  let state = connection.test_state()
-  let body = <<0:size({ 40_000 * 8 })>>
-  let entry = pending_stream(100_000, body)
-
-  let assert connection.FlushAccumulated(state, out, wrote) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  assert wrote == True
-  let bytes = bytes_tree.to_bit_array(out)
-
-  let assert Ok(#(frame.Data(1, False, chunk_1, _), rest)) =
-    frame.decode(bytes, 16_384)
-  assert bit_array.byte_size(chunk_1) == 16_384
-
-  let assert Ok(#(frame.Data(1, False, chunk_2, _), rest)) =
-    frame.decode(rest, 16_384)
-  assert bit_array.byte_size(chunk_2) == 16_384
-
-  let assert Ok(#(frame.Data(1, True, chunk_3, _), rest)) =
-    frame.decode(rest, 16_384)
-  assert bit_array.byte_size(chunk_3) == 40_000 - 16_384 - 16_384
-
-  assert rest == <<>>
-  assert dict.get(state.streams, 1) == Error(Nil)
-  assert state.conn_send_window == 65_535 - 40_000
-}
-
-pub fn adjust_stream_windows_applies_delta_to_all_streams_test() {
-  let entry_a = pending_stream(100, <<"a":utf8>>)
-  let entry_b = pending_stream(200, <<"b":utf8>>)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry_a), #(3, entry_b)]),
-    )
-
-  let state = connection.adjust_stream_windows(state, -50)
-
-  let assert Ok(a) = dict.get(state.streams, 1)
-  let assert Ok(b) = dict.get(state.streams, 3)
-  assert a.send_window == 50
-  assert b.send_window == 150
-}
-
-pub fn client_reset_on_flushing_stream_removes_it_test() {
-  let entry = pending_stream(10, <<"tail":utf8>>)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-    )
-
-  let result = connection.handle_client_reset(state, 1)
-  let assert connection.Proceed(state) = result
-  assert dict.get(state.streams, 1) == Error(Nil)
-}
-
-pub fn client_reset_on_computing_stream_keeps_stream_pids_test() {
-  let pid = process.spawn_unlinked(fn() { process.sleep_forever() })
-  let entry =
-    connection.Stream(
-      ..pending_stream(65_535, <<>>),
-      status: connection.Computing(pid),
-    )
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      stream_pids: dict.from_list([#(pid, 1)]),
-      highest_client_stream_id_seen: 1,
-    )
-
-  let result = connection.handle_client_reset(state, 1)
-  let assert connection.Proceed(state) = result
-
-  assert dict.get(state.streams, 1) == Error(Nil)
-  assert dict.get(state.stream_pids, pid) == Ok(1)
-}
-
-pub fn handle_data_accumulates_into_buffer_test() {
-  let entry = inbound_stream(65_535, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, False, <<"abc":utf8>>, 3)
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert bytes_tree.to_bit_array(updated.recv_buffer) == <<"abc":utf8>>
-  assert updated.recv_window == 65_535 - 3
-  assert updated.request_half_closed == False
-  assert state.conn_recv_window == 2_097_152 - 3
-}
-
-pub fn handle_data_padded_frame_counts_full_wire_size_test() {
-  let entry = inbound_stream(65_535, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, False, <<"abc":utf8>>, 10)
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert bytes_tree.to_bit_array(updated.recv_buffer) == <<"abc":utf8>>
-  assert updated.recv_window == 65_535 - 10
-  assert state.conn_recv_window == 2_097_152 - 10
-}
-
-pub fn handle_data_end_stream_sets_half_closed_test() {
-  let entry = inbound_stream(65_535, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, True, <<>>, 0)
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.request_half_closed == True
-}
-
-pub fn handle_data_delivers_directly_to_parked_reader_test() {
-  let reply_to = process.new_subject()
-  let entry = inbound_stream(2_097_152, Some(reply_to))
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, False, <<"hi":utf8>>, 2)
-
-  let assert Ok(http2.ChunkEvent(<<"hi":utf8>>)) =
-    process.receive(reply_to, 100)
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.parked_reader == None
-  assert bytes_tree.to_bit_array(updated.recv_buffer) == <<>>
-}
-
-pub fn handle_data_delivered_to_parked_reader_grants_credit_test() {
-  let reply_to = process.new_subject()
-  let entry = inbound_stream(100_000, Some(reply_to))
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-  let chunk = <<0:size({ 40_000 * 8 })>>
-
-  let result = connection.handle_data(state, 1, False, chunk, 40_000)
-
-  let assert connection.ProceedWithOutbound(state, out) = result
-  let assert Ok(http2.ChunkEvent(delivered)) = process.receive(reply_to, 100)
-  assert delivered == chunk
-
-  let bytes = bytes_tree.to_bit_array(out)
-  let assert Ok(#(frame.WindowUpdate(1, 2_037_152), rest)) =
-    frame.decode(bytes, 16_384)
-  let assert Ok(#(frame.WindowUpdate(0, 2_071_617), rest)) =
-    frame.decode(rest, 16_384)
-  assert rest == <<>>
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.recv_window == 2_097_152
-}
-
-pub fn handle_data_delivers_last_chunk_to_parked_reader_test() {
-  let reply_to = process.new_subject()
-  let entry = inbound_stream(2_097_152, Some(reply_to))
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(_state) =
-    connection.handle_data(state, 1, True, <<"hi":utf8>>, 2)
-
-  let assert Ok(http2.LastChunkEvent(<<"hi":utf8>>, [])) =
-    process.receive(reply_to, 100)
-}
-
-pub fn handle_data_sends_done_to_parked_reader_on_empty_end_stream_test() {
-  let reply_to = process.new_subject()
-  let entry = inbound_stream(2_097_152, Some(reply_to))
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(_state) =
-    connection.handle_data(state, 1, True, <<>>, 0)
-
-  let assert Ok(http2.DoneEvent([])) = process.receive(reply_to, 100)
-}
-
-pub fn handle_data_keeps_reader_parked_on_empty_open_frame_test() {
-  let reply_to = process.new_subject()
-  let entry = inbound_stream(2_097_152, Some(reply_to))
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, False, <<>>, 0)
-
-  assert process.receive(reply_to, 0) == Error(Nil)
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.parked_reader == Some(reply_to)
-  assert updated.request_half_closed == False
-}
-
-pub fn handle_data_keeps_trailers_left_by_an_earlier_block_test() {
-  let entry =
-    connection.Stream(..inbound_stream(2_097_152, None), trailers: [
-      #("x-checksum", "deadbeef"),
-    ])
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-      conn_recv_window: 2_097_152,
-    )
-
-  let assert connection.Proceed(state) =
-    connection.handle_data(state, 1, False, <<"abc":utf8>>, 3)
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.trailers == [#("x-checksum", "deadbeef")]
-}
-
-pub fn handle_data_stream_window_violation_rejects_stream_test() {
-  let entry = inbound_stream(5, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-
-  let result = connection.handle_data(state, 1, False, <<0:size(80)>>, 10)
-
-  let assert connection.RejectStream(state, 1, frame.FlowControlError) = result
-  assert state.conn_recv_window == 65_535 - 10
-}
-
-pub fn handle_data_conn_window_violation_terminates_test() {
-  let entry = inbound_stream(65_535, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      conn_recv_window: 5,
-      highest_client_stream_id_seen: 1,
-    )
-
-  let result = connection.handle_data(state, 1, False, <<0:size(80)>>, 10)
-
-  let assert connection.Terminate(Some(frame.FlowControlError)) = result
-}
-
-pub fn handle_data_on_idle_stream_is_protocol_error_test() {
-  let state = connection.test_state()
-
-  let result = connection.handle_data(state, 3, False, <<"x":utf8>>, 1)
-
-  let assert connection.Terminate(Some(frame.ProtocolError)) = result
-}
-
-pub fn handle_data_on_already_closed_stream_is_stream_error_test() {
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      highest_client_stream_id_seen: 5,
-    )
-
-  let result = connection.handle_data(state, 3, False, <<"x":utf8>>, 1)
-
-  let assert connection.ProceedWithOutbound(state, out) = result
-  let assert Ok(#(frame.RstStream(3, frame.StreamClosed), rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  let assert Ok(#(frame.WindowUpdate(0, 2_031_618), <<>>)) =
-    frame.decode(rest, 16_384)
-  assert state.conn_recv_window == 2_097_152
-}
-
-pub fn handle_data_buffered_without_reader_still_credits_conn_window_test() {
-  let entry = inbound_stream(100_000, None)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-  let chunk = <<0:size({ 40_000 * 8 })>>
-
-  let result = connection.handle_data(state, 1, False, chunk, 40_000)
-
-  let assert connection.ProceedWithOutbound(state, out) = result
-  let bytes = bytes_tree.to_bit_array(out)
-  let assert Ok(#(frame.WindowUpdate(0, 2_071_617), rest)) =
-    frame.decode(bytes, 16_384)
-  assert rest == <<>>
-  assert state.conn_recv_window == 2_097_152
-
-  let assert Ok(updated) = dict.get(state.streams, 1)
-  assert updated.recv_window == 100_000 - 40_000
-}
-
-pub fn handle_data_on_already_closed_stream_above_low_water_mark_is_not_credited_test() {
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      highest_client_stream_id_seen: 5,
-      conn_recv_window: 2_097_152,
-    )
-  let chunk = <<0:size({ 40_000 * 8 })>>
-
-  let result = connection.handle_data(state, 3, False, chunk, 40_000)
-
-  let assert connection.ProceedWithOutbound(state, out) = result
-  let assert Ok(#(frame.RstStream(3, frame.StreamClosed), <<>>)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  assert state.conn_recv_window == 2_097_152 - 40_000
-}
-
-pub fn handle_data_on_finished_stream_is_dropped_and_credited_test() {
-  let entry =
-    connection.Stream(
-      ..inbound_stream(100_000, None),
-      status: connection.Finished,
-    )
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-
-  let result = connection.handle_data(state, 1, False, <<"close":utf8>>, 5)
-
-  let assert connection.ProceedWithOutbound(state, out) = result
-  let assert Ok(#(frame.WindowUpdate(1, 1_997_157), _rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  let assert Ok(finished) = dict.get(state.streams, 1)
-  assert finished.recv_buffer == bytes_tree.new()
-  assert finished.recv_window == 2_097_152
-}
-
-pub fn handle_data_end_stream_on_finished_stream_removes_it_test() {
-  let entry =
-    connection.Stream(
-      ..inbound_stream(65_535, None),
-      status: connection.Finished,
-    )
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-
-  let assert connection.ProceedWithOutbound(state, _out) =
-    connection.handle_data(state, 1, True, <<>>, 0)
-
-  assert dict.get(state.streams, 1) == Error(Nil)
-}
-
-pub fn handle_data_on_already_closed_stream_can_exceed_conn_window_test() {
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      highest_client_stream_id_seen: 5,
-      conn_recv_window: 5,
-    )
-
-  let result = connection.handle_data(state, 3, False, <<0:size(80)>>, 10)
-
-  assert result == connection.Terminate(Some(frame.FlowControlError))
-}
-
-pub fn handle_data_with_stream_id_zero_is_protocol_error_test() {
-  let state = connection.test_state()
-
-  let result = connection.handle_data(state, 0, False, <<"x":utf8>>, 1)
-
-  assert result == connection.Terminate(Some(frame.ProtocolError))
-}
-
-pub fn handle_data_after_half_closed_remote_rejects_stream_test() {
-  let entry =
-    connection.Stream(..inbound_stream(65_535, None), request_half_closed: True)
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, entry)]),
-      highest_client_stream_id_seen: 1,
-    )
-
-  let result = connection.handle_data(state, 1, False, <<"x":utf8>>, 1)
-
-  let assert connection.RejectStream(state, 1, frame.StreamClosed) = result
-  assert state.conn_recv_window == 65_535 - 1
-}
-
-pub fn stream_recv_credit_above_low_water_mark_does_not_emit_test() {
-  let entry = inbound_stream(300_000, None)
-
-  let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_options())
-
-  assert increment == 0
-  assert entry.recv_window == 300_000
-}
-
-pub fn stream_recv_credit_at_low_water_mark_refills_to_high_test() {
-  let entry = inbound_stream(262_144, None)
-
-  let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_options())
-
-  assert increment == 2_097_152 - 262_144
-  assert entry.recv_window == 2_097_152
-}
-
-pub fn stream_recv_credit_below_low_water_mark_refills_to_high_test() {
-  let entry = inbound_stream(1000, None)
-
-  let #(entry, increment) =
-    connection.stream_recv_credit(entry, http2.default_options())
-
-  assert increment == 2_097_152 - 1000
-  assert entry.recv_window == 2_097_152
-}
-
-pub fn conn_recv_credit_above_low_water_mark_does_not_emit_test() {
-  let state =
-    connection.State(..connection.test_state(), conn_recv_window: 300_000)
-
-  let #(state, increment) = connection.conn_recv_credit(state)
-
-  assert increment == 0
-  assert state.conn_recv_window == 300_000
-}
-
-pub fn conn_recv_credit_below_low_water_mark_refills_to_high_test() {
-  let state =
-    connection.State(..connection.test_state(), conn_recv_window: 1000)
-
-  let #(state, increment) = connection.conn_recv_credit(state)
-
-  assert increment == 2_097_152 - 1000
-  assert state.conn_recv_window == 2_097_152
-}
-
-pub fn trailers_after_data_marks_half_closed_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let trailer_payload = encode([custom_field()])
-  let result = connection.handle_headers(state, 1, True, True, trailer_payload)
-
-  let assert connection.Proceed(state) = result
-  let assert Ok(entry) = dict.get(state.streams, 1)
-  assert entry.request_half_closed == True
-}
-
-pub fn trailers_with_pseudo_header_is_protocol_error_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let trailer_payload = encode([method_get()])
-  let result = connection.handle_headers(state, 1, True, True, trailer_payload)
-
-  let assert connection.RejectStream(_, 1, frame.ProtocolError) = result
-}
-
-pub fn trailers_without_end_stream_is_protocol_error_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let trailer_payload = encode([custom_field()])
-  let result = connection.handle_headers(state, 1, False, True, trailer_payload)
-
-  let assert connection.RejectStream(_, 1, frame.ProtocolError) = result
-}
-
-pub fn trailers_are_delivered_to_parked_reader_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let reply_to = process.new_subject()
-  let assert Ok(entry) = dict.get(state.streams, 1)
-  let state =
-    connection.State(
-      ..state,
-      streams: dict.insert(
-        state.streams,
-        1,
-        connection.Stream(..entry, parked_reader: Some(reply_to)),
+    |> client.handshake([])
+    |> client.get(1, "/hello")
+  let assert Ok(Nil) = process.receive(parent, 1000)
+
+  client
+  |> client.send(frame.RstStream(1, frame.Cancel))
+  |> client.get(3, "/hello")
+  |> expect_reset(3, frame.RefusedStream)
+}
+
+fn reset_hanging(
+  client: client.Client,
+  stream_ids: List(Int),
+) -> client.Client {
+  use client, stream_id <- list.fold(stream_ids, client)
+
+  client
+  |> client.get(stream_id, "/hang")
+  |> client.send(frame.RstStream(stream_id, frame.Cancel))
+}
+
+pub fn rapid_client_resets_are_enhance_your_calm_test() {
+  ready_with(ewe.Http2Options(..options(), rapid_reset_threshold: 3))
+  |> reset_hanging([1, 3, 5, 7])
+  |> expect_goaway(frame.EnhanceYourCalm)
+}
+
+pub fn reset_count_starts_over_each_window_test() {
+  let client =
+    ready_with(
+      ewe.Http2Options(
+        ..options(),
+        rapid_reset_window: 100,
+        rapid_reset_threshold: 2,
       ),
     )
+    |> reset_hanging([1, 3])
+  process.sleep(150)
 
-  let trailer_payload = encode([custom_field()])
-  let result = connection.handle_headers(state, 1, True, True, trailer_payload)
-  let assert connection.Proceed(_state) = result
-
-  let assert Ok(http2.DoneEvent(trailers)) = process.receive(reply_to, 100)
-  assert trailers == [#("x-custom", "some-longer-header-value-here")]
+  let #(received, _client) =
+    reset_hanging(client, [5, 7])
+    |> client.get(9, "/hello")
+    |> client.response(9)
+  let assert Response(status: 200, ..) = received
 }
 
-pub fn trailers_with_invalid_header_is_protocol_error_test() {
-  let payload = encode(minimal_headers())
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let bad_trailer =
-    encode([
-      alpacki.HeaderField(
-        <<"X-Bad":utf8>>,
-        <<"v":utf8>>,
-        alpacki.WithoutIndexing,
-      ),
-    ])
-  let result = connection.handle_headers(state, 1, True, True, bad_trailer)
-
-  let assert connection.RejectStream(_, 1, frame.ProtocolError) = result
-}
-
-pub fn content_length_exceeded_rejects_stream_test() {
-  let payload = encode(headers_with_content_length("5"))
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let result = connection.handle_data(state, 1, False, <<"toolong":utf8>>, 7)
-
-  let assert connection.RejectStream(_, 1, frame.ProtocolError) = result
-}
-
-pub fn content_length_short_at_end_stream_rejects_stream_test() {
-  let payload = encode(headers_with_content_length("5"))
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let result = connection.handle_data(state, 1, True, <<"abc":utf8>>, 3)
-
-  let assert connection.RejectStream(_, 1, frame.ProtocolError) = result
-}
-
-pub fn content_length_matching_body_is_accepted_test() {
-  let payload = encode(headers_with_content_length("5"))
-  let assert connection.Proceed(state) =
-    connection.handle_headers(connection.test_state(), 1, False, True, payload)
-
-  let result = connection.handle_data(state, 1, True, <<"abcde":utf8>>, 5)
-
-  assert result != connection.RejectStream(state, 1, frame.ProtocolError)
-}
-
-pub fn content_length_nonzero_with_no_body_rejects_before_spawn_test() {
-  let payload = encode(headers_with_content_length("5"))
-
-  let result =
-    connection.handle_headers(connection.test_state(), 1, True, True, payload)
-
-  let assert connection.RejectStream(state, 1, frame.ProtocolError) = result
-  assert dict.get(state.streams, 1) == Error(Nil)
-}
-
-fn queued_stream(
-  send_window: Int,
-  chunks: List(http2.Chunk),
-) -> connection.Stream {
-  let pending =
-    list.fold(chunks, connection.no_chunks(), fn(pending, chunk) {
-      let assert Ok(pending) = connection.push_chunk(pending, chunk)
-      pending
+pub fn resets_after_the_handler_returned_are_not_counted_test() {
+  let client =
+    ready_with(ewe.Http2Options(..options(), rapid_reset_threshold: 1))
+    |> list.fold([1, 3], _, fn(client, stream_id) {
+      let #(_headers, client) =
+        client
+        |> client.get(stream_id, "/big/100000")
+        |> client.skip_until(fn(received) {
+          case received {
+            frame.Headers(stream_id: id, ..) -> id == stream_id
+            _frame -> False
+          }
+        })
+      client.send(client, frame.RstStream(stream_id, frame.Cancel))
     })
 
-  connection.Stream(..pending_stream(send_window, <<>>), pending:)
+  let #(received, _client) =
+    client
+    |> client.send(frame.Ping(ack: False, data: <<"no-reset":utf8>>))
+    |> client.skip_until(fn(received) {
+      case received {
+        frame.Ping(ack: True, ..) | frame.Goaway(..) -> True
+        _frame -> False
+      }
+    })
+  let assert frame.Ping(ack: True, ..) = received
 }
 
-pub fn queued_chunks_acknowledge_each_on_full_delivery_test() {
-  let first = process.new_subject()
-  let second = process.new_subject()
-  let entry =
-    queued_stream(65_535, [
-      http2.Chunk(<<"one":utf8>>, Some(first)),
-      http2.Finish(<<"two":utf8>>, Some(second)),
-    ])
+pub fn provoked_server_resets_are_enhance_your_calm_test() {
+  let client =
+    ready_with(ewe.Http2Options(..options(), rapid_reset_threshold: 3))
 
-  let assert connection.FlushAccumulated(state, out, True) =
-    connection.do_flush_stream(
-      connection.test_state(),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
+  let client =
+    [1, 3, 5]
+    |> list.fold(client, fn(client, stream_id) {
+      client
+      |> client.get(stream_id, "/hang")
+      |> client.send(frame.WindowUpdate(stream_id, 0))
+      |> expect_reset(stream_id, frame.ProtocolError)
+    })
+
+  client
+  |> client.get(7, "/hang")
+  |> client.send(frame.WindowUpdate(7, 0))
+  |> expect_goaway(frame.EnhanceYourCalm)
+}
+
+pub fn reset_kills_a_handler_that_does_not_stream_test() {
+  let parent = process.new_subject()
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    process.send(parent, process.self())
+    app(req)
+  }
+
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.get(1, "/hang")
+  let assert Ok(pid) = process.receive(parent, 1000)
+  let _client = client.send(client, frame.RstStream(1, frame.Cancel))
+
+  assert client.wait_until(fn() { !process.is_alive(pid) }, 50)
+}
+
+pub fn sse_ends_on_reset_during_a_blocked_write_test() {
+  let writing = process.new_subject()
+  let closed = process.new_subject()
+  let handler = fn(_req: request.Request(ewe.Connection)) {
+    ewe.sse(
+      response.new(200),
+      on_init: fn(_conn, selector) {
+        let ticks = process.new_subject()
+        process.send(ticks, Nil)
+        #(ticks, process.select(selector, ticks))
+      },
+      handler: fn(conn, ticks, _tick) {
+        process.send(writing, Nil)
+        let _sent = ewe.send_event(conn, ewe.event(string.repeat("x", 10_000)))
+        process.send(ticks, Nil)
+        ewe.continue(ticks)
+      },
+      on_close: fn(_conn, _ticks) { process.send(closed, Nil) },
     )
+  }
 
-  let assert Ok(#(frame.Data(1, False, <<"one":utf8>>, 3), rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  let assert Ok(#(frame.Data(1, True, <<"two":utf8>>, 3), <<>>)) =
-    frame.decode(rest, 16_384)
-
-  assert process.receive(first, 0) == Ok(http2.WriteAck)
-  assert process.receive(second, 0) == Ok(http2.WriteAck)
-  assert dict.get(state.streams, 1) == Error(Nil)
-  assert state.conn_send_window == 65_535 - 6
-}
-
-pub fn queue_preserves_order_across_the_reversal_test() {
-  let entry =
-    queued_stream(65_535, [
-      http2.Chunk(<<"a":utf8>>, None),
-      http2.Chunk(<<"b":utf8>>, None),
-      http2.Finish(<<"c":utf8>>, None),
-    ])
-
-  let assert connection.FlushAccumulated(state, out, True) =
-    connection.do_flush_stream(
-      connection.test_state(),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
+  let client =
+    client.serve_with(
+      handler,
+      ewe.Http2Options(..options(), send_buffer_limit: 1000),
     )
+    |> client.handshake([frame.InitialWindowSize(0)])
+    |> client.get(1, "/")
+  let assert Ok(Nil) = process.receive(writing, 1000)
+  let _client = client.send(client, frame.RstStream(1, frame.Cancel))
 
-  let assert Ok(#(frame.Data(1, False, <<"a":utf8>>, 1), rest)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  let assert Ok(#(frame.Data(1, False, <<"b":utf8>>, 1), rest)) =
-    frame.decode(rest, 16_384)
-  let assert Ok(#(frame.Data(1, True, <<"c":utf8>>, 1), <<>>)) =
-    frame.decode(rest, 16_384)
-
-  assert dict.get(state.streams, 1) == Error(Nil)
-  assert state.conn_send_window == 65_535 - 3
+  let assert Ok(Nil) = process.receive(closed, 1000)
 }
 
-pub fn partial_drain_withholds_acknowledgement_until_complete_test() {
-  let ack = process.new_subject()
-  let entry = queued_stream(3, [http2.Chunk(<<"hello":utf8>>, Some(ack))])
+pub fn streaming_writer_learns_of_reset_test() {
+  let parent = process.new_subject()
+  let handler = fn(_req: request.Request(ewe.Connection)) {
+    use writer <- ewe.stream_response(response.new(200))
+    use writer <- result.try(ewe.send_chunk(writer, <<"a":utf8>>))
+    process.send(parent, Ok(Nil))
+    process.sleep(100)
+    let sent = ewe.send_chunk(writer, <<"b":utf8>>)
+    process.send(parent, result.replace(sent, Nil))
+    Ok(Nil)
+  }
 
-  let assert connection.FlushAccumulated(state, _blocked_out, True) =
-    connection.do_flush_stream(
-      connection.test_state(),
-      1,
-      entry,
-      bytes_tree.new(),
-      False,
-    )
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.get(1, "/")
+  let assert Ok(Ok(Nil)) = process.receive(parent, 1000)
+  let _client = client.send(client, frame.RstStream(1, frame.Cancel))
 
-  assert process.receive(ack, 0) == Error(Nil)
-  let assert Ok(blocked) = dict.get(state.streams, 1)
-
-  let assert connection.FlushAccumulated(state, out, True) =
-    connection.do_flush_stream(
-      state,
-      1,
-      connection.Stream(..blocked, send_window: 10),
-      bytes_tree.new(),
-      False,
-    )
-
-  let assert Ok(#(frame.Data(1, False, <<"lo":utf8>>, 2), <<>>)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  assert process.receive(ack, 0) == Ok(http2.WriteAck)
-
-  let assert Ok(drained) = dict.get(state.streams, 1)
-  assert drained.pending == connection.no_chunks()
+  assert process.receive(parent, 1000) == Ok(Error(ewe.StreamReset))
 }
 
-pub fn empty_terminator_closes_stream_with_the_window_shut_test() {
-  let ack = process.new_subject()
-  let state = connection.State(..connection.test_state(), conn_send_window: 0)
-  let entry = queued_stream(0, [http2.Finish(<<>>, Some(ack))])
+pub fn request_body_round_trips_test() {
+  let body = filler(192_000)
+  let client =
+    ready() |> client.headers(1, client.request_fields("POST", "/echo"), False)
+  let client =
+    list.fold([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], client, fn(client, index) {
+      let assert Ok(chunk) = bit_array.slice(body, index * 16_000, 16_000)
+      client.data(client, 1, chunk, index == 11)
+    })
 
-  let assert connection.FlushAccumulated(state, out, True) =
-    connection.do_flush_stream(state, 1, entry, bytes_tree.new(), False)
-
-  let assert Ok(#(frame.Data(1, True, <<>>, 0), <<>>)) =
-    frame.decode(bytes_tree.to_bit_array(out), 16_384)
-  assert process.receive(ack, 0) == Ok(http2.WriteAck)
-  assert dict.get(state.streams, 1) == Error(Nil)
+  let #(received, _client) = client.response(client, 1)
+  let assert Response(status: 200, body: echoed, ..) = received
+  assert echoed == body
 }
 
-fn writing_stream(queued: Int) -> connection.Stream {
-  connection.Stream(
-    ..queued_stream(0, [http2.Chunk(<<0:size(queued)>>, None)]),
-    writer: Some(process.new_subject()),
+pub fn data_beyond_the_stream_window_is_flow_control_error_test() {
+  ready_with(
+    ewe.Http2Options(
+      ..options(),
+      initial_window_size: 16_384,
+      recv_window_low_water_mark: 1,
+      recv_window_high_water_mark: 16_384,
+    ),
   )
+  |> client.headers(1, client.request_fields("POST", "/hang"), False)
+  |> client.data(1, filler(16_000), False)
+  |> client.data(1, filler(1000), False)
+  |> expect_reset(1, frame.FlowControlError)
 }
 
-pub fn a_writer_already_over_the_limit_is_stopped_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
+pub fn connection_window_is_refilled_once_half_is_used_test() {
+  let send_60_000 = fn(client, stream_id) {
+    use client, _frame <- list.fold([1, 2, 3, 4], client)
+    client.data(client, stream_id, filler(15_000), False)
+  }
 
-  assert connection.over_send_buffer_limit(writing_stream(80), options)
-}
-
-pub fn a_writer_within_the_limit_carries_on_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 64)
-
-  assert !connection.over_send_buffer_limit(writing_stream(80), options)
-}
-
-// One huge message is a single legitimate send: the queue it is measured
-// against is the one before it, which is empty.
-pub fn one_message_larger_than_the_limit_is_allowed_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
-  let empty =
-    connection.Stream(
-      ..queued_stream(0, []),
-      writer: Some(process.new_subject()),
+  let #(received, _client) =
+    ready_with(
+      ewe.Http2Options(
+        ..options(),
+        max_concurrent_streams: Some(2),
+        initial_window_size: 65_536,
+        recv_window_low_water_mark: 1,
+        recv_window_high_water_mark: 65_536,
+      ),
     )
+    |> client.headers(1, client.request_fields("POST", "/hang"), False)
+    |> send_60_000(1)
+    |> client.headers(3, client.request_fields("POST", "/hang"), False)
+    |> send_60_000(3)
+    |> client.skip_until(fn(received) {
+      case received {
+        frame.WindowUpdate(stream_id: 0, ..) -> True
+        _frame -> False
+      }
+    })
 
-  assert !connection.over_send_buffer_limit(empty, options)
+  assert received == frame.WindowUpdate(0, 75_000)
 }
 
-pub fn a_waiting_caller_is_never_capped_test() {
-  let options = http2.Options(..http2.default_options(), send_buffer_limit: 8)
-  let entry = queued_stream(0, [http2.Chunk(<<0:size(80)>>, None)])
+pub fn response_waits_for_the_stream_window_test() {
+  let client =
+    client.serve(app)
+    |> client.handshake([frame.InitialWindowSize(10)])
+    |> client.get(1, "/big/25")
+  let #(_headers, client) = client.receive(client)
+  let #(first, client) = client.receive(client)
+  let assert frame.Data(size: 10, end_stream: False, ..) = first
+  assert client.is_quiet(client)
 
-  assert !connection.over_send_buffer_limit(entry, options)
+  let #(rest, _client) =
+    client
+    |> client.send(frame.WindowUpdate(1, 15))
+    |> client.receive
+  let assert frame.Data(size: 15, end_stream: True, ..) = rest
 }
 
-fn pending_ids(state: connection.State, cursor: Int) -> List(Int) {
-  connection.State(..state, flush_cursor: cursor)
-  |> connection.rotated_pending
-  |> list.map(fn(entry) { entry.0 })
+pub fn response_waits_for_the_connection_window_test() {
+  let client =
+    client.serve(app)
+    |> client.handshake([frame.InitialWindowSize(1_000_000)])
+    |> client.get(1, "/big/70000")
+  let #(_headers, client) = client.receive(client)
+  let client = drain(client, 65_535)
+  assert client.is_quiet(client)
+
+  let #(rest, _client) =
+    client
+    |> client.send(frame.WindowUpdate(0, 10_000))
+    |> client.receive
+  let assert frame.Data(size: 4465, end_stream: True, ..) = rest
 }
 
-pub fn pending_streams_take_turns_at_the_connection_window_test() {
-  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(5, queued), #(1, queued), #(3, queued)]),
+fn drain(client: client.Client, remaining: Int) -> client.Client {
+  case remaining {
+    0 -> client
+    _remaining -> {
+      let #(received, client) = client.receive(client)
+      let assert frame.Data(size:, ..) = received
+      drain(client, remaining - size)
+    }
+  }
+}
+
+pub fn raised_initial_window_resumes_a_stalled_response_test() {
+  let client =
+    client.serve(app)
+    |> client.handshake([frame.InitialWindowSize(10)])
+    |> client.get(1, "/big/30")
+  let #(_headers, client) = client.receive(client)
+  let #(_first, client) = client.receive(client)
+
+  let #(rest, _client) =
+    client
+    |> client.send(
+      frame.Settings(ack: False, settings: [frame.InitialWindowSize(30)]),
     )
-
-  assert pending_ids(state, 0) == [1, 3, 5]
-  assert pending_ids(state, 1) == [3, 5, 1]
-  assert pending_ids(state, 3) == [5, 1, 3]
-  assert pending_ids(state, 5) == [1, 3, 5]
+    |> client.receive
+  let assert frame.Data(size: 20, end_stream: True, ..) = rest
 }
 
-pub fn streams_with_nothing_queued_are_not_flushed_test() {
-  let queued = queued_stream(0, [http2.Chunk(<<"x":utf8>>, None)])
-  let idle = queued_stream(0, [])
-  let state =
-    connection.State(
-      ..connection.test_state(),
-      streams: dict.from_list([#(1, idle), #(3, queued), #(5, idle)]),
+pub fn content_length_without_data_is_malformed_test() {
+  ready()
+  |> client.headers(
+    1,
+    [#("content-length", "3"), ..client.request_fields("POST", "/echo")],
+    True,
+  )
+  |> expect_reset(1, frame.ProtocolError)
+}
+
+pub fn continuation_limit_is_exact_test() {
+  let client =
+    ready_with(ewe.Http2Options(..options(), max_continuation_frames: 3))
+  let #(block, client) =
+    client.encode_fields(client, client.request_fields("GET", "/hello"))
+
+  let #(received, _client) =
+    client
+    |> client.send(frame.Headers(1, True, False, None, block))
+    |> client.send(frame.Continuation(1, False, <<>>))
+    |> client.send(frame.Continuation(1, False, <<>>))
+    |> client.send(frame.Continuation(1, True, <<>>))
+    |> client.response(1)
+
+  let assert Response(status: 200, ..) = received
+}
+
+pub fn continuation_flood_is_enhance_your_calm_test() {
+  let client =
+    ready_with(ewe.Http2Options(..options(), max_continuation_frames: 3))
+    |> client.send(frame.Headers(1, True, False, None, <<0x82>>))
+
+  list.fold([1, 2, 3, 4], client, fn(client, _index) {
+    client.send(client, frame.Continuation(1, False, <<>>))
+  })
+  |> expect_goaway(frame.EnhanceYourCalm)
+}
+
+pub fn client_goaway_is_answered_and_closes_the_connection_test() {
+  let #(received, client) =
+    ready()
+    |> client.send(frame.Goaway(0, frame.NoError, <<>>))
+    |> client.receive
+
+  let assert frame.Goaway(last_stream_id: 0, error: frame.NoError, ..) =
+    received
+  assert client.is_closed(client)
+}
+
+pub fn client_goaway_lets_open_streams_finish_test() {
+  let #(received, client) =
+    ready()
+    |> client.get(1, "/big/100")
+    |> client.send(frame.Goaway(0, frame.NoError, <<>>))
+    |> client.response(1)
+
+  let assert Response(status: 200, ..) = received
+  assert client.is_closed(client)
+}
+
+pub fn idle_connection_is_sent_goaway_test() {
+  ready_with(ewe.Http2Options(..options(), idle_timeout: 50))
+  |> expect_goaway(frame.NoError)
+}
+
+pub fn early_response_asks_the_client_to_stop_sending_test() {
+  let client =
+    ready()
+    |> client.headers(1, client.request_fields("POST", "/hello"), False)
+  let #(received, client) = client.response(client, 1)
+  let assert Response(status: 200, ..) = received
+
+  let client = expect_reset(client, 1, frame.NoError)
+  assert client
+    |> client.data(1, <<"late":utf8>>, True)
+    |> client.is_quiet
+}
+
+pub fn trailers_reach_the_handler_test() {
+  let #(received, _client) =
+    ready()
+    |> client.headers(1, client.request_fields("POST", "/trailer"), False)
+    |> client.data(1, <<"body":utf8>>, False)
+    |> client.headers(1, [#("x-trailer", "present")], True)
+    |> client.response(1)
+
+  let assert Response(status: 200, body: <<"present":utf8>>, ..) = received
+}
+
+pub fn informational_final_status_is_internal_error_test() {
+  ready()
+  |> client.get(1, "/informational")
+  |> expect_reset(1, frame.InternalError)
+}
+
+fn serve_file() -> Int {
+  client.serve_with(app, ewe.Http2Options(..options(), file_read_threshold: 0))
+}
+
+fn write_served_file() -> BitArray {
+  let data = counting(100_000, <<>>)
+  write_file(served_file, data)
+  data
+}
+
+fn counting(size: Int, acc: BitArray) -> BitArray {
+  case size {
+    0 -> acc
+    _size -> counting(size - 1, <<acc:bits, { size % 251 }>>)
+  }
+}
+
+pub fn file_is_sent_from_memory_with_small_frames_test() {
+  let data = write_served_file()
+
+  let #(received, _client) =
+    serve_file()
+    |> client.handshake([])
+    |> client.get(1, "/file")
+    |> client.response(1)
+
+  let assert Response(status: 200, body:, ..) = received
+  assert body == data
+}
+
+pub fn file_is_sent_with_sendfile_with_large_frames_test() {
+  let data = write_served_file()
+
+  let client =
+    serve_file()
+    |> client.handshake([
+      frame.MaxFrameSize(1_048_576),
+      frame.InitialWindowSize(1_048_576),
+    ])
+    |> client.send(frame.WindowUpdate(0, 1_048_576))
+    |> client.get(1, "/file")
+  let #(_headers, client) = client.receive(client)
+  let #(received, _client) = client.receive(client)
+
+  assert received == frame.Data(1, True, data, 100_000)
+}
+
+pub fn streamed_response_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/stream")
+    |> client.response(1)
+
+  let assert Response(status: 200, headers:, body: <<"abc":utf8>>) = received
+  assert list.key_find(headers, "content-length") == Error(Nil)
+}
+
+pub fn unsafe_response_header_is_answered_with_500_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/unsafe")
+    |> client.response(1)
+
+  let assert Response(status: 500, headers:, ..) = received
+  assert list.key_find(headers, "x-a") == Error(Nil)
+}
+
+pub fn unsafe_streamed_response_header_resets_the_stream_test() {
+  ready()
+  |> client.get(1, "/unsafe-stream")
+  |> expect_reset(1, frame.InternalError)
+}
+
+pub fn handler_crash_is_answered_with_on_crash_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/crash")
+    |> client.response(1)
+
+  let assert Response(status: 500, ..) = received
+}
+
+pub fn head_response_has_length_but_no_body_test() {
+  let #(received, client) =
+    ready()
+    |> client.headers(1, client.request_fields("HEAD", "/big/1234"), True)
+    |> client.response(1)
+
+  let assert Response(status: 200, headers:, body: <<>>) = received
+  assert list.key_find(headers, "content-length") == Ok("1234")
+  assert client.is_quiet(client)
+}
+
+pub fn no_content_response_drops_body_and_length_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/no-content")
+    |> client.response(1)
+
+  let assert Response(status: 204, headers:, body: <<>>) = received
+  assert list.key_find(headers, "content-length") == Error(Nil)
+}
+
+pub fn streamed_no_content_response_sends_no_body_test() {
+  let #(received, _client) =
+    ready()
+    |> client.get(1, "/streamed-no-content")
+    |> client.response(1)
+
+  let assert Response(status: 204, body: <<>>, ..) = received
+}
+
+pub fn connect_reaches_the_handler_test() {
+  let #(received, _client) =
+    ready()
+    |> client.headers(
+      1,
+      [#(":method", "CONNECT"), #(":authority", "example.com:443")],
+      True,
     )
+    |> client.response(1)
 
-  assert pending_ids(state, 0) == [3]
+  let assert Response(
+    status: 200,
+    headers:,
+    body: <<"tunnel to example.com":utf8>>,
+  ) = received
+  assert list.key_find(headers, "content-length") == Error(Nil)
 }
 
-fn connect_pseudo_headers() -> List(#(BitArray, BitArray)) {
+pub fn protocol_is_refused_when_not_advertised_test() {
+  let _client =
+    ready_with(ewe.Http2Options(..options(), websocket: False))
+    |> client.headers(
+      1,
+      [#(":protocol", "websocket"), ..client.request_fields("CONNECT", "/")],
+      True,
+    )
+    |> expect_reset(1, frame.ProtocolError)
+  Nil
+}
+
+pub fn oversized_header_list_is_answered_with_431_test() {
+  let #(received, _client) =
+    ready_with(ewe.Http2Options(..options(), max_header_list_size: Some(200)))
+    |> client.headers(
+      1,
+      [#("x-big", string.repeat("a", 300)), ..client.request_fields("GET", "/")],
+      True,
+    )
+    |> client.response(1)
+
+  let assert Response(status: 431, ..) = received
+}
+
+pub fn oversized_request_beyond_the_stream_limit_is_refused_test() {
+  ready_with(
+    ewe.Http2Options(
+      ..options(),
+      max_concurrent_streams: Some(1),
+      max_header_list_size: Some(200),
+    ),
+  )
+  |> client.get(1, "/hang")
+  |> client.headers(
+    3,
+    [#("x-big", string.repeat("a", 300)), ..client.request_fields("GET", "/")],
+    True,
+  )
+  |> expect_reset(3, frame.RefusedStream)
+}
+
+pub fn response_to_a_closed_connection_does_not_leak_test() {
+  let parent = process.new_subject()
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    process.send(parent, process.self())
+    app(req)
+  }
+
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.get(1, "/hang")
+  let assert Ok(pid) = process.receive(parent, 1000)
+  client.close(client)
+
+  assert client.wait_until(fn() { !process.is_alive(pid) }, 50)
+}
+
+pub fn goaway_error_from_client_closes_at_once_test() {
+  let client =
+    ready()
+    |> client.get(1, "/hang")
+    |> client.send(frame.Goaway(0, frame.InternalError, <<>>))
+
+  assert client.is_closed(client)
+}
+
+pub fn handler_reads_the_request_after_responding_test() {
+  let parent = process.new_subject()
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    use writer <- ewe.stream_response(response.new(200))
+    let assert Ok(Nil) = ewe.finish_response(writer)
+    process.send(
+      parent,
+      ewe.read_body(req, 100) |> result.map(fn(req) { req.body }),
+    )
+    Ok(Nil)
+  }
+
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.headers(1, client.request_fields("POST", "/"), False)
+  let #(received, client) = client.response(client, 1)
+  let assert Response(status: 200, ..) = received
+
+  let _client = client.data(client, 1, <<"late body":utf8>>, True)
+  assert process.receive(parent, 1000) == Ok(Ok(<<"late body":utf8>>))
+}
+
+fn websocket_request() -> List(#(String, String)) {
   [
-    #(<<":method":utf8>>, <<"CONNECT":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/socket":utf8>>),
-    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
+    #(":method", "CONNECT"),
+    #(":protocol", "websocket"),
+    #(":scheme", "http"),
+    #(":authority", "localhost"),
+    #(":path", "/"),
+    #("sec-websocket-version", "13"),
   ]
 }
 
-fn connect_pseudo_fields() -> List(alpacki.HeaderField) {
-  use #(name, value) <- list.map(connect_pseudo_headers())
-  alpacki.HeaderField(name, value, alpacki.WithoutIndexing)
-}
-
-fn extended_connect_state(websocket: Bool) -> connection.State {
-  let options = http2.Options(..http2.default_options(), websocket:)
-
-  connection.State(
-    ..connection.test_state(),
-    options:,
-    settings_frame: connection.build_settings_frame(options),
-  )
-}
-
-pub fn extended_connect_carries_its_protocol_test() {
-  let assert Ok(headers.DecodedRequest(
-    request:,
-    content_length: None,
-    protocol: Some("websocket"),
-  )) =
-    headers.build_request(
-      connect_pseudo_headers(),
-      Nil,
-      headers.header_patterns(),
+pub fn websocket_over_extended_connect_test() {
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    ewe.websocket(
+      request: req,
+      on_init: fn(_conn, selector) { #(Nil, selector) },
+      handler: fn(conn, state, message) {
+        case message {
+          ewe.TextFrame(text) -> {
+            let assert Ok(Nil) = ewe.send_text_frame(conn, text)
+            ewe.continue(state)
+          }
+          ewe.BinaryFrame(_data) | ewe.UserMessage(_message) ->
+            ewe.continue(state)
+        }
+      },
+      on_close: fn(_conn, _state) { Nil },
     )
+  }
 
-  assert request.method == http.Connect
-  assert request.path == "/socket"
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.headers(1, websocket_request(), False)
+  let #(headers, client) = client.receive(client)
+  let assert frame.Headers(stream_id: 1, end_stream: False, ..) = headers
+
+  let #(echoed, client) =
+    client
+    |> client.data(1, <<0x81, 0x82, 0:32, "hi":utf8>>, False)
+    |> client.receive
+  assert echoed == frame.Data(1, False, <<0x81, 0x02, "hi":utf8>>, 4)
+
+  let #(closed, _client) =
+    client
+    |> client.data(1, <<0x88, 0x82, 0:32, 1000:16>>, False)
+    |> client.receive
+  let assert frame.Data(
+    stream_id: 1,
+    end_stream: True,
+    data: <<0x88, _rest:bits>>,
+    ..,
+  ) = closed
 }
 
-pub fn protocol_without_connect_is_rejected_test() {
-  let headers = [
-    #(<<":method":utf8>>, <<"GET":utf8>>),
-    #(<<":scheme":utf8>>, <<"https":utf8>>),
-    #(<<":authority":utf8>>, <<"example.com":utf8>>),
-    #(<<":path":utf8>>, <<"/socket":utf8>>),
-    #(<<":protocol":utf8>>, <<"websocket":utf8>>),
-  ]
+pub fn write_after_the_response_ended_fails_at_once_test() {
+  let parent = process.new_subject()
+  let handler = fn(_req: request.Request(ewe.Connection)) {
+    use writer <- ewe.stream_response(response.new(200))
+    let assert Ok(Nil) = ewe.finish_response(writer)
+    process.send(parent, ewe.send_chunk(writer, <<"late":utf8>>))
+    Ok(Nil)
+  }
 
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.ProtocolWithoutConnect)
+  let #(received, _client) =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.get(1, "/")
+    |> client.response(1)
+  let assert Response(status: 200, body: <<>>, ..) = received
+
+  let assert Ok(Error(ewe.ConnectionClosed)) = process.receive(parent, 1000)
 }
 
-pub fn protocol_with_content_length_is_rejected_test() {
-  let headers =
-    list.append(connect_pseudo_headers(), [
-      #(<<"content-length":utf8>>, <<"5":utf8>>),
-    ])
-
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.ProtocolWithContentLength)
-}
-
-pub fn duplicate_protocol_is_rejected_test() {
-  let headers =
-    list.append(connect_pseudo_headers(), [
-      #(<<":protocol":utf8>>, <<"websocket":utf8>>),
-    ])
-
-  assert headers.build_request(headers, Nil, headers.header_patterns())
-    == Error(headers.DuplicatePseudoHeader)
-}
-
-pub fn extended_connect_is_refused_when_websockets_are_off_test() {
-  let assembly =
-    connection.HeaderAssembly(
-      1,
-      True,
-      1,
-      encode(connect_pseudo_fields()),
-      False,
+pub fn reading_the_body_again_after_the_stream_ended_returns_at_once_test() {
+  let parent = process.new_subject()
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    let assert Ok(_read) = ewe.read_body(req, 100)
+    use writer <- ewe.stream_response(response.new(200))
+    let assert Ok(Nil) = ewe.finish_response(writer)
+    process.send(
+      parent,
+      ewe.read_body(req, 100) |> result.map(fn(req) { req.body }),
     )
-  let result =
-    connection.complete_header_block(extended_connect_state(False), assembly)
+    Ok(Nil)
+  }
 
-  let assert connection.RejectStream(_state, stream_id, code) = result
-  assert stream_id == 1
-  assert code == frame.ProtocolError
+  let _client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.headers(1, client.request_fields("POST", "/"), False)
+    |> client.data(1, <<"body":utf8>>, True)
+  assert process.receive(parent, 1000) == Ok(Ok(<<>>))
 }
 
-pub fn extended_connect_is_served_when_websockets_are_on_test() {
-  let assembly =
-    connection.HeaderAssembly(
-      1,
-      True,
-      1,
-      encode(connect_pseudo_fields()),
-      False,
+pub fn websocket_on_close_can_still_send_test() {
+  let handler = fn(req: request.Request(ewe.Connection)) {
+    ewe.websocket(
+      request: req,
+      on_init: fn(_conn, selector) { #(Nil, selector) },
+      handler: fn(_conn, _state, _message) { ewe.stop() },
+      on_close: fn(conn, _state) {
+        let assert Ok(Nil) = ewe.send_text_frame(conn, "bye")
+        Nil
+      },
     )
+  }
 
-  let assert connection.Proceed(_state) =
-    connection.complete_header_block(extended_connect_state(True), assembly)
-}
+  let client =
+    client.serve(handler)
+    |> client.handshake([])
+    |> client.headers(1, websocket_request(), False)
+  let #(_headers, client) = client.receive(client)
 
-fn advertised_settings(websocket: Bool) -> List(frame.Setting) {
-  let assert Ok(#(frame.Settings(_stream_id, _ack, params), <<>>)) =
-    extended_connect_state(websocket).settings_frame
-    |> bytes_tree.to_bit_array
-    |> frame.decode(16_384)
+  let #(goodbye, client) =
+    client
+    |> client.data(1, <<0x81, 0x82, 0:32, "hi":utf8>>, False)
+    |> client.receive
+  assert goodbye == frame.Data(1, False, <<0x81, 0x03, "bye":utf8>>, 5)
 
-  params
-}
-
-pub fn websockets_off_does_not_advertise_extended_connect_test() {
-  assert !list.contains(
-    advertised_settings(False),
-    frame.EnableConnectProtocol(True),
-  )
-}
-
-pub fn websockets_on_advertises_extended_connect_test() {
-  assert list.contains(
-    advertised_settings(True),
-    frame.EnableConnectProtocol(True),
-  )
+  let #(ended, _client) = client.receive(client)
+  assert ended == frame.Data(1, True, <<>>, 0)
 }

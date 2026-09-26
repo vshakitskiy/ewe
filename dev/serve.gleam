@@ -34,6 +34,13 @@ fn handle_request(
         Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
       }
     http.Post, "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
+    // h2spec -h 127.0.0.1 -p 3000 -P /h2spec 
+    _method, "/h2spec" ->
+      case ewe.read_body(request, 1_000_000) {
+        Ok(_request) ->
+          response.new(200) |> response.set_body(ewe.Text("h2spec"))
+        Error(_error) -> response.new(400) |> response.set_body(ewe.Empty)
+      }
     http.Get, "/stream" -> {
       use writer <- ewe.stream_response(response.new(200))
       use writer <- result.try(ewe.send_chunk(writer, <<"hello, ":utf8>>))

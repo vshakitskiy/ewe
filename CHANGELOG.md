@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+- Add `idle_timeout` to `Http2Options`.
+- Support `CONNECT` over HTTP/2.
+- Accept `Host` in place of `:authority` over HTTP/2.
+- Change HTTP/2 defaults: `max_concurrent_streams` to 100,
+  `initial_window_size` and `recv_window_high_water_mark` to 256 KiB,
+  `recv_window_low_water_mark` to 64 KiB.
+- Apply `send_buffer_limit` to all streamed HTTP/2 bodies. Writes over it now
+  wait instead of resetting the stream.
+- `send_text_frame` and `send_binary_frame` now return errors over HTTP/2.
+- Keep repeated HTTP/2 request headers as separate entries except `cookie`.
+- Batch HTTP/2 frames into fewer socket writes.
+- Index `date` and common HTTP/2 response headers in the HPACK table.
+- Read large HTTP/2 files in 64 KiB chunks instead of one `sendfile` per frame
+  when the client's max frame size is smaller.
+- Send 500 to HTTP/2 responses with NUL, CR or LF in a header instead of
+  dropping the header. Streamed responses reset the stream.
+- Serve TLS connections that did not negotiate `h2` as HTTP/1.1.
+- Send two GOAWAY frames on graceful HTTP/2 shutdown.
+- Send `RST_STREAM(NO_ERROR)` when an HTTP/2 response completes before its
+  request body.
+- Respond 431 to HTTP/2 requests with oversized headers instead of closing the
+  connection.
+- Count resets caused by invalid frames toward the rapid reset limit
+  (CVE-2025-8671).
+- Reject HTTP/2 requests with whitespace around header values, userinfo in the
+  authority, or a `:path` not starting with `/`.
+- Fix HPACK state not updating after a rejected header block.
+- Fix HTTP/2 rejecting requests to IPv6 addresses.
+- Fix HTTP/2 accepting requests before the client's SETTINGS.
+- Fix `SETTINGS_INITIAL_WINDOW_SIZE` changes overflowing stream windows.
+- Fix HTTP/2 handlers running after the client disconnects.
+- Fix `max_continuation_frames` off-by-one.
+- Fix streamed HTTP/2 1xx, 204 and 304 responses sending a body.
+- Fix silent truncation when a file shrinks while sent over TLS.
+- Fix writes to a closed HTTP/2 stream hanging.
+- Fix HTTP/2 WebSocket `on_close` running after its stream ended.
+- Fix HTTP/2 SSE and WebSockets not ending after a reset or disconnect when the
+  handler ignores a failed write.
+
 ## v8.0.0 - 23.09.2026
 
 - Replace the vendored `glisten` fork with `tup` as the acceptor pool.

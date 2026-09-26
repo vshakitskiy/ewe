@@ -10,12 +10,12 @@ import websocks
 
 pub type Connection {
   Http1(http1.Connection)
-  Http2(http2.Connection(Body))
+  Http2(http2.Connection)
 }
 
 pub type Handler {
   Handler(
-    call: fn(request.Request(Connection)) -> response.Response(Body),
+    respond: fn(request.Request(Connection)) -> response.Response(Body),
     on_crash: response.Response(Body),
   )
 }
@@ -54,17 +54,17 @@ pub type FileDescriptor
 
 pub type ResponseWriter {
   Http1Writer(http1.ResponseWriter)
-  Http2Writer(http2.ResponseWriter(Body))
+  Http2Writer(http2.ResponseWriter)
 }
 
 pub type SseConnection {
   Http1Sse(http1.SseConnection)
-  Http2Sse(http2.SseConnection(Body))
+  Http2Sse(http2.SseConnection)
 }
 
 pub type WebsocketConnection {
   Http1Websocket(http1.WebsocketConnection)
-  Http2Websocket(http2.WebsocketConnection(Body))
+  Http2Websocket(http2.WebsocketConnection)
 }
 
 pub type Outcome {
@@ -72,21 +72,25 @@ pub type Outcome {
   StoppedAbnormal(reason: String)
 }
 
-pub type Step(user_state, user_message) {
-  Proceed(
+pub type Next(user_state, user_message) {
+  Continue(
     user_state: user_state,
-    messages: option.Option(process.Selector(user_message)),
+    selector: option.Option(process.Selector(user_message)),
   )
-  Halt(Outcome)
+  Stop
+  StopAbnormal(reason: String)
 }
 
 pub type Message {
-  Timeout
-  Http2Handshake
-  Http2Stream(http2.Reply(Body))
+  IdleTimeout
+  Http2HandshakeTimeout
+  Http2IdleTimeout
+  Http2Command(http2.Command)
+  Http2Respond(stream_id: Int, response: response.Response(Body))
   Http2Exit(process.ExitMessage)
-  Http2Drain
-  Http2StreamClose(pid: process.Pid)
+  Http2DrainTimeout
+  Http2Resume
+  Http2KillWorker(pid: process.Pid)
 }
 
 pub type Exit {
@@ -133,7 +137,7 @@ pub fn start_idle_timer(
   self: process.Subject(Message),
   timeout: Int,
 ) -> option.Option(process.Timer) {
-  process.send_after(self, timeout, Timeout)
+  process.send_after(self, timeout, IdleTimeout)
   |> option.Some
 }
 

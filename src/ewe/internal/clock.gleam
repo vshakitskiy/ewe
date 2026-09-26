@@ -1,6 +1,8 @@
 import gleam/erlang/process
+import gleam/int
 import gleam/otp/actor
 import gleam/result
+import gleam/string
 
 type Message {
   Tick
@@ -51,31 +53,23 @@ fn format_date(time: #(Int, #(Int, Int, Int), #(Int, Int, Int))) -> BitArray {
   <<
     weekday_to_string(weekday):utf8,
     ", ":utf8,
-    two_digits(day):bits,
+    padded(day, 2):utf8,
     " ":utf8,
     month_to_string(month):utf8,
     " ":utf8,
-    four_digits(year):bits,
+    padded(year, 4):utf8,
     " ":utf8,
-    two_digits(hour):bits,
+    padded(hour, 2):utf8,
     ":":utf8,
-    two_digits(minute):bits,
+    padded(minute, 2):utf8,
     ":":utf8,
-    two_digits(second):bits,
+    padded(second, 2):utf8,
     " GMT":utf8,
   >>
 }
 
-fn two_digits(value: Int) -> BitArray {
-  <<digit(value / 10), digit(value)>>
-}
-
-fn four_digits(value: Int) -> BitArray {
-  <<digit(value / 1000), digit(value / 100), digit(value / 10), digit(value)>>
-}
-
-fn digit(value: Int) -> Int {
-  0x30 + value % 10
+fn padded(value: Int, width: Int) -> String {
+  int.to_string(value) |> string.pad_start(width, "0")
 }
 
 fn weekday_to_string(weekday: Int) -> String {

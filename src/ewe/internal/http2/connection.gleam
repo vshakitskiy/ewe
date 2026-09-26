@@ -1,7 +1,8 @@
+import gleam/bit_array
+import gleam/bytes_tree
 import gleam/dynamic
 import gleam/erlang/process
 import gleam/erlang/reference
-import gleam/http/response
 import gleam/option
 import tup
 import websocks
@@ -19,6 +20,7 @@ pub type Options {
     rapid_reset_threshold: Int,
     handshake_timeout_ms: Int,
     drain_timeout_ms: Int,
+    idle_timeout_ms: Int,
     recv_window_low_water_mark: Int,
     recv_window_high_water_mark: Int,
     websocket: Bool,
@@ -30,8 +32,8 @@ pub type Options {
 
 pub fn default_options() -> Options {
   Options(
-    max_concurrent_streams: option.None,
-    initial_window_size: 2_097_152,
+    max_concurrent_streams: option.Some(100),
+    initial_window_size: 262_144,
     max_frame_size: 16_384,
     max_header_list_size: option.Some(32_768),
     header_table_size: 4096,
@@ -41,8 +43,9 @@ pub fn default_options() -> Options {
     rapid_reset_threshold: 100,
     handshake_timeout_ms: 10_000,
     drain_timeout_ms: 4000,
-    recv_window_low_water_mark: 262_144,
-    recv_window_high_water_mark: 2_097_152,
+    idle_timeout_ms: 60_000,
+    recv_window_low_water_mark: 65_536,
+    recv_window_high_water_mark: 262_144,
     websocket: True,
     send_buffer_limit: 1_048_576,
     file_read_threshold: 1_048_576,
@@ -50,46 +53,39 @@ pub fn default_options() -> Options {
   )
 }
 
-pub type Connection(body) {
+pub type Connection {
   Connection(
-    connection: process.Subject(Reply(body)),
+    commands: process.Subject(Command),
     stream_id: Int,
     has_body: Bool,
     pending: BitArray,
     pending_trailers: option.Option(List(#(String, String))),
-    read: Int,
+    bytes_read: Int,
     body_read_timeout: Int,
     peer: tup.Endpoint,
     protocol: option.Option(String),
   )
 }
 
-pub type Reply(body) {
-  Respond(stream_id: Int, response: response.Response(body))
+pub type Command {
   ReadBody(stream_id: Int, reply_to: process.Subject(BodyEvent))
   WriteHeaders(
     stream_id: Int,
     ack: process.Subject(WriteAck),
     status: Int,
     headers: List(#(String, String)),
-    mode: ResponseMode,
+    signals: option.Option(process.Subject(StreamSignal)),
   )
-  PushData(stream_id: Int, chunk: Chunk)
-}
-
-pub type ResponseMode {
-  PlainStream
-  EventStream(notify: process.Subject(StreamSignal))
-  WebsocketStream(notify: process.Subject(StreamSignal))
+  WriteData(
+    stream_id: Int,
+    data: BitArray,
+    end_stream: Bool,
+    ack: process.Subject(WriteAck),
+  )
 }
 
 pub type StreamSignal {
   Draining
-}
-
-pub type Chunk {
-  Chunk(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
-  Finish(bytes: BitArray, ack: option.Option(process.Subject(WriteAck)))
 }
 
 pub type BodyEvent {
@@ -99,28 +95,26 @@ pub type BodyEvent {
 }
 
 pub type WriteAck {
-  WriteAck
+  Written
+  Ended
 }
 
-pub type ResponseWriter(body) {
+pub type ResponseWriter {
   ResponseWriter(
-    connection: process.Subject(Reply(body)),
+    commands: process.Subject(Command),
     stream_id: Int,
     ack: process.Subject(WriteAck),
     ack_ref: reference.Reference,
   )
 }
 
-pub type SseConnection(body) {
-  SseConnection(
-    writer: ResponseWriter(body),
-    signals: process.Subject(StreamSignal),
-  )
+pub type SseConnection {
+  SseConnection(writer: ResponseWriter, signals: process.Subject(StreamSignal))
 }
 
-pub type WebsocketConnection(body) {
+pub type WebsocketConnection {
   WebsocketConnection(
-    writer: ResponseWriter(body),
+    writer: ResponseWriter,
     context: websocks.Context,
     body: process.Subject(BodyEvent),
     signals: process.Subject(StreamSignal),
@@ -129,14 +123,24 @@ pub type WebsocketConnection(body) {
 
 pub type Interrupted {
   StreamReset
+  StreamEnded
   ConnectionClosed
   TimedOut
 }
 
-@external(erlang, "ewe_http2_ffi", "recv_or_exit")
+pub fn interrupted_to_string(interrupted: Interrupted) -> String {
+  case interrupted {
+    StreamReset -> "the client reset the stream"
+    StreamEnded -> "the response had already ended"
+    ConnectionClosed -> "the connection closed"
+    TimedOut -> "the client did not read the response in time"
+  }
+}
+
+@external(erlang, "ewe_ffi", "recv_or_exit")
 pub fn receive_reply(tag: reference.Reference) -> Result(message, Interrupted)
 
-@external(erlang, "ewe_http2_ffi", "recv_or_exit")
+@external(erlang, "ewe_ffi", "recv_or_exit")
 pub fn receive_reply_within(
   tag: reference.Reference,
   timeout: Int,
@@ -145,5 +149,107 @@ pub fn receive_reply_within(
 @external(erlang, "ewe_ffi", "identity")
 pub fn tag(reference: reference.Reference) -> dynamic.Dynamic
 
-@external(erlang, "ewe_http2_ffi", "is_shutdown")
+@external(erlang, "ewe_ffi", "is_shutdown")
 pub fn is_shutdown(reason: dynamic.Dynamic) -> Bool
+
+pub type BodyError {
+  BodyTooLarge
+  InvalidBody
+}
+
+pub fn read_body(
+  connection: Connection,
+  limit: Int,
+) -> Result(#(BitArray, List(#(String, String))), BodyError) {
+  case connection.has_body {
+    False -> Ok(#(<<>>, []))
+    True -> read_all(connection, limit, bytes_tree.new())
+  }
+}
+
+fn read_all(
+  connection: Connection,
+  limit: Int,
+  acc: bytes_tree.BytesTree,
+) -> Result(#(BitArray, List(#(String, String))), BodyError) {
+  case next_chunk(connection) {
+    Error(error) -> Error(error)
+    Ok(Done(trailers)) -> Ok(#(bytes_tree.to_bit_array(acc), trailers))
+    Ok(Chunk(data, connection)) ->
+      case connection.bytes_read > limit {
+        True -> Error(BodyTooLarge)
+        False -> read_all(connection, limit, bytes_tree.append(acc, data))
+      }
+  }
+}
+
+pub type ReadEvent {
+  Chunk(data: BitArray, connection: Connection)
+  Done(trailers: List(#(String, String)))
+}
+
+pub fn read_body_chunk(
+  connection: Connection,
+  max_chunk_bytes max_chunk_bytes: Int,
+  limit limit: Int,
+) -> Result(ReadEvent, BodyError) {
+  case next_chunk(connection) {
+    Error(error) -> Error(error)
+    Ok(Done(trailers)) -> Ok(Done(trailers))
+    Ok(Chunk(data, connection)) ->
+      case connection.bytes_read > limit {
+        True -> Error(BodyTooLarge)
+        False -> Ok(split(connection, data, max_chunk_bytes))
+      }
+  }
+}
+
+fn split(
+  connection: Connection,
+  data: BitArray,
+  max_chunk_bytes: Int,
+) -> ReadEvent {
+  case data {
+    <<chunk:bytes-size(max_chunk_bytes), pending:bits>> ->
+      Chunk(chunk, Connection(..connection, pending:))
+    _data -> Chunk(data, Connection(..connection, pending: <<>>))
+  }
+}
+
+fn next_chunk(connection: Connection) -> Result(ReadEvent, BodyError) {
+  case connection.has_body, connection.pending, connection.pending_trailers {
+    False, _pending, _trailers -> Ok(Done([]))
+    True, <<>>, option.Some(trailers) -> Ok(Done(trailers))
+    True, <<>>, option.None -> pull(connection)
+    True, pending, _trailers ->
+      Ok(Chunk(pending, Connection(..connection, pending: <<>>)))
+  }
+}
+
+fn pull(connection: Connection) -> Result(ReadEvent, BodyError) {
+  let reply_ref = reference.new()
+  let reply_to = process.unsafely_create_subject(process.self(), tag(reply_ref))
+
+  process.send(connection.commands, ReadBody(connection.stream_id, reply_to))
+
+  case receive_reply_within(reply_ref, connection.body_read_timeout) {
+    Error(_interrupted) -> Error(InvalidBody)
+    Ok(DoneEvent(trailers)) -> Ok(Done(trailers))
+    Ok(ChunkEvent(data)) -> Ok(Chunk(data, count_read(connection, data)))
+    Ok(LastChunkEvent(data, trailers)) ->
+      Ok(Chunk(
+        data,
+        Connection(
+          ..count_read(connection, data),
+          pending_trailers: option.Some(trailers),
+        ),
+      ))
+  }
+}
+
+fn count_read(connection: Connection, data: BitArray) -> Connection {
+  Connection(
+    ..connection,
+    bytes_read: connection.bytes_read + bit_array.byte_size(data),
+  )
+}

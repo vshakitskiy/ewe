@@ -1,5 +1,6 @@
 import ewe/internal/connection
 import gleam/bytes_tree
+import gleam/dynamic
 import gleam/int
 import gleam/option
 import gleam/result
@@ -138,7 +139,12 @@ fn send_chunks(
     0 -> Ok(Nil)
     _remaining -> {
       let amount = int.min(remaining, chunk_size)
-      use data <- result.try(pread(handle, offset, amount))
+      use data <- result.try(
+        read(handle, offset, amount)
+        |> result.replace_error(
+          socket.Failure(dynamic.string("could not read the file")),
+        ),
+      )
       use Nil <- result.try(socket.send(
         transport,
         socket,
@@ -156,17 +162,24 @@ fn send_chunks(
   }
 }
 
-@external(erlang, "ewe_file_ffi", "read_range")
+@external(erlang, "ewe_ffi", "file_read")
+pub fn read(
+  handle: connection.FileDescriptor,
+  offset: Int,
+  length: Int,
+) -> Result(BitArray, FileError)
+
+@external(erlang, "ewe_ffi", "file_read_range")
 pub fn read_range(
   path: String,
   offset: Int,
   length: Int,
 ) -> Result(BitArray, FileError)
 
-@external(erlang, "ewe_file_ffi", "stat")
+@external(erlang, "ewe_ffi", "file_stat")
 fn stat(path: String) -> Result(Int, FileError)
 
-@external(erlang, "ewe_file_ffi", "sendfile")
+@external(erlang, "ewe_ffi", "sendfile")
 fn do_sendfile(
   handle: connection.FileDescriptor,
   socket: socket.Socket,
@@ -174,18 +187,11 @@ fn do_sendfile(
   bytes: Int,
 ) -> Result(Nil, socket.SocketError)
 
-@external(erlang, "ewe_file_ffi", "open")
+@external(erlang, "ewe_ffi", "file_open")
 pub fn open(path: String) -> Result(connection.FileDescriptor, FileError)
 
-@external(erlang, "ewe_file_ffi", "size")
+@external(erlang, "ewe_ffi", "file_size")
 fn size(handle: connection.FileDescriptor) -> Result(Int, FileError)
 
-@external(erlang, "ewe_file_ffi", "pread")
-fn pread(
-  handle: connection.FileDescriptor,
-  offset: Int,
-  length: Int,
-) -> Result(BitArray, socket.SocketError)
-
-@external(erlang, "ewe_file_ffi", "close")
+@external(erlang, "ewe_ffi", "file_close")
 pub fn close(handle: connection.FileDescriptor) -> Nil
