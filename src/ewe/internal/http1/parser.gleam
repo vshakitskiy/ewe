@@ -1,4 +1,5 @@
 import ewe/internal/http1/connection as http1
+import ewe/internal/target
 import gleam/bit_array
 import gleam/http
 import gleam/list
@@ -277,10 +278,9 @@ fn decode_component(bits: BitArray, on_error: ParseError) -> Step(String) {
 }
 
 fn validate_path(method: http.Method, path: String) -> Step(String) {
-  case path, method {
-    "*", http.Options -> StepDone(path)
-    "/" <> _remaining, _method -> StepDone(path)
-    _path, _method -> ParseError(BadTarget)
+  case target.is_valid_path(method, path) {
+    True -> StepDone(path)
+    False -> ParseError(BadTarget)
   }
 }
 
@@ -292,7 +292,7 @@ fn resolve_target(
 ) -> Step(#(String, option.Option(Int), String, option.Option(String))) {
   case method {
     http.Connect ->
-      case split_host_port(target) {
+      case target.split_host_port(target) {
         Ok(#(host, option.Some(_port) as port)) ->
           case bit_array_to_string(host) {
             Ok(host) -> StepDone(#(host, port, "", option.None))
@@ -318,86 +318,6 @@ fn resolve_host(
     option.Some(host_port), _version -> StepDone(host_port)
     option.None, Http10 -> StepDone(#("", option.None))
     option.None, Http11 -> ParseError(MissingHost)
-  }
-}
-
-fn split_host_port(
-  value: BitArray,
-) -> Result(#(BitArray, option.Option(Int)), Nil) {
-  case value {
-    <<"[":utf8, _remaining:bits>> -> split_bracketed_host(value)
-    _value ->
-      case find_colon(value) {
-        Error(Nil) -> Ok(#(value, option.None))
-        Ok(position) -> {
-          let size = bit_array.byte_size(value)
-          case value {
-            <<
-              host:bytes-size(position),
-              ":":utf8,
-              port:bytes-size(size - position - 1),
-            >> ->
-              case parse_port(port) {
-                Ok(port) -> Ok(#(host, option.Some(port)))
-                Error(Nil) -> Error(Nil)
-              }
-            _value -> Error(Nil)
-          }
-        }
-      }
-  }
-}
-
-fn split_bracketed_host(
-  value: BitArray,
-) -> Result(#(BitArray, option.Option(Int)), Nil) {
-  case find_close_bracket(value) {
-    Error(Nil) -> Error(Nil)
-    Ok(position) -> {
-      let size = bit_array.byte_size(value)
-
-      case value {
-        <<
-          host:bytes-size(position + 1),
-          remaining:bytes-size(size - position - 1),
-        >> ->
-          case remaining {
-            <<>> -> Ok(#(host, option.None))
-            <<":":utf8, port:bits>> ->
-              case parse_port(port) {
-                Ok(port) -> Ok(#(host, option.Some(port)))
-                Error(Nil) -> Error(Nil)
-              }
-            _remaining -> Error(Nil)
-          }
-        _value -> Error(Nil)
-      }
-    }
-  }
-}
-
-fn parse_port(bits: BitArray) -> Result(Int, Nil) {
-  case parse_decimal(bits) {
-    Ok(port) if port <= 65_535 -> Ok(port)
-    Ok(_port) -> Error(Nil)
-    Error(Nil) -> Error(Nil)
-  }
-}
-
-fn parse_decimal(bits: BitArray) -> Result(Int, Nil) {
-  case bits {
-    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
-      parse_decimal_digits(remaining, byte - 48)
-    _bits -> Error(Nil)
-  }
-}
-
-fn parse_decimal_digits(bits: BitArray, acc: Int) -> Result(Int, Nil) {
-  case bits {
-    <<byte, remaining:bits>> if byte >= 48 && byte <= 57 ->
-      parse_decimal_digits(remaining, acc * 10 + { byte - 48 })
-    <<>> -> Ok(acc)
-    _bits -> Error(Nil)
   }
 }
 
@@ -543,7 +463,7 @@ fn classify(
       case state.content_length {
         option.Some(_length) -> ParseError(DuplicateContentLength)
         option.None ->
-          case parse_decimal(value) {
+          case target.parse_decimal(value) {
             Ok(length) ->
               StepDone(
                 HeaderState(..state, content_length: option.Some(length)),
@@ -598,7 +518,7 @@ fn classify(
       case state.host {
         option.Some(_host) -> ParseError(DuplicateHost)
         option.None ->
-          case split_host_port(value) {
+          case target.split_host_port(value) {
             Ok(#(host, port)) -> {
               let host = option.Some(#(unsafe_to_string(host), port))
               StepDone(HeaderState(..state, host:))
@@ -670,31 +590,28 @@ pub fn has_token(value: BitArray, token: BitArray) -> Bool {
   value == token || list.contains(tokens(value), token)
 }
 
-@external(erlang, "ewe_http1_ffi", "find_lf")
+@external(erlang, "ewe_ffi", "find_lf")
 fn find_lf(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "ewe_http1_ffi", "find_colon")
+@external(erlang, "ewe_ffi", "find_colon")
 fn find_colon(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "ewe_http1_ffi", "find_space")
+@external(erlang, "ewe_ffi", "find_space")
 fn find_space(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "ewe_http1_ffi", "find_question")
+@external(erlang, "ewe_ffi", "find_question")
 fn find_question(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "ewe_http1_ffi", "find_close_bracket")
-fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "ewe_http1_ffi", "find_unsafe_header_byte")
+@external(erlang, "ewe_ffi", "find_unsafe_header_byte")
 pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
 
-@external(erlang, "ewe_http1_ffi", "split_comma")
+@external(erlang, "ewe_ffi", "split_comma")
 fn split_comma(bits: BitArray) -> List(BitArray)
 
-@external(erlang, "ewe_http1_ffi", "lowercase_ascii")
+@external(erlang, "ewe_ffi", "lowercase_ascii")
 pub fn lowercase_ascii(bits: BitArray) -> BitArray
 
-@external(erlang, "ewe_http1_ffi", "bit_array_to_string")
+@external(erlang, "ewe_ffi", "bit_array_to_string")
 fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
 
 @external(erlang, "ewe_ffi", "identity")

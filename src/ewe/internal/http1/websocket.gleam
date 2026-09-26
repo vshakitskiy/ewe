@@ -1,14 +1,12 @@
 import ewe/internal/connection
-import ewe/internal/http1/connection as http1
-import ewe/internal/http1/stream
-import ewe/internal/rescue
+import ewe/internal/http1
+import ewe/internal/http1/connection as http1_connection
 import ewe/internal/websocket
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http
 import gleam/option
 import gleam/result
-import logging
 import tup/socket
 import websocks
 
@@ -39,7 +37,7 @@ pub type Handshake {
 
 pub fn handshake(
   method: http.Method,
-  conn: http1.Connection,
+  conn: http1_connection.Connection,
 ) -> Result(Handshake, HandshakeError) {
   use Nil <- result.try(case method {
     http.Get -> Ok(Nil)
@@ -48,8 +46,8 @@ pub fn handshake(
 
   case conn.upgrade {
     option.None -> Error(NotAnUpgrade)
-    option.Some(http1.OtherUpgrade(..)) -> Error(NotWebsocket)
-    option.Some(http1.WebsocketUpgrade(key:, version:, extensions:)) -> {
+    option.Some(http1_connection.OtherUpgrade(..)) -> Error(NotWebsocket)
+    option.Some(http1_connection.WebsocketUpgrade(key:, version:, extensions:)) -> {
       use Nil <- result.try(case version {
         option.Some("13") -> Ok(Nil)
         option.Some(_other) | option.None -> Error(UnsupportedVersion)
@@ -57,270 +55,98 @@ pub fn handshake(
 
       use key <- result.map(option.to_result(key, MissingKey))
 
-      let compression = case extensions {
-        option.Some(header) ->
-          case websocks.has_deflate(header) {
-            True -> option.Some(websocks.get_compression_extensions(header))
-            False -> option.None
-          }
-        option.None -> option.None
-      }
-
-      Handshake(accept: websocks.compute_accept(key), compression:)
+      Handshake(
+        accept: websocks.compute_accept(key),
+        compression: websocket.compression(extensions),
+      )
     }
   }
-}
-
-type Handlers(user_state, user_message) {
-  Handlers(
-    step: fn(
-      connection.WebsocketConnection,
-      user_state,
-      websocket.Message(user_message),
-    ) -> connection.Step(user_state, user_message),
-    on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
-  )
 }
 
 pub fn run(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
   on_init: fn(connection.WebsocketConnection, process.Selector(user_message)) ->
     #(user_state, process.Selector(user_message)),
-  step: fn(
+  handler: fn(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> connection.Step(user_state, user_message),
+  ) -> connection.Next(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
-  let handlers = Handlers(step:, on_close:)
-  let #(state, messages) =
-    on_init(connection.Http1Websocket(conn), process.new_selector())
-
   case activate(conn) {
-    Ok(Nil) -> loop(conn, handlers, stream.selector(messages), state)
-    Error(reason) -> socket_failed(conn, handlers, state, reason)
+    Ok(Nil) ->
+      websocket.run(transport(conn), conn.context, on_init, handler, on_close)
+    Error(reason) -> {
+      websocks.close_context(conn.context)
+      connection.StoppedAbnormal(socket.describe_error(reason))
+    }
   }
 }
 
-fn ended(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  outcome: connection.Outcome,
-) -> connection.Outcome {
-  let handle = connection.Http1Websocket(conn)
-  rescue.logged("websocket close handler", fn() {
-    handlers.on_close(handle, state)
-  })
+fn transport(
+  conn: http1_connection.WebsocketConnection,
+) -> websocket.Transport(http1.SocketEvent(user_message), user_message) {
+  let send = fn(frame) {
+    write(conn, frame) |> result.map_error(socket.describe_error)
+  }
 
-  websocks.close_context(conn.context)
-  outcome
-}
-
-fn stopped(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-) -> connection.Outcome {
-  ended(conn, handlers, state, connection.Stopped)
-}
-
-fn crashed(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  details: String,
-) -> connection.Outcome {
-  logging.log(
-    logging.Error,
-    "Caught a crash in the websocket handler: " <> details,
-  )
-
-  ended(
-    conn,
-    handlers,
-    state,
-    connection.StoppedAbnormal("the handler crashed"),
+  websocket.Transport(
+    handle: fn(context) {
+      connection.Http1Websocket(
+        http1_connection.WebsocketConnection(..conn, context:),
+      )
+    },
+    selector: http1.socket_selector,
+    receive: fn(selector) { receive(conn, selector) },
+    send:,
+    close: send,
   )
 }
 
-fn socket_failed(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  reason: socket.SocketError,
-) -> connection.Outcome {
-  socket.describe_error(reason)
-  |> connection.StoppedAbnormal
-  |> ended(conn, handlers, state, _)
-}
-
-type Resume {
-  DrainBuffer
-  AwaitSocket
-}
-
-fn loop(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(stream.Event(user_message)),
-  state: user_state,
-) -> connection.Outcome {
+fn receive(
+  conn: http1_connection.WebsocketConnection,
+  selector: process.Selector(http1.SocketEvent(user_message)),
+) -> websocket.Event(user_message) {
   case process.selector_receive_forever(selector) {
-    stream.Closed -> stopped(conn, handlers, state)
-    stream.Failed(reason) | stream.Exited(connection.LinkFailed(reason)) ->
-      ended(conn, handlers, state, connection.StoppedAbnormal(reason))
-    stream.Exited(connection.ParentExited) ->
-      websocks.CloseReason(websocks.GoingAway, "server shutting down")
-      |> close(conn, _)
-      |> resolve(conn, handlers, state, _)
-    stream.Exited(connection.LinkExitedNormally) ->
-      loop(conn, handlers, selector, state)
-    stream.Exhausted ->
+    http1.Packet(data) -> websocket.Data(data, last: False)
+    http1.UserMessage(message) -> websocket.User(message)
+    http1.Exhausted ->
       case activate(conn) {
-        Ok(Nil) -> loop(conn, handlers, selector, state)
-        Error(reason) -> socket_failed(conn, handlers, state, reason)
+        Ok(Nil) -> receive(conn, selector)
+        Error(reason) -> websocket.Failed(socket.describe_error(reason))
       }
-    stream.Packet(data) ->
-      websocks.push_data(conn.context, data)
-      |> with_context(conn, _)
-      |> drain(handlers, selector, state)
-    stream.UserMessage(message) ->
-      websocket.UserMessage(message)
-      |> deliver(conn, handlers, selector, state, AwaitSocket, _)
-  }
-}
-
-fn drain(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(stream.Event(user_message)),
-  state: user_state,
-) -> connection.Outcome {
-  case websocks.next_frame(conn.context) {
-    Error(violation) ->
-      close(conn, websocket.close_reason(violation))
-      |> resolve(conn, handlers, state, _)
-    Ok(websocks.MoreData(context:)) ->
-      with_context(conn, context)
-      |> loop(handlers, selector, state)
-    Ok(websocks.Decoded(frame:, context:)) -> {
-      let conn = with_context(conn, context)
-
-      case frame {
-        websocks.Control(websocks.Ping(payload)) ->
-          case
-            write(
-              conn,
-              websocks.encode_pong_frame(payload:, masking: option.None),
-            )
-          {
-            Ok(Nil) -> drain(conn, handlers, selector, state)
-            Error(reason) -> socket_failed(conn, handlers, state, reason)
-          }
-        websocks.Control(websocks.Pong(_payload))
-        | websocks.Continuation(_payload) ->
-          drain(conn, handlers, selector, state)
-        websocks.Control(websocks.Close(reason)) ->
-          close(conn, reason) |> resolve(conn, handlers, state, _)
-        websocks.Text(payload) ->
-          websocket.TextFrame(unsafe_to_string(payload))
-          |> deliver(conn, handlers, selector, state, DrainBuffer, _)
-        websocks.Binary(payload) ->
-          websocket.BinaryFrame(payload)
-          |> deliver(conn, handlers, selector, state, DrainBuffer, _)
-      }
-    }
-  }
-}
-
-fn deliver(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(stream.Event(user_message)),
-  state: user_state,
-  resume: Resume,
-  message: websocket.Message(user_message),
-) -> connection.Outcome {
-  let handle = connection.Http1Websocket(conn)
-
-  case rescue.handler(fn() { handlers.step(handle, state, message) }) {
-    Error(details) -> crashed(conn, handlers, state, details)
-    Ok(connection.Halt(outcome)) -> ended(conn, handlers, state, outcome)
-    Ok(connection.Proceed(user_state: state, messages:)) -> {
-      let selector = case messages {
-        option.Some(messages) -> stream.selector(messages)
-        option.None -> selector
-      }
-
-      case resume {
-        DrainBuffer -> drain(conn, handlers, selector, state)
-        AwaitSocket -> loop(conn, handlers, selector, state)
-      }
-    }
-  }
-}
-
-fn resolve(
-  conn: http1.WebsocketConnection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  sent: Result(Nil, socket.SocketError),
-) -> connection.Outcome {
-  case sent {
-    Ok(Nil) -> stopped(conn, handlers, state)
-    Error(reason) -> socket_failed(conn, handlers, state, reason)
+    http1.Exited(connection.LinkExitedNormally) -> receive(conn, selector)
+    http1.Exited(connection.ParentExited) -> websocket.Shutdown
+    http1.Closed -> websocket.Gone
+    http1.Failed(reason) | http1.Exited(connection.LinkFailed(reason)) ->
+      websocket.Failed(reason)
   }
 }
 
 pub fn send_text(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
   text: String,
 ) -> Result(Nil, socket.SocketError) {
-  websocks.encode_text_frame(
-    payload: bit_array_from_string(text),
-    context: conn.context,
-    masking: option.None,
-  )
-  |> write(conn, _)
+  write(conn, websocket.text_frame(conn.context, text))
 }
 
 pub fn send_binary(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
   data: BitArray,
 ) -> Result(Nil, socket.SocketError) {
-  websocks.encode_binary_frame(
-    payload: data,
-    context: conn.context,
-    masking: option.None,
-  )
-  |> write(conn, _)
+  write(conn, websocket.binary_frame(conn.context, data))
 }
 
 pub fn send_close(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
   reason: websocks.CloseReason,
 ) -> Result(Nil, socket.SocketError) {
-  close(conn, reason)
-}
-
-fn with_context(
-  conn: http1.WebsocketConnection,
-  context: websocks.Context,
-) -> http1.WebsocketConnection {
-  http1.WebsocketConnection(..conn, context:)
-}
-
-fn close(
-  conn: http1.WebsocketConnection,
-  reason: websocks.CloseReason,
-) -> Result(Nil, socket.SocketError) {
-  write(conn, websocks.encode_close_frame(reason:, masking: option.None))
+  write(conn, websocket.close_frame(reason))
 }
 
 fn write(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
   frame: BitArray,
 ) -> Result(Nil, socket.SocketError) {
   bytes_tree.from_bit_array(frame)
@@ -328,13 +154,7 @@ fn write(
 }
 
 fn activate(
-  conn: http1.WebsocketConnection,
+  conn: http1_connection.WebsocketConnection,
 ) -> Result(Nil, socket.SocketError) {
-  stream.activate(conn.transport, conn.socket)
+  http1.activate(conn.transport, conn.socket)
 }
-
-@external(erlang, "ewe_ffi", "identity")
-fn unsafe_to_string(payload: BitArray) -> String
-
-@external(erlang, "ewe_ffi", "identity")
-fn bit_array_from_string(text: String) -> BitArray

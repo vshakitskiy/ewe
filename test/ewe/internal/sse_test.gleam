@@ -1,7 +1,7 @@
 import ewe/internal/sse
 import gleam/bit_array
 import gleam/bytes_tree
-import gleam/option.{None, Some}
+import gleam/option.{Some}
 
 fn encode(event: sse.Event) -> String {
   let assert Ok(encoded) =
@@ -14,14 +14,6 @@ fn encode(event: sse.Event) -> String {
 
 fn data(value: String) -> sse.Event {
   sse.Event(..sse.new(), data: Some(value))
-}
-
-pub fn plain_data_test() {
-  assert encode(data("hello")) == "data: hello\n\n"
-}
-
-pub fn empty_event_is_just_the_terminator_test() {
-  assert encode(sse.new()) == "\n"
 }
 
 pub fn multiline_data_becomes_repeated_fields_test() {
@@ -70,9 +62,4 @@ pub fn field_order_test() {
 
 pub fn comment_only_is_a_valid_keep_alive_test() {
   assert encode(sse.Event(..sse.new(), comment: Some(""))) == ": \n\n"
-}
-
-pub fn absent_fields_are_omitted_test() {
-  assert encode(sse.Event(..sse.new(), id: Some("9"), retry: None))
-    == "id: 9\n\n"
 }

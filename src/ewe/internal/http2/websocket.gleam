@@ -1,14 +1,12 @@
 import ewe/internal/connection
 import ewe/internal/http2/connection as http2
-import ewe/internal/rescue
+import ewe/internal/http2/worker
 import ewe/internal/websocket
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/option
 import gleam/result
-import gleam/string
-import logging
 import websocks
 
 const close_timeout_ms: Int = 5000
@@ -52,308 +50,115 @@ pub fn handshake(
     },
   )
 
-  let compression = case
-    request.get_header(request, "sec-websocket-extensions")
-  {
-    Ok(header) ->
-      case websocks.has_deflate(header) {
-        True -> option.Some(websocks.get_compression_extensions(header))
-        False -> option.None
-      }
-    Error(Nil) -> option.None
-  }
-
-  Ok(Handshake(compression:))
-}
-
-type Connection =
-  http2.WebsocketConnection(connection.Body)
-
-type Handlers(user_state, user_message) {
-  Handlers(
-    step: fn(
-      connection.WebsocketConnection,
-      user_state,
-      websocket.Message(user_message),
-    ) -> connection.Step(user_state, user_message),
-    on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
-  )
+  request.get_header(request, "sec-websocket-extensions")
+  |> option.from_result
+  |> websocket.compression
+  |> Handshake
+  |> Ok
 }
 
 pub fn run(
-  conn: Connection,
+  conn: http2.WebsocketConnection,
   on_init: fn(connection.WebsocketConnection, process.Selector(user_message)) ->
     #(user_state, process.Selector(user_message)),
-  step: fn(
+  handler: fn(
     connection.WebsocketConnection,
     user_state,
     websocket.Message(user_message),
-  ) -> connection.Step(user_state, user_message),
+  ) -> connection.Next(user_state, user_message),
   on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
 ) -> connection.Outcome {
-  let handlers = Handlers(step:, on_close:)
-  let #(state, messages) =
-    on_init(connection.Http2Websocket(conn), process.new_selector())
-
   read(conn)
-  loop(conn, handlers, stream_selector(conn, messages), state)
+  websocket.run(transport(conn), conn.context, on_init, handler, on_close)
 }
 
-fn read(conn: Connection) -> Nil {
-  process.send(
-    conn.writer.connection,
-    http2.ReadBody(conn.writer.stream_id, conn.body),
+fn transport(
+  conn: http2.WebsocketConnection,
+) -> websocket.Transport(Event(user_message), user_message) {
+  websocket.Transport(
+    handle: fn(context) {
+      connection.Http2Websocket(http2.WebsocketConnection(..conn, context:))
+    },
+    selector: fn(messages) { selector(conn, messages) },
+    receive: fn(selector) { receive(conn, selector) },
+    send: fn(frame) {
+      write(conn, frame) |> result.map_error(http2.interrupted_to_string)
+    },
+    close: fn(frame) {
+      worker.write_within(conn.writer, frame, True, close_timeout_ms)
+      |> result.map_error(http2.interrupted_to_string)
+    },
   )
 }
 
-fn loop(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(Received(user_message)),
-  state: user_state,
-) -> connection.Outcome {
-  case process.selector_receive_forever(selector) {
-    Exited(connection.ParentExited) -> stopped(conn, handlers, state)
-    Exited(connection.LinkExitedNormally) ->
-      loop(conn, handlers, selector, state)
-    Exited(connection.LinkFailed(reason)) ->
-      ended(conn, handlers, state, connection.StoppedAbnormal(reason))
-    Signal(http2.Draining) ->
-      close(
-        conn,
-        websocks.CloseReason(websocks.GoingAway, "server shutting down"),
-      )
-      |> resolve(conn, handlers, state, _)
-    Received(message) ->
-      websocket.UserMessage(message)
-      |> deliver(conn, handlers, selector, state, Await, _)
-    Body(http2.DoneEvent(_trailers)) -> finished(conn, handlers, state)
-    Body(http2.ChunkEvent(data)) ->
-      websocks.push_data(conn.context, data)
-      |> with_context(conn, _)
-      |> drain(handlers, selector, state, Await)
-    Body(http2.LastChunkEvent(data, _trailers)) ->
-      websocks.push_data(conn.context, data)
-      |> with_context(conn, _)
-      |> drain(handlers, selector, state, Halt)
-  }
-}
-
-type Resume {
-  Await
-  Halt
-}
-
-fn drain(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(Received(user_message)),
-  state: user_state,
-  resume: Resume,
-) -> connection.Outcome {
-  case websocks.next_frame(conn.context) {
-    Error(violation) ->
-      close(conn, websocket.close_reason(violation))
-      |> resolve(conn, handlers, state, _)
-    Ok(websocks.MoreData(context:)) -> {
-      let conn = with_context(conn, context)
-
-      case resume {
-        Halt -> finished(conn, handlers, state)
-        Await -> {
-          read(conn)
-          loop(conn, handlers, selector, state)
-        }
-      }
-    }
-    Ok(websocks.Decoded(frame:, context:)) -> {
-      let conn = with_context(conn, context)
-
-      case frame {
-        websocks.Control(websocks.Ping(payload)) -> {
-          push(conn, websocks.encode_pong_frame(payload:, masking: option.None))
-          drain(conn, handlers, selector, state, resume)
-        }
-        websocks.Control(websocks.Pong(_payload))
-        | websocks.Continuation(_payload) ->
-          drain(conn, handlers, selector, state, resume)
-        websocks.Control(websocks.Close(reason)) ->
-          close(conn, reason) |> resolve(conn, handlers, state, _)
-        websocks.Text(payload) ->
-          websocket.TextFrame(unsafe_to_string(payload))
-          |> deliver(conn, handlers, selector, state, resume, _)
-        websocks.Binary(payload) ->
-          websocket.BinaryFrame(payload)
-          |> deliver(conn, handlers, selector, state, resume, _)
-      }
-    }
-  }
-}
-
-fn deliver(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  selector: process.Selector(Received(user_message)),
-  state: user_state,
-  resume: Resume,
-  message: websocket.Message(user_message),
-) -> connection.Outcome {
-  let handle = connection.Http2Websocket(conn)
-
-  case rescue.handler(fn() { handlers.step(handle, state, message) }) {
-    Error(details) -> crashed(conn, handlers, state, details)
-    Ok(connection.Halt(connection.Stopped)) -> finished(conn, handlers, state)
-    Ok(connection.Halt(connection.StoppedAbnormal(..) as outcome)) ->
-      ended(conn, handlers, state, outcome)
-    Ok(connection.Proceed(user_state: state, messages:)) -> {
-      let selector = case messages {
-        option.Some(messages) -> stream_selector(conn, messages)
-        option.None -> selector
-      }
-
-      drain(conn, handlers, selector, state, resume)
-    }
-  }
-}
-
-fn ended(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  outcome: connection.Outcome,
-) -> connection.Outcome {
-  let handle = connection.Http2Websocket(conn)
-  rescue.logged("websocket close handler", fn() {
-    handlers.on_close(handle, state)
-  })
-
-  websocks.close_context(conn.context)
-  outcome
-}
-
-fn stopped(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-) -> connection.Outcome {
-  ended(conn, handlers, state, connection.Stopped)
-}
-
-fn finished(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-) -> connection.Outcome {
-  finish(conn, <<>>) |> resolve(conn, handlers, state, _)
-}
-
-fn crashed(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  details: String,
-) -> connection.Outcome {
-  logging.log(
-    logging.Error,
-    "Caught a crash in the websocket handler: " <> details,
-  )
-
-  ended(
-    conn,
-    handlers,
-    state,
-    connection.StoppedAbnormal("the handler crashed"),
-  )
-}
-
-fn resolve(
-  conn: Connection,
-  handlers: Handlers(user_state, user_message),
-  state: user_state,
-  sent: Result(Nil, http2.Interrupted),
-) -> connection.Outcome {
-  case sent {
-    Ok(Nil) -> stopped(conn, handlers, state)
-    Error(interrupted) ->
-      connection.StoppedAbnormal(string.inspect(interrupted))
-      |> ended(conn, handlers, state, _)
-  }
-}
-
-pub fn send_text(conn: Connection, text: String) -> Nil {
-  websocks.encode_text_frame(
-    payload: bit_array_from_string(text),
-    context: conn.context,
-    masking: option.None,
-  )
-  |> push(conn, _)
-}
-
-pub fn send_binary(conn: Connection, data: BitArray) -> Nil {
-  websocks.encode_binary_frame(
-    payload: data,
-    context: conn.context,
-    masking: option.None,
-  )
-  |> push(conn, _)
-}
-
-pub fn send_close(conn: Connection, reason: websocks.CloseReason) -> Nil {
-  websocks.encode_close_frame(reason:, masking: option.None)
-  |> push(conn, _)
-}
-
-fn push(conn: Connection, frame: BitArray) -> Nil {
-  process.send(
-    conn.writer.connection,
-    http2.PushData(conn.writer.stream_id, http2.Chunk(frame, option.None)),
-  )
-}
-
-fn close(
-  conn: Connection,
-  reason: websocks.CloseReason,
-) -> Result(Nil, http2.Interrupted) {
-  websocks.encode_close_frame(reason:, masking: option.None)
-  |> finish(conn, _)
-}
-
-fn finish(conn: Connection, bytes: BitArray) -> Result(Nil, http2.Interrupted) {
-  process.send(
-    conn.writer.connection,
-    http2.PushData(
-      conn.writer.stream_id,
-      http2.Finish(bytes, option.Some(conn.writer.ack)),
-    ),
-  )
-
-  http2.receive_reply_within(conn.writer.ack_ref, close_timeout_ms)
-  |> result.replace(Nil)
-}
-
-fn with_context(conn: Connection, context: websocks.Context) -> Connection {
-  http2.WebsocketConnection(..conn, context:)
-}
-
-type Received(user_message) {
-  Received(user_message)
+type Event(user_message) {
+  UserMessage(user_message)
   Body(http2.BodyEvent)
   Signal(http2.StreamSignal)
   Exited(connection.Exit)
 }
 
-fn stream_selector(
-  conn: Connection,
+fn selector(
+  conn: http2.WebsocketConnection,
   messages: process.Selector(user_message),
-) -> process.Selector(Received(user_message)) {
-  process.map_selector(messages, Received)
+) -> process.Selector(Event(user_message)) {
+  process.map_selector(messages, UserMessage)
   |> process.select_map(conn.body, Body)
   |> process.select_map(conn.signals, Signal)
   |> connection.select_exits(Exited)
 }
 
-@external(erlang, "ewe_ffi", "identity")
-fn unsafe_to_string(payload: BitArray) -> String
+fn receive(
+  conn: http2.WebsocketConnection,
+  selector: process.Selector(Event(user_message)),
+) -> websocket.Event(user_message) {
+  case process.selector_receive_forever(selector) {
+    Body(http2.ChunkEvent(data)) -> {
+      read(conn)
+      websocket.Data(data, last: False)
+    }
+    Body(http2.LastChunkEvent(data, _trailers)) ->
+      websocket.Data(data, last: True)
+    Body(http2.DoneEvent(_trailers)) -> websocket.Data(<<>>, last: True)
+    UserMessage(message) -> websocket.User(message)
+    Signal(http2.Draining) -> websocket.Shutdown
+    Exited(connection.LinkExitedNormally) -> receive(conn, selector)
+    Exited(connection.ParentExited) -> websocket.Gone
+    Exited(connection.LinkFailed(reason)) -> websocket.Failed(reason)
+  }
+}
 
-@external(erlang, "ewe_ffi", "identity")
-fn bit_array_from_string(text: String) -> BitArray
+fn read(conn: http2.WebsocketConnection) -> Nil {
+  process.send(
+    conn.writer.commands,
+    http2.ReadBody(conn.writer.stream_id, conn.body),
+  )
+}
+
+pub fn send_text(
+  conn: http2.WebsocketConnection,
+  text: String,
+) -> Result(Nil, http2.Interrupted) {
+  write(conn, websocket.text_frame(conn.context, text))
+}
+
+pub fn send_binary(
+  conn: http2.WebsocketConnection,
+  data: BitArray,
+) -> Result(Nil, http2.Interrupted) {
+  write(conn, websocket.binary_frame(conn.context, data))
+}
+
+pub fn send_close(
+  conn: http2.WebsocketConnection,
+  reason: websocks.CloseReason,
+) -> Result(Nil, http2.Interrupted) {
+  write(conn, websocket.close_frame(reason))
+}
+
+fn write(
+  conn: http2.WebsocketConnection,
+  frame: BitArray,
+) -> Result(Nil, http2.Interrupted) {
+  worker.write(conn.writer, frame, False)
+}

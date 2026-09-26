@@ -41,19 +41,22 @@ gleam add ewe@8 gleam_erlang gleam_otp gleam_http logging
 
 <h3 id="getting-started"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/getting_started.gleam">Getting Started</a></h3>
 
-A handler takes a [`request.Request(ewe.Connection)`](https://hexdocs.pm/ewe/ewe.html#Connection)
-and returns a [`response.Response(ewe.Body)`](https://hexdocs.pm/ewe/ewe.html#Body).
-The connection carried by the request is what [`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body),
-[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) and [`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket)
-work on.
+A handler takes a 
+[`request.Request(ewe.Connection)`](https://hexdocs.pm/ewe/ewe.html#Connection)
+and returns a 
+[`response.Response(ewe.Body)`](https://hexdocs.pm/ewe/ewe.html#Body). The 
+request argument the handler receives contains the connection, which you pass to 
+[`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body) to read the body, 
+or to [`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) and
+[`ewe.websocket`](https://hexdocs.pm/ewe/ewe.html#websocket).
 
-Instead of a port you can bind a unix domain socket with [`ewe.unix`](https://hexdocs.pm/ewe/ewe.html#unix),
-or let the OS pick a free port with [`ewe.listening_random`](https://hexdocs.pm/ewe/ewe.html#listening_random)
-and read the one it picked from what [`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start) returns.
-[`ewe.named`](https://hexdocs.pm/ewe/ewe.html#named) gives the server a name that
-is used by 
-[`ewe.get_server_info`](https://hexdocs.pm/ewe/ewe.html#get_server_info) later.
-
+To listen on a Unix domain socket instead of a port, use 
+[`ewe.unix`](https://hexdocs.pm/ewe/ewe.html#unix).
+[`ewe.listening_random`](https://hexdocs.pm/ewe/ewe.html#listening_random) lets the
+OS pick a free port and [`ewe.start`](https://hexdocs.pm/ewe/ewe.html#start)
+returns the address as the actor's started data. Name the server with 
+[`ewe.named`](https://hexdocs.pm/ewe/ewe.html#named) to look that address later 
+with [`ewe.get_server_info`](https://hexdocs.pm/ewe/ewe.html#get_server_info).
 
 ```gleam
 import ewe
@@ -78,10 +81,8 @@ pub fn main() {
 fn handle_request(
   _request: request.Request(ewe.Connection),
 ) -> response.Response(ewe.Body) {
-  // When sending a body it is important to include a `content-type` header.
-  // You never set `content-length` or `transfer-encoding` yourself, ewe frames
-  // the response and writes them for you.
-  //
+  // Give every body a `content-type`. ewe writes `content-length` and
+  // `transfer-encoding` itself, ypu don't need to specify those headers.
   response.new(200)
   |> response.set_header("content-type", "text/plain; charset=utf-8")
   |> response.set_body(ewe.Text("Hello, World!"))
@@ -92,8 +93,8 @@ fn handle_request(
 
 Enable TLS with [`ewe.with_tls`](https://hexdocs.pm/ewe/ewe.html#with_tls), which
 takes the certificate source as a [`ewe.Tls`](https://hexdocs.pm/ewe/ewe.html#Tls)
-value. The certificate and key are validated on startup and the server crashes if
-they are missing or invalid.
+value. The certificate and key are checked when the server starts and
+`ewe.start` returns an error if they are missing or invalid.
 
 ```gleam
 ewe.new(handler: handle_request)
@@ -117,10 +118,9 @@ It needs TLS to be configured.
 
 <h3 id="http2">HTTP/2</h3>
 
-HTTP/2 is always enabled on ewe. Over TLS ewe offers it through ALPN and a plain
-connection is served as HTTP/2 when it opens with the HTTP/2 preface which is
-what a client with prior knowledge sends. An `Upgrade: h2c` request is not
-negotiated, and it is answered as HTTP/1.1.
+HTTP/2 is always enabled. Over TLS it is offered through ALPN, and a client that 
+does not choose `h2` is served HTTP/1.1. A cleartext connection is served as
+HTTP/2 when it starts with the HTTP/2 preface.
 
 <h3 id="sending-a-response"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/sending_response.gleam">Sending a Response</a></h3>
 
@@ -174,8 +174,8 @@ fn handle_request(
 <h3 id="reading-the-request-body"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/reading_body.gleam">Reading the Request Body</a></h3>
 
 [`ewe.read_body`](https://hexdocs.pm/ewe/ewe.html#read_body) reads the whole body
-into memory up to `limit` bytes. Trailer fields of a chunked request are appended
-to the returned request's headers.
+into memory and fails with `ewe.BodyTooLarge` if it is over `limit` bytes.
+Trailer fields sent after the body are added to the returned request's headers.
 
 ```gleam
 fn handle_request(
@@ -202,22 +202,26 @@ fn handle_request(
 }
 ```
 
-A body the handler never read is drained by the server so the connection can be
-reused. One larger than `auto_drain_limit` closes the connection instead.
+On HTTP/1, a body the handler did not read is read and discarded after the
+response, so the connection can be reused. A body over `auto_drain_limit` causes
+the connection to be closed instead.
 
 <h3 id="streaming-bodies"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/streaming_bodies.gleam">Streaming Bodies</a></h3>
 
-[`ewe.read_body_chunk`](https://hexdocs.pm/ewe/ewe.html#read_body_chunk) pulls up
-to `max_chunk_bytes` per call rather than buffering everything. Each
-[`ewe.Chunk`](https://hexdocs.pm/ewe/ewe.html#ReadEvent) carries the request to
-feed into the next call.
+[`ewe.read_body_chunk`](https://hexdocs.pm/ewe/ewe.html#read_body_chunk) reads
+the body a piece at a time, at most `max_chunk_bytes` per call, instead of all 
+at once. Each [`ewe.Chunk`](https://hexdocs.pm/ewe/ewe.html#ReadEvent) comes with
+the request to pass to the next call.
 
-Going the other way, [`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response)
-turns a response into a streamed one. Its handler owns an
-[`ewe.ResponseWriter`](https://hexdocs.pm/ewe/ewe.html#ResponseWriter) and must
-end by calling [`ewe.finish_chunk`](https://hexdocs.pm/ewe/ewe.html#finish_chunk)
-or [`ewe.finish_response`](https://hexdocs.pm/ewe/ewe.html#finish_response) since
-that is what closes the stream. The callback runs in the same connection process.
+To send a body in pieces use 
+[`ewe.stream_response`](https://hexdocs.pm/ewe/ewe.html#stream_response).
+Its function gets an 
+[`ewe.ResponseWriter`](https://hexdocs.pm/ewe/ewe.html#ResponseWriter),
+writes with [`ewe.send_chunk`](https://hexdocs.pm/ewe/ewe.html#send_chunk) and
+must end the response with 
+[`ewe.finish_chunk`](https://hexdocs.pm/ewe/ewe.html#finish_chunk) or 
+[`ewe.finish_response`](https://hexdocs.pm/ewe/ewe.html#finish_response). It 
+runs in the process serving the request.
 
 ```gleam
 fn handle_stream(
@@ -253,10 +257,9 @@ fn echo_body(
 
 <h3 id="serving-files"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/serving_files.gleam">Serving Files</a></h3>
 
-[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) prepares a file as a response
-body so you never read one in yourself. `offset` and `limit` serve a byte range,
-which is what a range request needs. It takes the connection so it is the
-request's body you pass in first.
+[`ewe.file`](https://hexdocs.pm/ewe/ewe.html#file) prepares a file as a response 
+body. Pass the request's body first since how the file is sent depends on the 
+connection. `offset` and `limit` send only part of the file.
 
 ```gleam
 case ewe.file(request.body, resolved, offset: None, limit: None) {
@@ -270,9 +273,9 @@ case ewe.file(request.body, resolved, offset: None, limit: None) {
 
 <h3 id="client-address"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/client_info.gleam">Client Address</a></h3>
 
-[`ewe.get_client_info`](https://hexdocs.pm/ewe/ewe.html#get_client_info) reads the
-address a request came from off its connection as a
-[`ewe.SocketAddress`](https://hexdocs.pm/ewe/ewe.html#SocketAddress). The
+[`ewe.get_client_info`](https://hexdocs.pm/ewe/ewe.html#get_client_info) returns
+the address the request came from as an
+[`ewe.SocketAddress`](https://hexdocs.pm/ewe/ewe.html#SocketAddress). The 
 address is read once when the client connects.
 
 ```gleam
@@ -309,8 +312,8 @@ or [`ewe.send_binary_frame`](https://hexdocs.pm/ewe/ewe.html#send_binary_frame)
 and say what happens next with
 [`ewe.Next`](https://hexdocs.pm/ewe/ewe.html#Next).
 
-On HTTP/1 the request is the usual `Upgrade: websocket` handshake and on HTTP/2 
-it is the extended `CONNECT` of 
+On HTTP/1 the request is the usual `Upgrade: websocket` handshake and on HTTP/2
+it is the extended `CONNECT` of
 [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) which ewe advertises with
 `SETTINGS_ENABLE_CONNECT_PROTOCOL`. To keep WebSockets on HTTP/1 only, turn it
 off:
@@ -383,7 +386,7 @@ Ping and pong frames are answered by the server and never reach the handler. To
 start the closing handshake yourself, return
 [`ewe.send_close_frame`](https://hexdocs.pm/ewe/ewe.html#send_close_frame) with a
 [`ewe.CloseReason`](https://hexdocs.pm/ewe/ewe.html#CloseReason). No frame can be
-sent after it!
+sent after it.
 
 <h3 id="server-sent-events"><a target="_blank" href="https://github.com/vshakitskiy/ewe/blob/mistress/examples/src/sse.gleam">Server-Sent Events</a></h3>
 
@@ -466,39 +469,37 @@ ewe.new(handler: handle_request)
 | `max_request_line` | `8192` | Longer request lines are refused with a 414. |
 | `max_header_line` | `8192` | Longer header lines are refused with a 431. |
 | `max_headers` | `100` | Requests carrying more header fields are refused with a 431. |
-| `max_chunk_size_line` | `128` | Longest chunk size line in a chunked body. |
-| `idle_timeout` | `10_000` | How long a connection may sit without sending anything. |
-| `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
-| `auto_drain_limit` | `1_048_576` | An unread body larger than this closes the connection instead of being drained. |
-| `auto_drain_chunk_bytes` | `65_536` | How much of that drain is read at a time. |
+| `max_chunk_size_line` | `128` | Longer chunk size lines in a chunked body are refused with a 413. |
+| `idle_timeout` | `10_000` | How long a connection may stay idle before it is closed. |
+| `body_read_timeout` | `10_000` | How long `read_body` and `read_body_chunk` wait for more of the body before failing. |
+| `auto_drain_limit` | `1_048_576` | The largest unread body discarded so the connection can be reused. A larger body closes the connection. |
+| `auto_drain_chunk_bytes` | `65_536` | How many bytes are read at a time while an unread body is discarded. |
 
-[`ewe.Http2Options`](https://hexdocs.pm/ewe/ewe.html#Http2Options), where a value
-the protocol does not allow is replaced with the default rather than reaching a
-peer:
+[`ewe.Http2Options`](https://hexdocs.pm/ewe/ewe.html#Http2Options):
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `max_concurrent_streams` | `None` | How many streams a client may have open at once. |
-| `initial_window_size` | `2_097_152` | How much response body a stream may have in flight. |
+| `max_concurrent_streams` | `Some(100)` | How many streams a client may have open at once. |
+| `initial_window_size` | `262_144` | How much request body a client may send on a new stream before the server allows more. |
 | `max_frame_size` | `16_384` | Largest frame accepted, between 16384 and 16777215. |
-| `max_header_list_size` | `Some(32_768)` | Largest header list accepted. |
-| `header_table_size` | `4096` | HPACK dynamic table kept for decoding. |
-| `max_continuation_frames` | `100` | How many CONTINUATION frames one header sequence may span. |
-| `max_header_block_bytes` | `65_536` | Bytes one header block may total before decoding. |
-| `rapid_reset_window` | `10_000` | Window over which client stream resets are counted. |
-| `rapid_reset_threshold` | `100` | Resets within that window that trip a GOAWAY which is what keeps Rapid Reset (CVE-2023-44487) in check. |
-| `handshake_timeout` | `10_000` | How long a connection may sit in the preface and SETTINGS handshake. |
-| `recv_window_low_water_mark` | `262_144` | Once a receive window falls to this it is topped back up. |
-| `recv_window_high_water_mark` | `2_097_152` | What it is topped up to; a wider gap costs fewer WINDOW_UPDATE round trips. |
+| `max_header_list_size` | `Some(32_768)` | Requests with larger decoded headers are answered with a 431. |
+| `header_table_size` | `4096` | Size of the HPACK table used to decode request headers. |
+| `max_continuation_frames` | `100` | How many CONTINUATION frames one header block may use. |
+| `max_header_block_bytes` | `65_536` | Largest header block across its HEADERS and CONTINUATION frames. |
+| `rapid_reset_window` | `10_000` | The time over which `rapid_reset_threshold` counts resets. |
+| `rapid_reset_threshold` | `100` | Most streams reset while their handler is still running, within the window. More resets close the connection. Guards against Rapid Reset (CVE-2023-44487) and MadeYouReset (CVE-2025-8671). |
+| `handshake_timeout` | `10_000` | How long the client has to send its SETTINGS and acknowledge ours. |
+| `idle_timeout` | `60_000` | How long a connection may stay idle before it is sent GOAWAY and closed. |
+| `recv_window_low_water_mark` | `65_536` | When a client can send only this much more on a stream, the server lets it send more. |
+| `recv_window_high_water_mark` | `262_144` | How much request body a stream holds before the handler reads it. |
 | `websocket` | `True` | Whether a client may open a WebSocket over HTTP/2 with the extended `CONNECT` of RFC 8441. |
-| `send_buffer_limit` | `1_048_576` | Bytes a WebSocket stream may already have queued for a client that is not reading before a further write resets it. One message is always sent whatever its size. |
-| `file_read_threshold` | `1_048_576` | Files at or below this are read into memory, larger ones are streamed from disk. |
-| `body_read_timeout` | `10_000` | How long a single body read waits for the client. |
+| `send_buffer_limit` | `1_048_576` | How much a streamed body, SSE or WebSocket may queue for a slow client before the next write waits. |
+| `file_read_threshold` | `1_048_576` | Files up to this size are read into memory, larger ones are sent from disk. |
+| `body_read_timeout` | `10_000` | How long `read_body` and `read_body_chunk` wait for more of the body. |
 
-Both protocols read the socket through one buffer, 64 KiB by default. Set it with
-[`ewe.buffer_size`](https://hexdocs.pm/ewe/ewe.html#buffer_size). A larger one
-lets one read take in more at once which pays off when clients send large
-bodies.
+Each read from the socket takes in at most 
+[`ewe.buffer_size`](https://hexdocs.pm/ewe/ewe.html#buffer_size) bytes, 64 KiB 
+by default. A larger size means fewer reads for clients that send large bodies.
 
 <h3 id="running-under-supervision">Running Under Supervision</h3>
 
@@ -538,8 +539,8 @@ Point `application_start_module` at a module exporting `start/2` and `stop/1`:
 application_start_module = "my_app"
 ```
 
-`start` returns the pid of the top supervisor to the application controller,
-which is the pid it supervises from there on.
+`start` returns the top supervisor's pid, which the application controller then
+watches.
 
 ```gleam
 import gleam/erlang/atom
@@ -590,11 +591,11 @@ pub fn main() {
 > A server started from `main`, even under a supervisor, is killed with the VM
 > on SIGTERM.
 
-When OTP stops the server each connection gets to finish before it is closed.
+When OTP stops the server, each connection gets to finish before it is closed.
 HTTP/1 connections finish the request they are serving, WebSockets are sent a
-going away close frame and HTTP/2 connections send GOAWAY and wait for their
-open streams. 
-[`ewe.shutdown_timeout`](https://hexdocs.pm/ewe/ewe.html#shutdown_timeout) sets 
+close frame with code 1001 (going away), SSE streams end, and HTTP/2 connections
+send GOAWAY and wait for their open streams.
+[`ewe.shutdown_timeout`](https://hexdocs.pm/ewe/ewe.html#shutdown_timeout) sets
 how long that may take, 15 seconds by default.
 
 ```gleam
@@ -605,8 +606,7 @@ ewe.new(handler: handle_request)
 
 <h2 id="examples">Examples</h2>
 
-Most sections above link to a runnable example. They live in 
-[examples](examples/), see [its README](examples/README.md) for how to run them.
+Most sections above link to a runnable example. They live in [examples](examples/).
 
 <h2 id="api-reference">API Reference</h2>
 

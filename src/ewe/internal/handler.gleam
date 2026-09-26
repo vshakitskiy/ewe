@@ -3,6 +3,7 @@ import ewe/internal/http1
 import ewe/internal/http1/connection as http1_connection
 import ewe/internal/http2
 import ewe/internal/http2/connection as http2_connection
+import gleam/bit_array
 import gleam/erlang/process
 import gleam/option
 import logging
@@ -10,25 +11,26 @@ import tup
 import tup/socket
 
 pub type State {
-  Initialised(http1.State, http2_connection.Options, Negotiated)
+  Detecting(Detection)
   Http1(http1.State)
   Http2(http2.State)
 }
 
-pub type Negotiated {
-  NegotiatedHttp1
-  NegotiatedHttp2
-  NotNegotiated
+pub type Detection {
+  Detection(
+    expected: Expected,
+    buffer: BitArray,
+    idle_timer: option.Option(process.Timer),
+    self: process.Subject(connection.Message),
+    handler: connection.Handler,
+    http1_options: http1_connection.Options,
+    http2_options: http2_connection.Options,
+  )
 }
 
-fn negotiated(connection: tup.Connection) -> Negotiated {
-  let #(transport, socket) = tup.socket(connection)
-
-  case socket.negotiated_protocol(transport, socket) {
-    Ok(<<"h2":utf8>>) -> NegotiatedHttp2
-    Ok(<<"http/1.1":utf8>>) -> NegotiatedHttp1
-    Ok(_protocol) | Error(_reason) -> NotNegotiated
-  }
+pub type Expected {
+  OnlyHttp2
+  Http1OrHttp2
 }
 
 pub fn on_init(
@@ -38,23 +40,35 @@ pub fn on_init(
 ) {
   fn(connection: tup.Connection, selector: process.Selector(connection.Message)) {
     let self = process.new_subject()
-
-    let state =
-      http1.State(
-        handler:,
-        self:,
+    let idle_timer =
+      connection.start_idle_timer(self, http1_options.idle_timeout)
+    let detecting = fn(expected) {
+      Detecting(Detection(
+        expected:,
         buffer: <<>>,
-        idle_timer: connection.start_idle_timer(
-          self,
-          http1_options.idle_timeout,
-        ),
-        options: http1_options,
-      )
+        idle_timer:,
+        self:,
+        handler:,
+        http1_options:,
+        http2_options:,
+      ))
+    }
+    let #(transport, socket) = tup.socket(connection)
 
-    #(
-      Initialised(state, http2_options, negotiated(connection)),
-      process.select(selector, self),
-    )
+    let state = case transport, socket.negotiated_protocol(transport, socket) {
+      socket.Ssl, Ok(<<"h2":utf8>>) -> detecting(OnlyHttp2)
+      socket.Ssl, _protocol ->
+        Http1(http1.State(
+          handler:,
+          self:,
+          buffer: <<>>,
+          idle_timer:,
+          options: http1_options,
+        ))
+      socket.Tcp, _protocol -> detecting(Http1OrHttp2)
+    }
+
+    #(state, process.select(selector, self))
   }
 }
 
@@ -64,39 +78,8 @@ pub fn loop(
   message: tup.Message(connection.Message),
 ) -> tup.Next(State, connection.Message) {
   case state, message {
-    Initialised(state, http2_options, negotiated), tup.Incoming(data) -> {
-      connection.cancel_timer(state.idle_timer)
-      let buffer = connection.append_buffer(state.buffer, data)
-
-      case negotiated, sniff_preface(buffer) {
-        NegotiatedHttp1, _sniff -> start_http1(state, buffer, connection)
-        NegotiatedHttp2, NeedMoreData | NotNegotiated, NeedMoreData ->
-          http1.State(
-            ..state,
-            buffer:,
-            idle_timer: connection.start_idle_timer(
-              state.self,
-              state.options.idle_timeout,
-            ),
-          )
-          |> Initialised(http2_options, negotiated)
-          |> tup.continue
-        NegotiatedHttp2, Http2Preface(remaining:)
-        | NotNegotiated, Http2Preface(remaining:)
-        -> start_http2(connection, state.handler, http2_options, remaining)
-        NegotiatedHttp2, InvalidHttp2Preface
-        | NegotiatedHttp2, NotHttp2
-        | NotNegotiated, InvalidHttp2Preface
-        -> {
-          logging.log(
-            logging.Debug,
-            "Closed a connection with an invalid HTTP/2 preface",
-          )
-          tup.stop()
-        }
-        NotNegotiated, NotHttp2 -> start_http1(state, buffer, connection)
-      }
-    }
+    Detecting(detection), tup.Incoming(data) ->
+      detect(detection, data, connection)
     Http1(state), tup.Incoming(data) ->
       http1.State(..state, buffer: connection.append_buffer(state.buffer, data))
       |> http1.handle_message(connection)
@@ -104,57 +87,91 @@ pub fn loop(
     Http2(state), message ->
       http2.handle_message(state, message, connection)
       |> from_http2
-    Initialised(..), tup.User(connection.Timeout)
-    | Http1(..), tup.User(connection.Timeout)
+    Detecting(..), tup.User(connection.IdleTimeout)
+    | Http1(..), tup.User(connection.IdleTimeout)
     -> {
       logging.log(logging.Debug, "Connection idled for too long, closing.")
       tup.stop()
     }
-    Initialised(..), tup.User(_message) | Http1(..), tup.User(_message) ->
+    Detecting(..), tup.User(_message) | Http1(..), tup.User(_message) ->
       tup.continue(state)
   }
 }
 
-fn start_http1(
-  state: http1.State,
-  buffer: BitArray,
+pub fn on_close(state: State) -> Nil {
+  case state {
+    Http2(state) -> http2.stop_workers(state)
+    Detecting(..) | Http1(..) -> Nil
+  }
+}
+
+fn detect(
+  detection: Detection,
+  data: BitArray,
   connection: tup.Connection,
 ) -> tup.Next(State, connection.Message) {
-  http1.State(..state, buffer:, idle_timer: option.None)
-  |> http1.handle_message(connection)
-  |> from_http1
+  connection.cancel_timer(detection.idle_timer)
+  let buffer = connection.append_buffer(detection.buffer, data)
+
+  case detection.expected, sniff_preface(buffer) {
+    _expected, Http2Preface(remaining:) ->
+      start_http2(connection, detection, remaining)
+    _expected, NeedMoreData -> {
+      let idle_timer =
+        connection.start_idle_timer(
+          detection.self,
+          detection.http1_options.idle_timeout,
+        )
+
+      tup.continue(Detecting(Detection(..detection, buffer:, idle_timer:)))
+    }
+    Http1OrHttp2, NotHttp2 ->
+      http1.State(
+        handler: detection.handler,
+        self: detection.self,
+        buffer:,
+        idle_timer: option.None,
+        options: detection.http1_options,
+      )
+      |> http1.handle_message(connection)
+      |> from_http1
+    OnlyHttp2, NotHttp2 | _expected, InvalidHttp2Preface -> {
+      logging.log(
+        logging.Debug,
+        "Closed a connection with an invalid HTTP/2 preface",
+      )
+      tup.stop()
+    }
+  }
 }
 
 fn start_http2(
   connection: tup.Connection,
-  handler: connection.Handler,
-  options: http2_connection.Options,
-  remaining: BitArray,
+  detection: Detection,
+  rest: BitArray,
 ) -> tup.Next(State, connection.Message) {
   process.trap_exits(True)
 
-  let self = process.new_subject()
-  let replies = process.new_subject()
-
-  let parent = connection.parent_pid()
-
-  let state =
-    http2.init(handler, options, self, replies, tup.peer(connection), parent)
+  let commands = process.new_subject()
 
   let selector =
     process.new_selector()
-    |> process.select(self)
-    |> process.select_map(replies, connection.Http2Stream)
+    |> process.select(detection.self)
+    |> process.select_map(commands, connection.Http2Command)
     |> process.select_trapped_exits(connection.Http2Exit)
 
-  case tup.send(connection, state.settings_frame) {
-    Error(_reason) -> tup.stop()
-    Ok(Nil) ->
-      http2.handle_message(state, tup.Incoming(remaining), connection)
-      |> from_http2
-      |> tup.with_selector(selector)
-      |> tup.with_active_state(tup.Count(http2.socket_active_batch_size))
-  }
+  http2.start(
+    connection,
+    detection.handler,
+    detection.http2_options,
+    detection.self,
+    commands,
+    connection.parent_pid(),
+    rest,
+  )
+  |> from_http2
+  |> tup.with_selector(selector)
+  |> tup.with_active_state(tup.Count(socket_active_batch_size))
 }
 
 fn from_http1(next: http1.Next) -> tup.Next(State, connection.Message) {
@@ -169,9 +186,10 @@ fn from_http2(next: http2.Next) -> tup.Next(State, connection.Message) {
   case next {
     http2.Continue(state) -> tup.continue(Http2(state))
     http2.Close -> tup.stop()
-    http2.CloseAbnormal(reason:) -> tup.stop_abnormal(reason)
   }
 }
+
+const socket_active_batch_size = 32
 
 pub type Sniff {
   NeedMoreData
@@ -186,25 +204,11 @@ pub fn sniff_preface(buffer: BitArray) -> Sniff {
   case buffer {
     <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8, remaining:bits>> ->
       Http2Preface(remaining:)
-    <<"PRI * HTTP/2.0\r\n":utf8, _remaining:bits>> ->
-      case is_partial_preface(buffer, preface) {
-        True -> NeedMoreData
-        False -> InvalidHttp2Preface
-      }
     _buffer ->
-      case is_partial_preface(buffer, preface) {
-        True -> NeedMoreData
-        False -> NotHttp2
+      case bit_array.starts_with(preface, buffer), buffer {
+        True, _buffer -> NeedMoreData
+        False, <<"PRI * HTTP/2.0\r\n":utf8, _rest:bits>> -> InvalidHttp2Preface
+        False, _buffer -> NotHttp2
       }
-  }
-}
-
-fn is_partial_preface(buffer: BitArray, expected: BitArray) -> Bool {
-  case buffer, expected {
-    <<byte, buffer:bits>>, <<wanted, expected:bits>> if byte == wanted -> {
-      is_partial_preface(buffer, expected)
-    }
-    <<>>, _expected -> True
-    _buffer, _expected -> False
   }
 }

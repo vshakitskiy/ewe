@@ -1,250 +1,177 @@
-import ewe/internal/http2/frame
+import ewe/internal/http2/frame.{ConnectionError, Decoded, NeedMoreData}
 import gleam/bit_array
+import gleam/list
+import gleam/option.{None, Some}
 
-pub fn data_frame_test() {
-  assert <<0:size(24), 0x0:8, 0x1:8, 0:1, 1:31, "":utf8>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Data(1, True, <<>>, 0), <<>>))
+fn raw(
+  frame_type: Int,
+  flags: Int,
+  stream_id: Int,
+  payload: BitArray,
+) -> BitArray {
+  <<
+    { bit_array.byte_size(payload) }:24,
+    frame_type:8,
+    flags:8,
+    0:1,
+    stream_id:31,
+    payload:bits,
+  >>
 }
 
-pub fn data_frame_with_payload_test() {
-  assert <<5:size(24), 0x0:8, 0x0:8, 0:1, 3:31, "hello":utf8, "extra":utf8>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Data(3, False, <<"hello":utf8>>, 5), <<"extra":utf8>>))
+fn decode(bits: BitArray) -> frame.Decoded {
+  frame.decode(bits, 16_384)
 }
 
-pub fn incomplete_header_test() {
-  assert frame.decode(<<0:size(24), 0x0:8>>, 16_384) == Error(frame.Incomplete)
+pub fn partial_header_is_incomplete_test() {
+  assert decode(<<0:24, 0x0:8>>) == NeedMoreData
 }
 
-pub fn incomplete_payload_test() {
-  assert <<5:size(24), 0x0:8, 0x0:8, 0:1, 1:31, "hi":utf8>>
-    |> frame.decode(16_384)
-    == Error(frame.Incomplete)
+pub fn partial_payload_is_incomplete_test() {
+  assert decode(<<5:24, 0x0:8, 0:8, 0:1, 1:31, "hi":utf8>>) == NeedMoreData
 }
 
-pub fn settings_frame_test() {
-  assert <<
-      12:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x1:16, 4096:32, 0x3:16, 100:32,
-    >>
-    |> frame.decode(16_384)
-    == Ok(
-      #(
-        frame.Settings(0, False, [
-          frame.HeaderTableSize(4096),
-          frame.MaxConcurrentStreams(100),
-        ]),
-        <<>>,
-      ),
-    )
+pub fn bytes_after_a_frame_are_left_test() {
+  assert decode(<<raw(0x0, 0x0, 3, <<"hello":utf8>>):bits, "extra":utf8>>)
+    == Decoded(frame.Data(3, False, <<"hello":utf8>>, 5), <<"extra":utf8>>)
 }
 
-pub fn settings_ack_test() {
-  assert <<0:size(24), 0x4:8, 0x1:8, 0:1, 0:31>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Settings(0, True, []), <<>>))
+pub fn reserved_bit_is_ignored_test() {
+  assert decode(<<0:24, 0x0:8, 0x1:8, 1:1, 1:31>>)
+    == Decoded(frame.Data(1, True, <<>>, 0), <<>>)
+}
+
+pub fn unused_flags_are_ignored_test() {
+  assert decode(raw(0x6, 0xfe, 0, <<0:64>>))
+    == Decoded(frame.Ping(ack: False, data: <<0:64>>), <<>>)
+}
+
+pub fn frame_over_max_frame_size_is_frame_size_error_test() {
+  assert decode(<<16_385:24, 0x0:8, 0:8, 0:1, 1:31>>)
+    == ConnectionError(frame.FrameSizeError)
+}
+
+pub fn padded_data_counts_padding_in_size_test() {
+  assert decode(raw(0x0, 0x8, 1, <<2, "hi":utf8, 0, 0>>))
+    == Decoded(frame.Data(1, False, <<"hi":utf8>>, 5), <<>>)
+}
+
+pub fn padding_as_long_as_the_payload_is_protocol_error_test() {
+  assert decode(raw(0x0, 0x8, 1, <<5, "hi":utf8, 0, 0>>))
+    == ConnectionError(frame.ProtocolError)
+}
+
+pub fn padded_frame_without_pad_length_is_frame_size_error_test() {
+  assert decode(raw(0x0, 0x8, 1, <<>>)) == ConnectionError(frame.FrameSizeError)
+}
+
+pub fn headers_priority_fields_are_stripped_test() {
+  assert decode(raw(0x1, 0x24, 3, <<1:1, 1:31, 16:8, 0x82>>))
+    == Decoded(frame.Headers(3, False, True, Some(1), <<0x82>>), <<>>)
+}
+
+pub fn headers_too_short_for_priority_is_frame_size_error_test() {
+  assert decode(raw(0x1, 0x24, 3, <<0, 0>>))
+    == ConnectionError(frame.FrameSizeError)
+}
+
+pub fn priority_of_wrong_length_is_a_stream_error_test() {
+  assert decode(<<raw(0x2, 0x0, 3, <<0:32>>):bits, "rest":utf8>>)
+    == frame.StreamError(3, frame.FrameSizeError, <<"rest":utf8>>)
 }
 
 pub fn settings_ack_with_payload_is_frame_size_error_test() {
-  assert <<6:size(24), 0x4:8, 0x1:8, 0:1, 0:31, 0x1:16, 4096:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.FrameSizeError))
+  assert decode(raw(0x4, 0x1, 0, <<0x1:16, 4096:32>>))
+    == ConnectionError(frame.FrameSizeError)
 }
 
-pub fn padded_data_frame_test() {
-  assert <<5:size(24), 0x0:8, 0x8:8, 0:1, 1:31, 2:8, "hi":utf8, 0:8, 0:8>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Data(1, False, <<"hi":utf8>>, 5), <<>>))
+pub fn settings_not_a_multiple_of_six_is_frame_size_error_test() {
+  assert decode(raw(0x4, 0x0, 0, <<0x1:16, 4096:24>>))
+    == ConnectionError(frame.FrameSizeError)
 }
 
-pub fn headers_with_priority_test() {
-  assert <<
-      10:size(24), 0x1:8, 0x24:8, 0:1, 1:31, 0:1, 0:31, 16:8, "block":utf8,
-    >>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Headers(1, False, True, <<"block":utf8>>), <<>>))
+pub fn unknown_setting_is_dropped_test() {
+  assert decode(raw(0x4, 0x0, 0, <<0xff:16, 1:32, 0x5:16, 20_000:32>>))
+    == Decoded(
+      frame.Settings(ack: False, settings: [frame.MaxFrameSize(20_000)]),
+      <<>>,
+    )
 }
 
-pub fn window_update_test() {
-  assert <<4:size(24), 0x8:8, 0x0:8, 0:1, 5:31, 0:1, 1000:31>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.WindowUpdate(5, 1000), <<>>))
+fn round_trip(sent: frame.Frame) -> Nil {
+  assert decode(frame.encode(sent)) == Decoded(sent, <<>>)
 }
 
-pub fn unknown_frame_type_test() {
-  assert <<3:size(24), 0xf:8, 0x0:8, 0:1, 0:31, "abc":utf8>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Unknown(0, 0xf, <<"abc":utf8>>), <<>>))
-}
-
-pub fn rst_stream_error_code_test() {
-  assert <<4:size(24), 0x3:8, 0x0:8, 0:1, 1:31, 0x1:32>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.RstStream(1, frame.ProtocolError), <<>>))
-}
-
-pub fn rst_stream_wrong_size_test() {
-  assert <<2:size(24), 0x3:8, 0x0:8, 0:1, 1:31, 0:16>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.FrameSizeError))
-}
-
-pub fn goaway_unknown_error_code_test() {
-  assert <<8:size(24), 0x7:8, 0x0:8, 0:1, 0:31, 0:1, 3:31, 999:32>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Goaway(0, 3, frame.UnknownErrorCode(999), <<>>), <<>>))
-}
-
-pub fn settings_enable_push_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x2:16, 0:32>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Settings(0, False, [frame.EnablePush(False)]), <<>>))
-}
-
-pub fn settings_enable_push_invalid_value_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x2:16, 2:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn settings_initial_window_size_overflow_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x4:16, 2_147_483_648:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.FlowControlError))
-}
-
-pub fn settings_max_frame_size_out_of_range_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x5:16, 100:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn padding_exceeds_payload_is_protocol_error_test() {
-  assert <<3:size(24), 0x0:8, 0x8:8, 0:1, 1:31, 10:8, "hi":utf8>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn frame_exceeding_max_frame_size_is_frame_size_error_test() {
-  assert <<5:size(24), 0x0:8, 0x0:8, 0:1, 3:31, "hello":utf8, "extra":utf8>>
-    |> frame.decode(4)
-    == Error(frame.Violation(frame.FrameSizeError))
-}
-
-pub fn priority_frame_with_stream_id_zero_is_protocol_error_test() {
-  assert <<5:size(24), 0x2:8, 0x0:8, 0:1, 0:31, 0:1, 2:31, 16:8>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn priority_frame_self_dependency_is_protocol_error_test() {
-  assert <<5:size(24), 0x2:8, 0x0:8, 0:1, 1:31, 0:1, 1:31, 16:8>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn priority_frame_test() {
-  assert <<5:size(24), 0x2:8, 0x0:8, 0:1, 1:31, 0:1, 2:31, 16:8>>
-    |> frame.decode(16_384)
-    == Ok(#(frame.Priority(1), <<>>))
-}
-
-pub fn rst_stream_with_stream_id_zero_is_protocol_error_test() {
-  assert <<4:size(24), 0x3:8, 0x0:8, 0:1, 0:31, 0x1:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn goaway_with_nonzero_stream_id_is_protocol_error_test() {
-  assert <<8:size(24), 0x7:8, 0x0:8, 0:1, 1:31, 0:1, 3:31, 999:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn headers_with_priority_self_dependency_is_protocol_error_test() {
-  assert <<
-      10:size(24), 0x1:8, 0x24:8, 0:1, 1:31, 0:1, 1:31, 16:8, "block":utf8,
-    >>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn encode_data_roundtrip_test() {
-  let frame = frame.Data(1, True, <<"hello":utf8>>, 5)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
-}
-
-pub fn encode_headers_roundtrip_test() {
-  let frame = frame.Headers(3, False, True, <<"block":utf8>>)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
-}
-
-pub fn encode_settings_roundtrip_test() {
-  let frame =
-    frame.Settings(0, False, [
-      frame.MaxConcurrentStreams(100),
+pub fn encoded_frames_decode_to_themselves_test() {
+  round_trip(frame.Data(1, True, <<"hi":utf8>>, 2))
+  round_trip(frame.Headers(1, False, True, None, <<0x82>>))
+  round_trip(frame.Headers(3, True, False, Some(1), <<0x82>>))
+  round_trip(frame.Priority(3, 1))
+  round_trip(frame.RstStream(1, frame.RefusedStream))
+  round_trip(
+    frame.Settings(ack: False, settings: [
+      frame.HeaderTableSize(0),
       frame.EnablePush(False),
-    ])
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
+      frame.MaxConcurrentStreams(100),
+      frame.InitialWindowSize(1),
+      frame.MaxFrameSize(16_384),
+      frame.MaxHeaderListSize(8192),
+      frame.EnableConnectProtocol(True),
+    ]),
+  )
+  round_trip(frame.Settings(ack: True, settings: []))
+  round_trip(frame.PushPromise(1, 2, <<0x82>>))
+  round_trip(frame.Ping(ack: False, data: <<"12345678":utf8>>))
+  round_trip(frame.Goaway(5, frame.EnhanceYourCalm, <<"calm":utf8>>))
+  round_trip(frame.WindowUpdate(0, 1))
+  round_trip(frame.Continuation(1, True, <<0x82>>))
 }
 
-pub fn encode_rst_stream_roundtrip_test() {
-  let frame = frame.RstStream(5, frame.Cancel)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
+pub fn data_header_declares_a_payload_sent_separately_test() {
+  assert <<frame.data_header(1, True, 2):bits, "hi":utf8>>
+    == frame.encode(frame.Data(1, True, <<"hi":utf8>>, 2))
 }
 
-pub fn encode_goaway_roundtrip_test() {
-  let frame = frame.Goaway(0, 7, frame.EnhanceYourCalm, <<"bye":utf8>>)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
+pub fn stream_frames_on_stream_zero_are_protocol_errors_test() {
+  use #(frame_type, payload) <- list.each([
+    #(0x0, <<>>),
+    #(0x1, <<0x82>>),
+    #(0x2, <<0:1, 1:31, 16:8>>),
+    #(0x3, <<0:32>>),
+    #(0x9, <<0x82>>),
+  ])
+  assert decode(raw(frame_type, 0x4, 0, payload))
+    == ConnectionError(frame.ProtocolError)
 }
 
-pub fn encode_window_update_roundtrip_test() {
-  let frame = frame.WindowUpdate(9, 65_535)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
+pub fn connection_frames_on_a_stream_are_protocol_errors_test() {
+  use #(frame_type, payload) <- list.each([
+    #(0x4, <<>>),
+    #(0x6, <<0:64>>),
+    #(0x7, <<0:64>>),
+  ])
+  assert decode(raw(frame_type, 0x0, 1, payload))
+    == ConnectionError(frame.ProtocolError)
 }
 
-pub fn encode_ping_roundtrip_test() {
-  let frame = frame.Ping(0, True, <<1, 2, 3, 4, 5, 6, 7, 8>>)
-  assert frame.encode(frame) |> frame.decode(16_384) == Ok(#(frame, <<>>))
+pub fn fixed_size_frames_of_wrong_length_are_frame_size_errors_test() {
+  use #(frame_type, stream_id, payload) <- list.each([
+    #(0x3, 1, <<0:24>>),
+    #(0x6, 0, <<0:32>>),
+    #(0x8, 1, <<100:40>>),
+  ])
+  assert decode(raw(frame_type, 0x0, stream_id, payload))
+    == ConnectionError(frame.FrameSizeError)
 }
 
-pub fn encode_data_header_declares_length_without_payload_test() {
-  let header = frame.encode_data_header(1, True, 5)
-  assert header
-    |> bit_array.append(<<"hello":utf8>>)
-    |> frame.decode(16_384)
-    == Ok(#(frame.Data(1, True, <<"hello":utf8>>, 5), <<>>))
-}
-
-pub fn settings_enable_connect_protocol_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 1:32>>
-    |> frame.decode(16_384)
-    == Ok(
-      #(frame.Settings(0, False, [frame.EnableConnectProtocol(True)]), <<>>),
-    )
-}
-
-pub fn settings_enable_connect_protocol_disabled_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 0:32>>
-    |> frame.decode(16_384)
-    == Ok(
-      #(frame.Settings(0, False, [frame.EnableConnectProtocol(False)]), <<>>),
-    )
-}
-
-pub fn settings_enable_connect_protocol_invalid_value_test() {
-  assert <<6:size(24), 0x4:8, 0x0:8, 0:1, 0:31, 0x8:16, 2:32>>
-    |> frame.decode(16_384)
-    == Error(frame.Violation(frame.ProtocolError))
-}
-
-pub fn settings_enable_connect_protocol_round_trips_test() {
-  let encoded =
-    frame.Settings(0, False, [frame.EnableConnectProtocol(True)])
-    |> frame.encode
-
-  assert frame.decode(encoded, 16_384)
-    == Ok(
-      #(frame.Settings(0, False, [frame.EnableConnectProtocol(True)]), <<>>),
-    )
+pub fn invalid_setting_values_are_rejected_test() {
+  use #(identifier, value, error) <- list.each([
+    #(0x2, 2, frame.ProtocolError),
+    #(0x4, 2_147_483_648, frame.FlowControlError),
+    #(0x5, 16_383, frame.ProtocolError),
+    #(0x5, 16_777_216, frame.ProtocolError),
+    #(0x8, 2, frame.ProtocolError),
+  ])
+  assert decode(raw(0x4, 0x0, 0, <<identifier:16, value:32>>))
+    == ConnectionError(error)
 }

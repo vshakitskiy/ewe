@@ -1,37 +1,26 @@
 import gleam/bit_array
 import gleam/list
-import gleam/result
+import gleam/option.{type Option, None, Some}
 
 pub type Frame {
-  Data(
-    stream_id: Int,
-    end_stream: Bool,
-    payload: BitArray,
-    flow_control_size: Int,
-  )
+  Data(stream_id: Int, end_stream: Bool, data: BitArray, size: Int)
   Headers(
     stream_id: Int,
     end_stream: Bool,
     end_headers: Bool,
-    payload: BitArray,
+    dependency: Option(Int),
+    fragment: BitArray,
   )
-  Priority(stream_id: Int)
-  RstStream(stream_id: Int, error_code: ErrorCode)
-  Settings(stream_id: Int, ack: Bool, params: List(Setting))
-  PushPromise(stream_id: Int, payload: BitArray)
-  Ping(stream_id: Int, ack: Bool, opaque_data: BitArray)
-  Goaway(
-    stream_id: Int,
-    last_stream_id: Int,
-    error_code: ErrorCode,
-    debug_data: BitArray,
-  )
+  Priority(stream_id: Int, dependency: Int)
+  RstStream(stream_id: Int, error: ErrorCode)
+  Settings(ack: Bool, settings: List(Setting))
+  PushPromise(stream_id: Int, promised_stream_id: Int, fragment: BitArray)
+  Ping(ack: Bool, data: BitArray)
+  Goaway(last_stream_id: Int, error: ErrorCode, debug: BitArray)
   WindowUpdate(stream_id: Int, increment: Int)
-  Continuation(stream_id: Int, end_headers: Bool, payload: BitArray)
-  Unknown(stream_id: Int, frame_type: Int, payload: BitArray)
+  Continuation(stream_id: Int, end_headers: Bool, fragment: BitArray)
+  Unknown(stream_id: Int, frame_type: Int)
 }
-
-pub const settings_ack = Settings(0, True, [])
 
 pub type Setting {
   HeaderTableSize(Int)
@@ -41,7 +30,6 @@ pub type Setting {
   MaxFrameSize(Int)
   MaxHeaderListSize(Int)
   EnableConnectProtocol(Bool)
-  UnknownSetting(Int, Int)
 }
 
 pub type ErrorCode {
@@ -62,243 +50,342 @@ pub type ErrorCode {
   UnknownErrorCode(Int)
 }
 
-pub type FrameError {
-  Incomplete
-  Violation(ErrorCode)
+pub type Decoded {
+  Decoded(frame: Frame, rest: BitArray)
+  StreamError(stream_id: Int, error: ErrorCode, rest: BitArray)
+  ConnectionError(error: ErrorCode)
+  NeedMoreData
 }
 
-pub fn decode(
-  data: BitArray,
-  max_frame_size: Int,
-) -> Result(#(Frame, BitArray), FrameError) {
-  case data {
+pub const max_window_size = 2_147_483_647
+
+pub const default_window_size = 65_535
+
+pub const min_frame_size = 16_384
+
+pub const max_frame_size = 16_777_215
+
+pub const default_header_table_size = 4096
+
+pub fn decode(bytes: BitArray, max_size: Int) -> Decoded {
+  case bytes {
     <<
-      length:size(24),
-      type_:8,
-      _unused_flags:2,
-      priority:1,
-      _unused_flag_high:1,
-      padded:1,
-      end_headers:1,
-      _unused_flag_low:1,
-      end_stream_or_ack:1,
-      _reserved_bit:1,
+      length:24,
+      frame_type:8,
+      flags:bits-size(8),
+      _reserved:1,
       stream_id:31,
-      remaining:bits,
+      rest:bits,
     >> ->
-      case length > max_frame_size {
-        True -> Error(Violation(FrameSizeError))
+      case length > max_size {
+        True -> ConnectionError(FrameSizeError)
         False ->
-          case remaining {
-            <<payload:bytes-size(length), remaining:bits>> -> {
-              use frame <- result.try(decode_payload(
-                type_,
-                stream_id,
-                end_stream_or_ack == 1,
-                end_headers == 1,
-                padded == 1,
-                priority == 1,
-                payload,
-              ))
-              Ok(#(frame, remaining))
-            }
-            _remaining -> Error(Incomplete)
+          case rest {
+            <<payload:bytes-size(length), rest:bits>> ->
+              decode_payload(frame_type, flags, stream_id, payload, rest)
+            _partial -> NeedMoreData
           }
       }
-    _data -> Error(Incomplete)
+    _partial -> NeedMoreData
   }
 }
 
 fn decode_payload(
-  type_: Int,
+  frame_type: Int,
+  flags: BitArray,
   stream_id: Int,
-  end_stream_or_ack: Bool,
-  end_headers: Bool,
-  padded: Bool,
-  priority: Bool,
   payload: BitArray,
-) -> Result(Frame, FrameError) {
-  case type_ {
+  rest: BitArray,
+) -> Decoded {
+  let assert <<
+    _unused:2,
+    priority_flag:1,
+    _unused:1,
+    padded_flag:1,
+    end_headers_flag:1,
+    _unused:1,
+    end_stream_or_ack:1,
+  >> = flags
+  let padded = padded_flag == 1
+  let end_stream = end_stream_or_ack == 1
+
+  case frame_type {
     0x0 -> {
-      use content <- result.try(strip_padding(padded, payload))
-      Ok(Data(
-        stream_id:,
-        end_stream: end_stream_or_ack,
-        payload: content,
-        flow_control_size: bit_array.byte_size(payload),
-      ))
+      use <- require_stream(stream_id)
+      use content <- unpad(padded, payload)
+
+      let size = bit_array.byte_size(payload)
+      Decoded(Data(stream_id:, end_stream:, data: content, size:), rest)
     }
     0x1 -> {
-      use content <- result.try(strip_padding(padded, payload))
-      use header_block <- result.try(strip_priority(
-        priority,
-        stream_id,
-        content,
-      ))
-      Ok(Headers(
-        stream_id:,
-        end_stream: end_stream_or_ack,
-        end_headers:,
-        payload: header_block,
-      ))
+      use <- require_stream(stream_id)
+      use content <- unpad(padded, payload)
+      use dependency, fragment <- priority_fields(priority_flag == 1, content)
+      Decoded(
+        Headers(
+          stream_id:,
+          end_stream:,
+          end_headers: end_headers_flag == 1,
+          dependency:,
+          fragment:,
+        ),
+        rest,
+      )
     }
-    0x2 ->
+    0x2 -> {
+      use <- require_stream(stream_id)
       case payload {
-        <<_exclusive:1, stream_dependency:31, _weight:8>> ->
-          case stream_id == 0, stream_dependency == stream_id {
-            True, _self_dependent | _on_stream_zero, True ->
-              Error(Violation(ProtocolError))
-            False, False -> Ok(Priority(stream_id:))
+        <<_exclusive:1, dependency:31, _weight:8>> ->
+          Decoded(Priority(stream_id:, dependency:), rest)
+        _payload -> StreamError(stream_id, FrameSizeError, rest)
+      }
+    }
+    0x3 -> {
+      use <- require_stream(stream_id)
+      case payload {
+        <<code:32>> ->
+          Decoded(RstStream(stream_id:, error: error_code(code)), rest)
+        _payload -> ConnectionError(FrameSizeError)
+      }
+    }
+    0x4 -> {
+      use <- require_connection(stream_id)
+      case end_stream, payload {
+        True, <<>> -> Decoded(Settings(ack: True, settings: []), rest)
+        True, _payload -> ConnectionError(FrameSizeError)
+        False, _payload ->
+          case decode_settings(payload, []) {
+            Ok(settings) -> Decoded(Settings(ack: False, settings:), rest)
+            Error(error) -> ConnectionError(error)
           }
-        _payload -> Error(Violation(FrameSizeError))
       }
-    0x3 ->
-      case stream_id == 0, payload {
-        True, _payload -> Error(Violation(ProtocolError))
-        False, <<error_code:32>> ->
-          Ok(RstStream(stream_id:, error_code: decode_error_code(error_code)))
-        False, _payload -> Error(Violation(FrameSizeError))
-      }
-    0x4 ->
-      case end_stream_or_ack, payload {
-        True, <<>> -> Ok(Settings(stream_id, True, []))
-        True, _payload -> Error(Violation(FrameSizeError))
-        False, _payload -> {
-          use params <- result.try(decode_settings(payload, []))
-          Ok(Settings(stream_id:, ack: False, params:))
-        }
-      }
-    0x5 -> {
-      use content <- result.try(strip_padding(padded, payload))
-      Ok(PushPromise(stream_id:, payload: content))
     }
-    0x6 ->
+    0x5 -> {
+      use <- require_stream(stream_id)
+      use content <- unpad(padded, payload)
+      case content {
+        <<_reserved:1, promised_stream_id:31, fragment:bits>> ->
+          Decoded(PushPromise(stream_id:, promised_stream_id:, fragment:), rest)
+        _content -> ConnectionError(FrameSizeError)
+      }
+    }
+    0x6 -> {
+      use <- require_connection(stream_id)
       case payload {
-        <<opaque_data:bytes-size(8)>> ->
-          Ok(Ping(stream_id:, ack: end_stream_or_ack, opaque_data:))
-        _payload -> Error(Violation(FrameSizeError))
+        <<_opaque:bytes-size(8)>> ->
+          Decoded(Ping(ack: end_stream, data: payload), rest)
+        _payload -> ConnectionError(FrameSizeError)
       }
-    0x7 ->
-      case stream_id == 0, payload {
-        False, _payload -> Error(Violation(ProtocolError))
-        True,
-          <<_reserved_bit:1, last_stream_id:31, error_code:32, debug_data:bits>>
-        ->
-          Ok(Goaway(
-            stream_id:,
-            last_stream_id:,
-            error_code: decode_error_code(error_code),
-            debug_data:,
-          ))
-        True, _payload -> Error(Violation(FrameSizeError))
+    }
+    0x7 -> {
+      use <- require_connection(stream_id)
+      case payload {
+        <<_reserved:1, last_stream_id:31, code:32, debug:bits>> ->
+          Decoded(
+            Goaway(last_stream_id:, error: error_code(code), debug:),
+            rest,
+          )
+        _payload -> ConnectionError(FrameSizeError)
       }
+    }
     0x8 ->
       case payload {
-        <<_reserved_bit:1, increment:31>> ->
-          Ok(WindowUpdate(stream_id:, increment:))
-        _payload -> Error(Violation(FrameSizeError))
+        <<_reserved:1, increment:31>> ->
+          Decoded(WindowUpdate(stream_id:, increment:), rest)
+        _payload -> ConnectionError(FrameSizeError)
       }
-    0x9 -> Ok(Continuation(stream_id:, end_headers:, payload:))
-    other -> Ok(Unknown(stream_id, other, payload))
+    0x9 -> {
+      use <- require_stream(stream_id)
+      Decoded(
+        Continuation(
+          stream_id:,
+          end_headers: end_headers_flag == 1,
+          fragment: payload,
+        ),
+        rest,
+      )
+    }
+    frame_type -> Decoded(Unknown(stream_id:, frame_type:), rest)
   }
 }
 
-fn strip_padding(
+fn require_stream(stream_id: Int, decode: fn() -> Decoded) -> Decoded {
+  case stream_id {
+    0 -> ConnectionError(ProtocolError)
+    _stream_id -> decode()
+  }
+}
+
+fn require_connection(stream_id: Int, decode: fn() -> Decoded) -> Decoded {
+  case stream_id {
+    0 -> decode()
+    _stream_id -> ConnectionError(ProtocolError)
+  }
+}
+
+fn unpad(
   padded: Bool,
   payload: BitArray,
-) -> Result(BitArray, FrameError) {
-  case padded {
-    False -> Ok(payload)
-    True ->
-      case payload {
-        <<pad_length:8, remaining:bits>> -> {
-          let content_length = bit_array.byte_size(remaining) - pad_length
-          case content_length >= 0 {
-            True ->
-              case remaining {
-                <<content:bytes-size(content_length), _padding:bits>> ->
-                  Ok(content)
-                _remaining -> Error(Violation(FrameSizeError))
-              }
-            False -> Error(Violation(ProtocolError))
-          }
+  decode: fn(BitArray) -> Decoded,
+) -> Decoded {
+  case padded, payload {
+    False, _payload -> decode(payload)
+    True, <<pad_length:8, rest:bits>> ->
+      case bit_array.byte_size(rest) - pad_length {
+        content_size if content_size >= 0 -> {
+          let assert <<content:bytes-size(content_size), _padding:bits>> = rest
+          decode(content)
         }
-        _payload -> Error(Violation(FrameSizeError))
+        _negative -> ConnectionError(ProtocolError)
       }
+    True, _payload -> ConnectionError(FrameSizeError)
   }
 }
 
-fn strip_priority(
-  priority: Bool,
-  stream_id: Int,
-  payload: BitArray,
-) -> Result(BitArray, FrameError) {
-  case priority {
-    False -> Ok(payload)
-    True ->
-      case payload {
-        <<_exclusive:1, stream_dependency:31, _weight:8, remaining:bits>> ->
-          case stream_dependency == stream_id {
-            True -> Error(Violation(ProtocolError))
-            False -> Ok(remaining)
-          }
-        _payload -> Error(Violation(FrameSizeError))
-      }
+fn priority_fields(
+  present: Bool,
+  content: BitArray,
+  decode: fn(Option(Int), BitArray) -> Decoded,
+) -> Decoded {
+  case present, content {
+    False, _content -> decode(None, content)
+    True, <<_exclusive:1, dependency:31, _weight:8, fragment:bits>> ->
+      decode(Some(dependency), fragment)
+    True, _content -> ConnectionError(FrameSizeError)
   }
 }
 
 fn decode_settings(
   payload: BitArray,
-  acc: List(Setting),
-) -> Result(List(Setting), FrameError) {
+  settings: List(Setting),
+) -> Result(List(Setting), ErrorCode) {
   case payload {
-    <<>> -> Ok(list.reverse(acc))
-    <<id:16, value:32, remaining:bits>> -> {
-      use setting <- result.try(decode_setting(id, value))
-      decode_settings(remaining, [setting, ..acc])
-    }
-    _payload -> Error(Violation(FrameSizeError))
+    <<>> -> Ok(list.reverse(settings))
+    <<identifier:16, value:32, payload:bits>> ->
+      case decode_setting(identifier, value) {
+        Ok(Some(setting)) -> decode_settings(payload, [setting, ..settings])
+        Ok(None) -> decode_settings(payload, settings)
+        Error(error) -> Error(error)
+      }
+    _payload -> Error(FrameSizeError)
   }
 }
 
-const max_window_size = 2_147_483_647
-
-const min_max_frame_size = 16_384
-
-const max_max_frame_size = 16_777_215
-
-fn decode_setting(id: Int, value: Int) -> Result(Setting, FrameError) {
-  case id {
-    0x1 -> Ok(HeaderTableSize(value))
-    0x2 ->
-      case value {
-        0 -> Ok(EnablePush(False))
-        1 -> Ok(EnablePush(True))
-        _value -> Error(Violation(ProtocolError))
-      }
-    0x3 -> Ok(MaxConcurrentStreams(value))
-    0x4 ->
-      case value > max_window_size {
-        True -> Error(Violation(FlowControlError))
-        False -> Ok(InitialWindowSize(value))
-      }
-    0x5 ->
-      case value < min_max_frame_size || value > max_max_frame_size {
-        True -> Error(Violation(ProtocolError))
-        False -> Ok(MaxFrameSize(value))
-      }
-    0x6 -> Ok(MaxHeaderListSize(value))
-    0x8 ->
-      case value {
-        0 -> Ok(EnableConnectProtocol(False))
-        1 -> Ok(EnableConnectProtocol(True))
-        _value -> Error(Violation(ProtocolError))
-      }
-    other -> Ok(UnknownSetting(other, value))
+fn decode_setting(
+  identifier: Int,
+  value: Int,
+) -> Result(Option(Setting), ErrorCode) {
+  case identifier, value {
+    0x1, _value -> Ok(Some(HeaderTableSize(value)))
+    0x2, 0 -> Ok(Some(EnablePush(False)))
+    0x2, 1 -> Ok(Some(EnablePush(True)))
+    0x2, _value -> Error(ProtocolError)
+    0x3, _value -> Ok(Some(MaxConcurrentStreams(value)))
+    0x4, _value if value > max_window_size -> Error(FlowControlError)
+    0x4, _value -> Ok(Some(InitialWindowSize(value)))
+    0x5, _value if value < min_frame_size || value > max_frame_size ->
+      Error(ProtocolError)
+    0x5, _value -> Ok(Some(MaxFrameSize(value)))
+    0x6, _value -> Ok(Some(MaxHeaderListSize(value)))
+    0x8, 0 -> Ok(Some(EnableConnectProtocol(False)))
+    0x8, 1 -> Ok(Some(EnableConnectProtocol(True)))
+    0x8, _value -> Error(ProtocolError)
+    _identifier, _value -> Ok(None)
   }
 }
 
-fn decode_error_code(code: Int) -> ErrorCode {
+pub fn encode(frame: Frame) -> BitArray {
+  case frame {
+    Data(stream_id:, end_stream:, data:, size: _size) -> <<
+      data_header(stream_id, end_stream, bit_array.byte_size(data)):bits,
+      data:bits,
+    >>
+    Headers(stream_id:, end_stream:, end_headers:, dependency:, fragment:) ->
+      case dependency {
+        None -> header(0x1, flags(end_stream, end_headers), stream_id, fragment)
+        Some(dependency) ->
+          header(
+            0x1,
+            <<0:2, 1:1, 0:2, bit(end_headers):1, 0:1, bit(end_stream):1>>,
+            stream_id,
+            <<0:1, dependency:31, 15:8, fragment:bits>>,
+          )
+      }
+    Priority(stream_id:, dependency:) ->
+      header(0x2, <<0>>, stream_id, <<0:1, dependency:31, 15:8>>)
+    RstStream(stream_id:, error:) ->
+      header(0x3, <<0>>, stream_id, <<encode_error_code(error):32>>)
+    Settings(ack:, settings:) ->
+      header(0x4, flags(ack, False), 0, encode_settings(settings))
+    PushPromise(stream_id:, promised_stream_id:, fragment:) ->
+      header(0x5, flags(False, True), stream_id, <<
+        0:1,
+        promised_stream_id:31,
+        fragment:bits,
+      >>)
+    Ping(ack:, data:) -> header(0x6, flags(ack, False), 0, data)
+    Goaway(last_stream_id:, error:, debug:) ->
+      header(0x7, <<0>>, 0, <<
+        0:1,
+        last_stream_id:31,
+        encode_error_code(error):32,
+        debug:bits,
+      >>)
+    WindowUpdate(stream_id:, increment:) ->
+      header(0x8, <<0>>, stream_id, <<0:1, increment:31>>)
+    Continuation(stream_id:, end_headers:, fragment:) ->
+      header(0x9, flags(False, end_headers), stream_id, fragment)
+    Unknown(stream_id:, frame_type:) ->
+      header(frame_type, <<0>>, stream_id, <<>>)
+  }
+}
+
+pub fn data_header(stream_id: Int, end_stream: Bool, length: Int) -> BitArray {
+  <<length:24, 0x0:8, flags(end_stream, False):bits, 0:1, stream_id:31>>
+}
+
+fn header(
+  frame_type: Int,
+  flags: BitArray,
+  stream_id: Int,
+  payload: BitArray,
+) -> BitArray {
+  <<
+    bit_array.byte_size(payload):24,
+    frame_type:8,
+    flags:bits,
+    0:1,
+    stream_id:31,
+    payload:bits,
+  >>
+}
+
+fn flags(end_stream_or_ack: Bool, end_headers: Bool) -> BitArray {
+  <<0:5, bit(end_headers):1, 0:1, bit(end_stream_or_ack):1>>
+}
+
+fn bit(value: Bool) -> Int {
+  case value {
+    True -> 1
+    False -> 0
+  }
+}
+
+fn encode_settings(settings: List(Setting)) -> BitArray {
+  use encoded, setting <- list.fold(settings, <<>>)
+  let #(identifier, value) = case setting {
+    HeaderTableSize(value) -> #(0x1, value)
+    EnablePush(value) -> #(0x2, bit(value))
+    MaxConcurrentStreams(value) -> #(0x3, value)
+    InitialWindowSize(value) -> #(0x4, value)
+    MaxFrameSize(value) -> #(0x5, value)
+    MaxHeaderListSize(value) -> #(0x6, value)
+    EnableConnectProtocol(value) -> #(0x8, bit(value))
+  }
+  <<encoded:bits, identifier:16, value:32>>
+}
+
+fn error_code(code: Int) -> ErrorCode {
   case code {
     0x0 -> NoError
     0x1 -> ProtocolError
@@ -314,123 +401,12 @@ fn decode_error_code(code: Int) -> ErrorCode {
     0xb -> EnhanceYourCalm
     0xc -> InadequateSecurity
     0xd -> Http11Required
-    other -> UnknownErrorCode(other)
+    code -> UnknownErrorCode(code)
   }
 }
 
-pub fn encode(frame: Frame) -> BitArray {
-  let #(type_, flags, payload) = encode_payload(frame)
-  let length = bit_array.byte_size(payload)
-  <<
-    length:size(24),
-    type_:8,
-    flags:bits,
-    0:1,
-    frame.stream_id:31,
-    payload:bits,
-  >>
-}
-
-fn encode_payload(frame: Frame) -> #(Int, BitArray, BitArray) {
-  case frame {
-    Data(end_stream:, payload:, ..) -> #(
-      0x0,
-      encode_flags(end_stream, False),
-      payload,
-    )
-    Headers(end_stream:, end_headers:, payload:, ..) -> #(
-      0x1,
-      encode_flags(end_stream, end_headers),
-      payload,
-    )
-    Priority(..) -> #(0x2, encode_flags(False, False), <<0:1, 0:31, 0:8>>)
-    RstStream(error_code:, ..) -> #(0x3, encode_flags(False, False), <<
-      encode_error_code(error_code):32,
-    >>)
-    Settings(ack:, params:, ..) -> #(
-      0x4,
-      encode_flags(ack, False),
-      encode_settings(params),
-    )
-    PushPromise(payload:, ..) -> #(0x5, encode_flags(False, False), payload)
-    Ping(ack:, opaque_data:, ..) -> #(
-      0x6,
-      encode_flags(ack, False),
-      opaque_data,
-    )
-    Goaway(last_stream_id:, error_code:, debug_data:, ..) -> #(
-      0x7,
-      encode_flags(False, False),
-      <<
-        0:1,
-        last_stream_id:31,
-        encode_error_code(error_code):32,
-        debug_data:bits,
-      >>,
-    )
-    WindowUpdate(increment:, ..) -> #(0x8, encode_flags(False, False), <<
-      0:1,
-      increment:31,
-    >>)
-    Continuation(end_headers:, payload:, ..) -> #(
-      0x9,
-      encode_flags(False, end_headers),
-      payload,
-    )
-    Unknown(frame_type:, payload:, ..) -> #(frame_type, <<0:8>>, payload)
-  }
-}
-
-fn encode_flags(end_stream_or_ack: Bool, end_headers: Bool) -> BitArray {
-  <<0:5, bit(end_headers):1, 0:1, bit(end_stream_or_ack):1>>
-}
-
-pub fn encode_data_header(
-  stream_id: Int,
-  end_stream: Bool,
-  length: Int,
-) -> BitArray {
-  <<
-    length:size(24),
-    0x0:8,
-    encode_flags(end_stream, False):bits,
-    0:1,
-    stream_id:31,
-  >>
-}
-
-fn bit(value: Bool) -> Int {
-  case value {
-    True -> 1
-    False -> 0
-  }
-}
-
-fn encode_settings(params: List(Setting)) -> BitArray {
-  case params {
-    [] -> <<>>
-    [setting, ..rest] -> {
-      let #(id, value) = encode_setting(setting)
-      <<id:16, value:32, encode_settings(rest):bits>>
-    }
-  }
-}
-
-fn encode_setting(setting: Setting) -> #(Int, Int) {
-  case setting {
-    HeaderTableSize(value) -> #(0x1, value)
-    EnablePush(value) -> #(0x2, bit(value))
-    MaxConcurrentStreams(value) -> #(0x3, value)
-    InitialWindowSize(value) -> #(0x4, value)
-    MaxFrameSize(value) -> #(0x5, value)
-    MaxHeaderListSize(value) -> #(0x6, value)
-    EnableConnectProtocol(value) -> #(0x8, bit(value))
-    UnknownSetting(id, value) -> #(id, value)
-  }
-}
-
-fn encode_error_code(code: ErrorCode) -> Int {
-  case code {
+fn encode_error_code(error: ErrorCode) -> Int {
+  case error {
     NoError -> 0x0
     ProtocolError -> 0x1
     InternalError -> 0x2
@@ -445,6 +421,6 @@ fn encode_error_code(code: ErrorCode) -> Int {
     EnhanceYourCalm -> 0xb
     InadequateSecurity -> 0xc
     Http11Required -> 0xd
-    UnknownErrorCode(other) -> other
+    UnknownErrorCode(code) -> code
   }
 }

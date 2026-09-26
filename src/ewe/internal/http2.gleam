@@ -1,259 +1,242 @@
 import alpacki
 import ewe/internal/clock
-import ewe/internal/connection
+import ewe/internal/connection.{type Body}
 import ewe/internal/file
 import ewe/internal/http2/connection as http2
-import ewe/internal/http2/frame
-import ewe/internal/http2/headers
-import ewe/internal/http2/stream
+import ewe/internal/http2/frame.{type ErrorCode}
+import ewe/internal/http2/outbox.{type Outbox}
+import ewe/internal/http2/parser
+import ewe/internal/http2/worker
+import ewe/internal/queue.{type Queue}
 import gleam/bit_array
-import gleam/bytes_tree
+import gleam/bytes_tree.{type BytesTree}
 import gleam/dict.{type Dict}
-import gleam/erlang/process
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/http
-import gleam/http/request.{type Request}
+import gleam/http/request
 import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import logging
 import tup
 import tup/socket
 
-@internal
-pub type PeerSettings {
-  PeerSettings(
-    header_table_size: Int,
-    initial_window_size: Int,
-    max_frame_size: Int,
-    max_header_list_size: Option(Int),
-  )
-}
-
-const default_peer_settings = PeerSettings(
-  header_table_size: 4096,
-  initial_window_size: 65_535,
-  max_frame_size: 16_384,
-  max_header_list_size: None,
-)
-
-fn apply_settings(
-  settings: PeerSettings,
-  params: List(frame.Setting),
-) -> PeerSettings {
-  list.fold(params, settings, apply_setting)
-}
-
-fn apply_setting(
-  settings: PeerSettings,
-  setting: frame.Setting,
-) -> PeerSettings {
-  case setting {
-    frame.HeaderTableSize(value) ->
-      PeerSettings(..settings, header_table_size: value)
-    frame.InitialWindowSize(value) ->
-      PeerSettings(..settings, initial_window_size: value)
-    frame.MaxFrameSize(value) -> PeerSettings(..settings, max_frame_size: value)
-    frame.MaxHeaderListSize(value) ->
-      PeerSettings(..settings, max_header_list_size: Some(value))
-    frame.EnablePush(_enabled)
-    | frame.MaxConcurrentStreams(_limit)
-    | frame.EnableConnectProtocol(_websocket)
-    | frame.UnknownSetting(_id, _value) -> settings
-  }
-}
-
 pub type Next {
   Continue(State)
   Close
-  CloseAbnormal(reason: String)
 }
 
-@internal
-pub type HandshakePhase {
-  AwaitingSettings
-  Connected
-}
-
-@internal
-pub type HeaderAssembly {
-  HeaderAssembly(
-    stream_id: Int,
-    end_stream: Bool,
-    fragment_count: Int,
-    block: BitArray,
-    trailers: Bool,
-  )
-}
-
-@internal
-pub type StreamStatus {
-  Computing(pid: process.Pid)
-  Flushing
-  Finished
-}
-
-@internal
-pub type Pending {
-  PendingChunks(front: List(http2.Chunk), back: List(http2.Chunk), bytes: Int)
-  PendingFile(
-    descriptor: connection.FileDescriptor,
-    offset: Int,
-    remaining: Int,
-  )
-}
-
-@internal
-pub type Stream {
-  Stream(
-    status: StreamStatus,
-    send_window: Int,
-    pending: Pending,
-    writer: Option(process.Subject(http2.StreamSignal)),
-    recv_window: Int,
-    recv_buffer: bytes_tree.BytesTree,
-    request_half_closed: Bool,
-    parked_reader: Option(process.Subject(http2.BodyEvent)),
-    content_length: Option(Int),
-    body_bytes_received: Int,
-    trailers: List(#(String, String)),
-    method: http.Method,
-  )
-}
-
-@internal
-pub type State {
+pub opaque type State {
   State(
+    phase: Phase,
+    lifecycle: Lifecycle,
     buffer: BitArray,
-    handshake: HandshakePhase,
-    peer_settings: PeerSettings,
-    timer: Option(process.Timer),
-    hpack_decoder: alpacki.DynamicTable,
-    hpack_encoder: alpacki.DynamicTable,
-    header_assembly: Option(HeaderAssembly),
-    reply_subject: process.Subject(http2.Reply(connection.Body)),
-    handler: connection.Handler,
-    streams: Dict(Int, Stream),
-    stream_pids: Dict(process.Pid, Int),
-    conn_send_window: Int,
-    conn_recv_window: Int,
-    reset_window_start: Int,
-    reset_count: Int,
-    highest_client_stream_id_seen: Int,
-    flush_cursor: Int,
-    draining: Bool,
-    drain_subject: process.Subject(connection.Message),
-    drain_timer: Option(process.Timer),
+    output: List(Segment),
+    output_size: Int,
     options: http2.Options,
-    settings_frame: bytes_tree.BytesTree,
-    patterns: headers.HeaderPatterns,
+    settings_acknowledged: Bool,
+    local_initial_window: Int,
+    peer_initial_window: Int,
+    peer_max_frame_size: Int,
+    decoder: alpacki.DynamicTable,
+    decoder_limit: Int,
+    encoder: alpacki.DynamicTable,
+    streams: Dict(Int, Stream),
+    workers: Dict(Pid, Int),
+    ready: Queue(Int),
+    resuming: Bool,
+    reset_streams: List(Int),
+    last_stream_id: Int,
+    send_window: Int,
+    recv_window: Int,
+    resets: ResetBudget,
+    last_activity: Int,
+    self: Subject(connection.Message),
+    commands: Subject(http2.Command),
+    handler: connection.Handler,
     peer: tup.Endpoint,
-    parent: Result(process.Pid, Nil),
+    scheme: http.Scheme,
+    parent: Result(Pid, Nil),
   )
 }
 
-const default_send_window = 65_535
-
-const max_window_size = 2_147_483_647
-
-pub const socket_active_batch_size = 32
-
-@internal
-pub fn build_settings_frame(options: http2.Options) -> bytes_tree.BytesTree {
-  let params = case options.header_table_size {
-    4096 -> []
-    _size -> [frame.HeaderTableSize(options.header_table_size)]
-  }
-
-  let params = case options.initial_window_size {
-    65_535 -> params
-    _size -> [frame.InitialWindowSize(options.initial_window_size), ..params]
-  }
-
-  let params = case options.max_frame_size {
-    16_384 -> params
-    _size -> [frame.MaxFrameSize(options.max_frame_size), ..params]
-  }
-
-  let params = case options.max_concurrent_streams {
-    Some(value) -> [frame.MaxConcurrentStreams(value), ..params]
-    None -> params
-  }
-
-  let params = case options.max_header_list_size {
-    Some(value) -> [frame.MaxHeaderListSize(value), ..params]
-    None -> params
-  }
-
-  let params = case options.websocket {
-    True -> [frame.EnableConnectProtocol(True), ..params]
-    False -> params
-  }
-
-  frame.Settings(0, False, params)
-  |> frame.encode
-  |> bytes_tree.from_bit_array
+type Phase {
+  AwaitingSettings
+  AwaitingFrame
+  AwaitingContinuation(FieldBlock)
 }
 
-pub fn kill_live_workers(state: State) -> Nil {
-  use _stream_id, entry <- dict.each(state.streams)
-
-  case entry.status {
-    Computing(pid) -> process.send_abnormal_exit(pid, "connection_closed")
-    Flushing | Finished -> Nil
-  }
-
-  case entry.pending {
-    PendingFile(descriptor, _offset, _remaining) -> file.close(descriptor)
-    PendingChunks(..) -> Nil
-  }
+type FieldBlock {
+  FieldBlock(
+    stream_id: Int,
+    purpose: Purpose,
+    end_stream: Bool,
+    dependency: Option(Int),
+    fragments: BitArray,
+    continuations: Int,
+  )
 }
 
-pub fn init(
+type Purpose {
+  OpensRequest
+  Trailers
+  ClosedStream
+}
+
+type Segment {
+  Frames(BytesTree)
+  SendFile(descriptor: connection.FileDescriptor, offset: Int, length: Int)
+  CloseFile(connection.FileDescriptor)
+}
+
+type Lifecycle {
+  Serving
+  Announcing
+  Closing(last_stream_id: Int)
+}
+
+type Stream {
+  Stream(
+    head_request: Bool,
+    outbound: Outbound,
+    inbound: Inbound,
+    tunnel: Bool,
+    worker: Option(Pid),
+    send_window: Int,
+    recv_window: Int,
+    scheduled: Bool,
+    held_ack: Option(Subject(http2.WriteAck)),
+    signals: Option(Subject(http2.StreamSignal)),
+    files: List(connection.FileDescriptor),
+    unread: BytesTree,
+    unread_size: Int,
+    reader: Option(Subject(http2.BodyEvent)),
+    trailers: List(#(String, String)),
+    content_length: Option(Int),
+    received_size: Int,
+  )
+}
+
+type Outbound {
+  AwaitingResponse
+  Responding(Outbox)
+  Responded
+}
+
+type Inbound {
+  Receiving
+  Received
+  Consumed
+}
+
+type ResetBudget {
+  ResetBudget(window_start: Int, count: Int)
+}
+
+type Halt {
+  Fail(state: State, error: ErrorCode)
+  Quit(state: State)
+}
+
+const max_stream_id = 2_147_483_647
+
+const remembered_resets = 100
+
+const worker_grace_ms = 5000
+
+const transmit_quantum = 1_048_576
+
+const cork_limit = 262_144
+
+const shutdown_ping = <<"shutdown":utf8>>
+
+pub fn start(
+  connection: tup.Connection,
   handler: connection.Handler,
   options: http2.Options,
-  self: process.Subject(connection.Message),
-  reply_subject: process.Subject(http2.Reply(connection.Body)),
-  peer: tup.Endpoint,
-  parent: Result(process.Pid, Nil),
-) -> State {
-  let table = alpacki.new_dynamic(options.header_table_size)
+  self: Subject(connection.Message),
+  commands: Subject(http2.Command),
+  parent: Result(Pid, Nil),
+  rest: BitArray,
+) -> Next {
+  let scheme = case tup.socket(connection).0 {
+    socket.Tcp -> http.Http
+    socket.Ssl -> http.Https
+  }
 
-  let timer =
-    process.send_after(
-      self,
-      options.handshake_timeout_ms,
-      connection.Http2Handshake,
+  let now = monotonic_ms()
+  let state =
+    State(
+      phase: AwaitingSettings,
+      lifecycle: Serving,
+      buffer: <<>>,
+      output: [],
+      output_size: 0,
+      options:,
+      settings_acknowledged: False,
+      local_initial_window: frame.default_window_size,
+      peer_initial_window: frame.default_window_size,
+      peer_max_frame_size: frame.min_frame_size,
+      decoder: alpacki.new_dynamic(frame.default_header_table_size),
+      decoder_limit: frame.default_header_table_size,
+      encoder: alpacki.new_dynamic(frame.default_header_table_size),
+      streams: dict.new(),
+      workers: dict.new(),
+      ready: queue.new(),
+      resuming: False,
+      reset_streams: [],
+      last_stream_id: 0,
+      send_window: frame.default_window_size,
+      recv_window: frame.default_window_size,
+      resets: ResetBudget(window_start: now, count: 0),
+      last_activity: now,
+      self:,
+      commands:,
+      handler:,
+      peer: tup.peer(connection),
+      scheme:,
+      parent:,
     )
 
-  State(
-    buffer: <<>>,
-    handshake: AwaitingSettings,
-    peer_settings: default_peer_settings,
-    timer: Some(timer),
-    hpack_decoder: table,
-    hpack_encoder: table,
-    header_assembly: None,
-    reply_subject:,
-    handler:,
-    streams: dict.new(),
-    stream_pids: dict.new(),
-    conn_send_window: default_send_window,
-    conn_recv_window: default_send_window,
-    reset_window_start: 0,
-    reset_count: 0,
-    highest_client_stream_id_seen: 0,
-    flush_cursor: 0,
-    draining: False,
-    drain_subject: self,
-    drain_timer: None,
-    options:,
-    settings_frame: build_settings_frame(options),
-    patterns: headers.header_patterns(),
-    peer:,
-    parent:,
+  process.send_after(
+    self,
+    options.handshake_timeout_ms,
+    connection.Http2HandshakeTimeout,
   )
+  process.send_after(self, options.idle_timeout_ms, connection.Http2IdleTimeout)
+
+  state
+  |> emit(frame.encode(frame.Settings(ack: False, settings: settings(options))))
+  |> open_connection_window
+  |> receive(rest)
+  |> conclude(connection)
+}
+
+fn settings(options: http2.Options) -> List(frame.Setting) {
+  [
+    frame.HeaderTableSize(options.header_table_size),
+    frame.InitialWindowSize(options.initial_window_size),
+    frame.MaxFrameSize(options.max_frame_size),
+    frame.EnableConnectProtocol(options.websocket),
+    ..option.values([
+      option.map(options.max_concurrent_streams, frame.MaxConcurrentStreams),
+      option.map(options.max_header_list_size, frame.MaxHeaderListSize),
+    ])
+  ]
+}
+
+fn open_connection_window(state: State) -> State {
+  let increment = connection_window(state.options) - state.recv_window
+
+  case increment > 0 {
+    True ->
+      State(..state, recv_window: state.recv_window + increment)
+      |> emit(frame.encode(frame.WindowUpdate(0, increment)))
+    False -> state
+  }
 }
 
 pub fn handle_message(
@@ -262,1919 +245,1635 @@ pub fn handle_message(
   connection: tup.Connection,
 ) -> Next {
   case message {
-    tup.Incoming(bytes) -> handle_packet(state, bytes, connection)
-    tup.User(connection.Http2Handshake) ->
-      handle_handshake_timeout(state, connection)
-    tup.User(connection.Http2Stream(reply)) ->
-      handle_stream_reply(state, reply, connection)
-    tup.User(connection.Http2Exit(exit)) ->
-      handle_stream_exit(state, exit, connection)
-    tup.User(connection.Http2Drain) -> stop_connection(state)
-    tup.User(connection.Http2StreamClose(pid)) ->
-      finish_or_continue(handle_stream_close_timeout(state, pid))
-    tup.User(connection.Timeout) -> Continue(state)
+    tup.Incoming(bytes) -> receive(state, bytes)
+    tup.User(connection.Http2Command(command)) ->
+      Ok(handle_command(state, command))
+    tup.User(connection.Http2Respond(stream_id:, response:)) ->
+      Ok(receive_response(state, stream_id, response))
+    tup.User(connection.Http2Exit(exit)) -> handle_exit(state, exit)
+    tup.User(connection.Http2HandshakeTimeout) -> handshake_timeout(state)
+    tup.User(connection.Http2Resume) -> Ok(State(..state, resuming: False))
+    tup.User(connection.Http2KillWorker(pid)) -> Ok(kill_worker(state, pid))
+    tup.User(connection.Http2IdleTimeout) -> idle_timeout(state)
+    tup.User(connection.IdleTimeout) -> Ok(state)
+    tup.User(connection.Http2DrainTimeout) -> Error(Quit(state))
   }
+  |> conclude(connection)
 }
 
-fn stop_connection(state: State) -> Next {
-  kill_live_workers(state)
-
-  Close
-}
-
-fn handle_handshake_timeout(state: State, connection: tup.Connection) -> Next {
-  case state.handshake {
-    AwaitingSettings ->
-      terminate(state, connection, Some(frame.SettingsTimeout))
-    Connected -> Continue(state)
-  }
-}
-
-fn handle_packet(
-  state: State,
-  bytes: BitArray,
-  connection: tup.Connection,
-) -> Next {
-  State(..state, buffer: <<state.buffer:bits, bytes:bits>>)
-  |> process_frames(connection)
-}
-
-fn process_frames(state: State, connection: tup.Connection) -> Next {
-  case frame.decode(state.buffer, state.options.max_frame_size) {
-    Ok(#(frame, remaining)) ->
-      case handle_frame(State(..state, buffer: remaining), frame, connection) {
-        Proceed(state) -> process_frames(state, connection)
-        ProceedWithOutbound(state, out) ->
-          case tup.send(connection, out) {
-            Ok(Nil) -> process_frames(state, connection)
-            Error(_reason) -> terminate(state, connection, None)
-          }
-        RejectStream(state, stream_id, code) ->
-          reject_stream(connection, state, stream_id, code)
-        Terminate(code) -> terminate(state, connection, code)
+fn conclude(result: Result(State, Halt), connection: tup.Connection) -> Next {
+  case result {
+    Ok(state) -> {
+      let state = transmit(state, transmit_quantum)
+      let finished = case state.lifecycle {
+        Closing(..) -> dict.is_empty(state.streams)
+        Serving | Announcing -> False
       }
-    Error(frame.Incomplete) -> finish_or_continue(state)
-    Error(frame.Violation(code)) -> terminate(state, connection, Some(code))
+
+      case !finished && hold_output(state) {
+        True -> Continue(resume_later(state))
+        False ->
+          case write(state, connection) {
+            Ok(state) if !finished -> Continue(state)
+            Ok(state) -> stop(state)
+            Error(Nil) -> stop(state)
+          }
+      }
+    }
+    Error(Fail(state:, error:)) -> {
+      let last_stream_id = case state.lifecycle {
+        Closing(last_stream_id:) -> last_stream_id
+        Serving | Announcing -> state.last_stream_id
+      }
+      let state =
+        emit(
+          state,
+          frame.encode(frame.Goaway(last_stream_id:, error:, debug: <<>>)),
+        )
+      let _written = write(state, connection)
+      stop(state)
+    }
+    Error(Quit(state:)) -> stop(state)
   }
 }
 
-fn reject_stream(
-  connection: tup.Connection,
-  state: State,
-  stream_id: Int,
-  code: frame.ErrorCode,
-) -> Next {
-  let state = case dict.get(state.streams, stream_id) {
-    Error(Nil) -> state
-    Ok(entry) -> reset_and_remove_stream(state, stream_id, entry)
-  }
+fn receive(state: State, bytes: BitArray) -> Result(State, Halt) {
+  State(
+    ..state,
+    buffer: connection.append_buffer(state.buffer, bytes),
+    last_activity: monotonic_ms(),
+  )
+  |> process_frames
+}
 
-  case send_frame(connection, frame.RstStream(stream_id, code)) {
-    Ok(Nil) -> process_frames(state, connection)
-    Error(_reason) -> terminate(state, connection, None)
+fn process_frames(state: State) -> Result(State, Halt) {
+  case frame.decode(state.buffer, state.options.max_frame_size) {
+    frame.Decoded(frame:, rest:) ->
+      case handle_frame(State(..state, buffer: rest), frame) {
+        Ok(state) -> process_frames(state)
+        Error(halt) -> Error(halt)
+      }
+    frame.StreamError(stream_id:, error:, rest:) ->
+      case stream_error(State(..state, buffer: rest), stream_id, error) {
+        Ok(state) -> process_frames(state)
+        Error(halt) -> Error(halt)
+      }
+    frame.ConnectionError(error) -> Error(Fail(state, error))
+    frame.NeedMoreData -> Ok(state)
   }
 }
 
-const stream_close_grace_ms = 5000
+fn handle_frame(state: State, received: frame.Frame) -> Result(State, Halt) {
+  case state.phase, received {
+    AwaitingSettings, frame.Settings(ack: False, settings:) ->
+      apply_settings(State(..state, phase: AwaitingFrame), settings)
+    AwaitingSettings, _frame -> Error(Fail(state, frame.ProtocolError))
+    AwaitingContinuation(block),
+      frame.Continuation(stream_id:, end_headers:, fragment:)
+      if stream_id == block.stream_id
+    -> continue_field_block(state, block, end_headers, fragment)
+    AwaitingContinuation(_block), _frame ->
+      Error(Fail(state, frame.ProtocolError))
+    AwaitingFrame, frame.Data(stream_id:, end_stream:, data:, size:) ->
+      receive_data(state, stream_id, end_stream, data, size)
+    AwaitingFrame,
+      frame.Headers(
+        stream_id:,
+        end_stream:,
+        end_headers:,
+        dependency:,
+        fragment:,
+      )
+    ->
+      begin_field_block(
+        state,
+        stream_id,
+        end_stream,
+        end_headers,
+        dependency,
+        fragment,
+      )
+    AwaitingFrame, frame.Priority(stream_id:, dependency:) ->
+      receive_priority(state, stream_id, dependency)
+    AwaitingFrame, frame.RstStream(stream_id:, error: _error) ->
+      receive_reset(state, stream_id)
+    AwaitingFrame, frame.Settings(ack: False, settings:) ->
+      apply_settings(state, settings)
+    AwaitingFrame, frame.Settings(ack: True, settings: _settings) ->
+      Ok(receive_settings_ack(state))
+    AwaitingFrame, frame.PushPromise(..) ->
+      Error(Fail(state, frame.ProtocolError))
+    AwaitingFrame, frame.Ping(ack: False, data:) ->
+      Ok(emit(state, frame.encode(frame.Ping(ack: True, data:))))
+    AwaitingFrame, frame.Ping(ack: True, data:) ->
+      Ok(receive_ping_ack(state, data))
+    AwaitingFrame, frame.Goaway(last_stream_id: _last, error:, debug: _debug) ->
+      receive_goaway(state, error)
+    AwaitingFrame, frame.WindowUpdate(stream_id:, increment:) ->
+      receive_window_update(state, stream_id, increment)
+    AwaitingFrame, frame.Continuation(..) ->
+      Error(Fail(state, frame.ProtocolError))
+    AwaitingFrame, frame.Unknown(..) -> Ok(state)
+  }
+}
 
-fn reset_and_remove_stream(
+type Lookup {
+  Open(Stream)
+  Idle
+  Closed
+}
+
+fn lookup(state: State, stream_id: Int) -> Lookup {
+  case dict.get(state.streams, stream_id) {
+    Ok(stream) -> Open(stream)
+    Error(Nil) ->
+      case stream_id % 2 == 1 && stream_id <= state.last_stream_id {
+        True -> Closed
+        False -> Idle
+      }
+  }
+}
+
+fn receive_data(
   state: State,
   stream_id: Int,
-  entry: Stream,
+  end_stream: Bool,
+  data: BitArray,
+  size: Int,
+) -> Result(State, Halt) {
+  case lookup(state, stream_id) {
+    Idle -> Error(Fail(state, frame.ProtocolError))
+    Open(stream) -> {
+      use state <- result.try(consume_connection_window(state, size))
+      receive_stream_data(state, stream_id, stream, end_stream, data, size)
+    }
+    Closed -> {
+      use state <- result.try(consume_connection_window(state, size))
+      closed_stream_data(state, stream_id)
+    }
+  }
+}
+
+fn consume_connection_window(state: State, size: Int) -> Result(State, Halt) {
+  case size > state.recv_window {
+    True -> Error(Fail(state, frame.FlowControlError))
+    False -> {
+      let recv_window = state.recv_window - size
+      let target = connection_window(state.options)
+
+      case recv_window <= target / 2 {
+        False -> Ok(State(..state, recv_window:))
+        True ->
+          State(..state, recv_window: target)
+          |> emit(frame.encode(frame.WindowUpdate(0, target - recv_window)))
+          |> Ok
+      }
+    }
+  }
+}
+
+fn connection_window(options: http2.Options) -> Int {
+  case options.max_concurrent_streams {
+    Some(limit) ->
+      int.min(
+        limit * options.recv_window_high_water_mark,
+        frame.max_window_size,
+      )
+    None -> frame.max_window_size
+  }
+}
+
+fn receive_stream_data(
+  state: State,
+  stream_id: Int,
+  stream: Stream,
+  end_stream: Bool,
+  data: BitArray,
+  size: Int,
+) -> Result(State, Halt) {
+  let received_size = stream.received_size + bit_array.byte_size(data)
+
+  case stream.inbound {
+    Received | Consumed -> stream_error(state, stream_id, frame.StreamClosed)
+    Receiving if size > stream.recv_window ->
+      stream_error(state, stream_id, frame.FlowControlError)
+    Receiving ->
+      case
+        content_length_mismatch(
+          stream.content_length,
+          received_size,
+          end_stream,
+        )
+      {
+        True -> stream_error(state, stream_id, frame.ProtocolError)
+        False ->
+          Stream(
+            ..stream,
+            inbound: case end_stream {
+              True -> Received
+              False -> Receiving
+            },
+            recv_window: stream.recv_window - size,
+            unread: bytes_tree.append(stream.unread, data),
+            unread_size: stream.unread_size + bit_array.byte_size(data),
+            received_size:,
+          )
+          |> feed_reader(state, stream_id, _)
+          |> Ok
+      }
+  }
+}
+
+fn content_length_mismatch(
+  content_length: Option(Int),
+  received: Int,
+  complete: Bool,
+) -> Bool {
+  case content_length {
+    None -> False
+    Some(expected) -> received > expected || complete && received != expected
+  }
+}
+
+fn feed_reader(state: State, stream_id: Int, stream: Stream) -> State {
+  let stream = case stream.reader, body_event(stream) {
+    Some(reader), Some(#(event, inbound)) -> {
+      process.send(reader, event)
+      Stream(
+        ..stream,
+        inbound:,
+        reader: None,
+        unread: bytes_tree.new(),
+        unread_size: 0,
+      )
+    }
+    Some(_reader), None | None, _event -> stream
+  }
+
+  let #(state, stream) = refill_stream_window(state, stream_id, stream)
+  settle(state, stream_id, stream)
+}
+
+fn body_event(stream: Stream) -> Option(#(http2.BodyEvent, Inbound)) {
+  case stream.unread_size, stream.inbound {
+    0, Receiving -> None
+    _size, Receiving ->
+      Some(#(
+        http2.ChunkEvent(bytes_tree.to_bit_array(stream.unread)),
+        Receiving,
+      ))
+    0, Received | _size, Consumed ->
+      Some(#(http2.DoneEvent(stream.trailers), Consumed))
+    _size, Received ->
+      Some(#(
+        http2.LastChunkEvent(
+          bytes_tree.to_bit_array(stream.unread),
+          stream.trailers,
+        ),
+        Consumed,
+      ))
+  }
+}
+
+fn refill_stream_window(
+  state: State,
+  stream_id: Int,
+  stream: Stream,
+) -> #(State, Stream) {
+  let target = state.options.recv_window_high_water_mark - stream.unread_size
+  let increment = target - stream.recv_window
+  let at_low_water =
+    stream.recv_window <= state.options.recv_window_low_water_mark
+
+  case stream.inbound == Receiving && at_low_water && increment > 0 {
+    True -> #(
+      emit(state, frame.encode(frame.WindowUpdate(stream_id, increment))),
+      Stream(..stream, recv_window: target),
+    )
+    False -> #(state, stream)
+  }
+}
+
+fn begin_field_block(
+  state: State,
+  stream_id: Int,
+  end_stream: Bool,
+  end_headers: Bool,
+  dependency: Option(Int),
+  fragment: BitArray,
+) -> Result(State, Halt) {
+  let purpose = case lookup(state, stream_id) {
+    Idle if stream_id % 2 == 1 -> Ok(OpensRequest)
+    Idle -> Error(Fail(state, frame.ProtocolError))
+    Open(_stream) -> Ok(Trailers)
+    Closed -> Ok(ClosedStream)
+  }
+  use purpose <- result.try(purpose)
+
+  let last_stream_id = case purpose {
+    OpensRequest -> stream_id
+    Trailers | ClosedStream -> state.last_stream_id
+  }
+
+  let block =
+    FieldBlock(
+      stream_id:,
+      purpose:,
+      end_stream:,
+      dependency:,
+      fragments: <<>>,
+      continuations: 0,
+    )
+
+  extend_field_block(
+    State(..state, last_stream_id:),
+    block,
+    end_headers,
+    fragment,
+  )
+}
+
+fn continue_field_block(
+  state: State,
+  block: FieldBlock,
+  end_headers: Bool,
+  fragment: BitArray,
+) -> Result(State, Halt) {
+  let block = FieldBlock(..block, continuations: block.continuations + 1)
+  extend_field_block(
+    State(..state, phase: AwaitingFrame),
+    block,
+    end_headers,
+    fragment,
+  )
+}
+
+fn extend_field_block(
+  state: State,
+  block: FieldBlock,
+  end_headers: Bool,
+  fragment: BitArray,
+) -> Result(State, Halt) {
+  let block =
+    FieldBlock(..block, fragments: <<block.fragments:bits, fragment:bits>>)
+
+  case
+    bit_array.byte_size(block.fragments) > state.options.max_header_block_bytes
+    || block.continuations > state.options.max_continuation_frames
+  {
+    True -> Error(Fail(state, frame.EnhanceYourCalm))
+    False ->
+      case end_headers {
+        False -> Ok(State(..state, phase: AwaitingContinuation(block)))
+        True -> complete_field_block(state, block)
+      }
+  }
+}
+
+fn complete_field_block(
+  state: State,
+  block: FieldBlock,
+) -> Result(State, Halt) {
+  use #(state, fields, size) <- result.try(decode_field_block(
+    state,
+    block.fragments,
+  ))
+
+  let oversized = case state.options.max_header_list_size {
+    Some(limit) -> size > limit
+    None -> False
+  }
+
+  case block.purpose, block.dependency {
+    ClosedStream, _dependency -> closed_stream_headers(state, block.stream_id)
+    OpensRequest, Some(dependency) if dependency == block.stream_id ->
+      stream_error(state, block.stream_id, frame.ProtocolError)
+    OpensRequest, _dependency -> open_stream(state, block, fields, oversized)
+    Trailers, _dependency if oversized ->
+      stream_error(state, block.stream_id, frame.ProtocolError)
+    Trailers, _dependency -> receive_trailers(state, block, fields)
+  }
+}
+
+fn decode_field_block(
+  state: State,
+  block: BitArray,
+) -> Result(#(State, List(#(BitArray, BitArray)), Int), Halt) {
+  case alpacki.decode_header_block(block, state.decoder) {
+    Ok(alpacki.DecodedHeaderBlock(
+      headers:,
+      decoded_size:,
+      dynamic_table:,
+      remaining: <<>>,
+    )) ->
+      case alpacki.dynamic_max_size(dynamic_table) > state.decoder_limit {
+        True -> Error(Fail(state, frame.CompressionError))
+        False ->
+          Ok(#(State(..state, decoder: dynamic_table), headers, decoded_size))
+      }
+    Ok(alpacki.DecodedHeaderBlock(..)) | Error(_error) ->
+      Error(Fail(state, frame.CompressionError))
+  }
+}
+
+fn open_stream(
+  state: State,
+  block: FieldBlock,
+  fields: List(#(BitArray, BitArray)),
+  oversized: Bool,
+) -> Result(State, Halt) {
+  let stream_id = block.stream_id
+  let refused = case state.lifecycle, state.options.max_concurrent_streams {
+    Closing(last_stream_id:), _limit -> stream_id > last_stream_id
+    _lifecycle, Some(limit) ->
+      dict.size(state.streams) >= limit || dict.size(state.workers) >= limit
+    _lifecycle, None -> False
+  }
+
+  case refused, oversized {
+    True, _oversized -> Ok(reset(state, stream_id, frame.RefusedStream))
+    False, True -> Ok(answer_early(state, stream_id, block.end_stream, 431))
+    False, False -> start_request(state, block, fields)
+  }
+}
+
+fn start_request(
+  state: State,
+  block: FieldBlock,
+  fields: List(#(BitArray, BitArray)),
+) -> Result(State, Halt) {
+  let stream_id = block.stream_id
+
+  case parser.request(fields, state.scheme, state.options.websocket) {
+    Error(_malformed) -> Ok(reset(state, stream_id, frame.ProtocolError))
+    Ok(parser.DecodedRequest(content_length: Some(length), ..))
+      if block.end_stream && length != 0
+    -> Ok(reset(state, stream_id, frame.ProtocolError))
+    Ok(parser.DecodedRequest(request:, content_length:, protocol:)) -> {
+      let request =
+        http2.Connection(
+          commands: state.commands,
+          stream_id:,
+          has_body: !block.end_stream,
+          pending: <<>>,
+          pending_trailers: None,
+          bytes_read: 0,
+          body_read_timeout: state.options.body_read_timeout,
+          peer: state.peer,
+          protocol:,
+        )
+        |> connection.Http2
+        |> request.set_body(request, _)
+      let pid =
+        worker.start(
+          state.self,
+          state.commands,
+          stream_id,
+          request,
+          state.handler,
+        )
+      let stream =
+        Stream(
+          ..new_stream(state, block.end_stream, Some(pid)),
+          head_request: request.method == http.Head,
+          tunnel: request.method == http.Connect,
+          content_length:,
+        )
+
+      Ok(
+        State(
+          ..state,
+          streams: dict.insert(state.streams, stream_id, stream),
+          workers: dict.insert(state.workers, pid, stream_id),
+        ),
+      )
+    }
+  }
+}
+
+fn new_stream(state: State, end_stream: Bool, worker: Option(Pid)) -> Stream {
+  Stream(
+    head_request: False,
+    outbound: AwaitingResponse,
+    inbound: case end_stream {
+      True -> Consumed
+      False -> Receiving
+    },
+    tunnel: False,
+    worker:,
+    send_window: state.peer_initial_window,
+    recv_window: state.local_initial_window,
+    scheduled: False,
+    held_ack: None,
+    signals: None,
+    files: [],
+    unread: bytes_tree.new(),
+    unread_size: 0,
+    reader: None,
+    trailers: [],
+    content_length: None,
+    received_size: 0,
+  )
+}
+
+fn answer_early(
+  state: State,
+  stream_id: Int,
+  end_stream: Bool,
+  status: Int,
 ) -> State {
-  case entry.status {
-    Computing(pid) -> {
+  let stream = new_stream(state, end_stream, None)
+  send_response(state, stream_id, stream, status, [], [], Omitted)
+}
+
+fn receive_trailers(
+  state: State,
+  block: FieldBlock,
+  fields: List(#(BitArray, BitArray)),
+) -> Result(State, Halt) {
+  case dict.get(state.streams, block.stream_id) {
+    Error(Nil) -> closed_stream_headers(state, block.stream_id)
+    Ok(stream) ->
+      case stream.inbound, block.end_stream, parser.trailers(fields) {
+        Received, _end_stream, _trailers | Consumed, _end_stream, _trailers ->
+          stream_error(state, block.stream_id, frame.StreamClosed)
+        Receiving, False, _trailers ->
+          stream_error(state, block.stream_id, frame.ProtocolError)
+        Receiving, True, Error(_malformed) ->
+          stream_error(state, block.stream_id, frame.ProtocolError)
+        Receiving, True, Ok(trailers) ->
+          case
+            content_length_mismatch(
+              stream.content_length,
+              stream.received_size,
+              True,
+            )
+          {
+            True -> stream_error(state, block.stream_id, frame.ProtocolError)
+            False ->
+              Stream(..stream, inbound: Received, trailers:)
+              |> feed_reader(state, block.stream_id, _)
+              |> Ok
+          }
+      }
+  }
+}
+
+fn closed_stream_data(state: State, stream_id: Int) -> Result(State, Halt) {
+  case list.contains(state.reset_streams, stream_id) {
+    True -> Ok(state)
+    False -> Ok(reset(state, stream_id, frame.StreamClosed))
+  }
+}
+
+fn closed_stream_headers(state: State, stream_id: Int) -> Result(State, Halt) {
+  case list.contains(state.reset_streams, stream_id) {
+    True -> Ok(state)
+    False -> Error(Fail(state, frame.ProtocolError))
+  }
+}
+
+fn receive_priority(
+  state: State,
+  stream_id: Int,
+  dependency: Int,
+) -> Result(State, Halt) {
+  case dependency == stream_id {
+    True -> stream_error(state, stream_id, frame.ProtocolError)
+    False -> Ok(state)
+  }
+}
+
+fn receive_reset(state: State, stream_id: Int) -> Result(State, Halt) {
+  case lookup(state, stream_id) {
+    Idle -> Error(Fail(state, frame.ProtocolError))
+    Closed -> Ok(state)
+    Open(stream) -> {
+      use state <- result.map(count_reset(state, stream))
+      remove_stream(state, stream_id, stream)
+    }
+  }
+}
+
+fn receive_window_update(
+  state: State,
+  stream_id: Int,
+  increment: Int,
+) -> Result(State, Halt) {
+  case stream_id, increment, lookup(state, stream_id) {
+    0, 0, _lookup -> Error(Fail(state, frame.ProtocolError))
+    0, _increment, _lookup ->
+      case state.send_window + increment > frame.max_window_size {
+        True -> Error(Fail(state, frame.FlowControlError))
+        False -> Ok(State(..state, send_window: state.send_window + increment))
+      }
+    _stream_id, _increment, Idle -> Error(Fail(state, frame.ProtocolError))
+    _stream_id, _increment, Closed -> Ok(state)
+    _stream_id, 0, Open(_stream) ->
+      stream_error(state, stream_id, frame.ProtocolError)
+    _stream_id, _increment, Open(stream) ->
+      case stream.send_window + increment > frame.max_window_size {
+        True -> stream_error(state, stream_id, frame.FlowControlError)
+        False ->
+          Stream(..stream, send_window: stream.send_window + increment)
+          |> schedule(state, stream_id, _)
+          |> Ok
+      }
+  }
+}
+
+fn apply_settings(
+  state: State,
+  settings: List(frame.Setting),
+) -> Result(State, Halt) {
+  use state <- result.map(list.try_fold(settings, state, apply_setting))
+  emit(state, frame.encode(frame.Settings(ack: True, settings: [])))
+}
+
+fn apply_setting(state: State, setting: frame.Setting) -> Result(State, Halt) {
+  case setting {
+    frame.HeaderTableSize(size) -> {
+      let size = int.min(size, frame.default_header_table_size)
+
+      case size == alpacki.dynamic_max_size(state.encoder) {
+        True -> Ok(state)
+        False ->
+          Ok(
+            State(..state, encoder: alpacki.resize_dynamic(state.encoder, size)),
+          )
+      }
+    }
+    frame.InitialWindowSize(size) -> change_initial_window(state, size)
+    frame.MaxFrameSize(size) -> Ok(State(..state, peer_max_frame_size: size))
+    frame.EnablePush(_enabled)
+    | frame.MaxConcurrentStreams(_limit)
+    | frame.EnableConnectProtocol(_enabled)
+    | frame.MaxHeaderListSize(_size) -> Ok(state)
+  }
+}
+
+fn change_initial_window(state: State, size: Int) -> Result(State, Halt) {
+  let delta = size - state.peer_initial_window
+  let state = State(..state, peer_initial_window: size)
+
+  use state, stream_id, stream <- dict.fold(state.streams, Ok(state))
+  use state <- result.try(state)
+  let send_window = stream.send_window + delta
+
+  case send_window > frame.max_window_size {
+    True -> Error(Fail(state, frame.FlowControlError))
+    False -> Ok(schedule(state, stream_id, Stream(..stream, send_window:)))
+  }
+}
+
+fn receive_settings_ack(state: State) -> State {
+  case state.settings_acknowledged {
+    True -> state
+    False -> {
+      let limit = state.options.header_table_size
+      let decoder = case limit < alpacki.dynamic_max_size(state.decoder) {
+        True -> alpacki.expect_table_size_update(state.decoder)
+        False -> state.decoder
+      }
+      let delta = state.options.initial_window_size - state.local_initial_window
+      let streams =
+        dict.map_values(state.streams, fn(_stream_id, stream) {
+          Stream(..stream, recv_window: stream.recv_window + delta)
+        })
+
+      State(
+        ..state,
+        settings_acknowledged: True,
+        decoder:,
+        decoder_limit: limit,
+        local_initial_window: state.options.initial_window_size,
+        streams:,
+      )
+    }
+  }
+}
+
+fn handshake_timeout(state: State) -> Result(State, Halt) {
+  case state.phase, state.settings_acknowledged {
+    AwaitingSettings, _acknowledged -> Error(Fail(state, frame.ProtocolError))
+    _phase, False -> Error(Fail(state, frame.SettingsTimeout))
+    _phase, True -> Ok(state)
+  }
+}
+
+fn receive_ping_ack(state: State, data: BitArray) -> State {
+  case state.lifecycle, data == shutdown_ping {
+    Announcing, True -> send_final_goaway(state)
+    _lifecycle, _shutdown -> state
+  }
+}
+
+fn send_final_goaway(state: State) -> State {
+  let last_stream_id = state.last_stream_id
+
+  State(..state, lifecycle: Closing(last_stream_id:))
+  |> emit(
+    frame.encode(
+      frame.Goaway(last_stream_id:, error: frame.NoError, debug: <<>>),
+    ),
+  )
+}
+
+fn receive_goaway(state: State, error: ErrorCode) -> Result(State, Halt) {
+  case error, state.lifecycle {
+    frame.NoError, Closing(..) -> Ok(state)
+    frame.NoError, Serving | frame.NoError, Announcing ->
+      Ok(send_final_goaway(state))
+    _error, _lifecycle -> Error(Quit(state))
+  }
+}
+
+fn stream_error(
+  state: State,
+  stream_id: Int,
+  error: ErrorCode,
+) -> Result(State, Halt) {
+  case lookup(state, stream_id) {
+    Idle -> Error(Fail(state, error))
+    Closed -> Ok(reset(state, stream_id, error))
+    Open(stream) -> {
+      use state <- result.map(count_reset(state, stream))
+      reset(state, stream_id, error)
+    }
+  }
+}
+
+fn reset(state: State, stream_id: Int, error: ErrorCode) -> State {
+  let state =
+    State(
+      ..state,
+      reset_streams: list.take(
+        [stream_id, ..state.reset_streams],
+        remembered_resets,
+      ),
+    )
+    |> emit(frame.encode(frame.RstStream(stream_id:, error:)))
+
+  case dict.get(state.streams, stream_id) {
+    Ok(stream) -> remove_stream(state, stream_id, stream)
+    Error(Nil) -> state
+  }
+}
+
+fn count_reset(state: State, stream: Stream) -> Result(State, Halt) {
+  case stream.worker {
+    None -> Ok(state)
+    Some(_pid) -> {
+      let now = monotonic_ms()
+      let resets = case
+        now - state.resets.window_start > state.options.rapid_reset_window_ms
+      {
+        True -> ResetBudget(window_start: now, count: 1)
+        False -> ResetBudget(..state.resets, count: state.resets.count + 1)
+      }
+
+      case resets.count > state.options.rapid_reset_threshold {
+        True -> Error(Fail(state, frame.EnhanceYourCalm))
+        False -> Ok(State(..state, resets:))
+      }
+    }
+  }
+}
+
+fn remove_stream(state: State, stream_id: Int, stream: Stream) -> State {
+  case stream.worker {
+    Some(pid) -> {
       process.send_abnormal_exit(pid, "stream_reset")
       process.send_after(
-        state.drain_subject,
-        stream_close_grace_ms,
-        connection.Http2StreamClose(pid),
+        state.self,
+        worker_grace_ms,
+        connection.Http2KillWorker(pid),
       )
-
       Nil
     }
-    Flushing | Finished -> Nil
-  }
-
-  case entry.pending {
-    PendingFile(descriptor, _offset, _remaining) -> file.close(descriptor)
-    PendingChunks(..) -> Nil
+    None -> Nil
   }
 
   State(..state, streams: dict.delete(state.streams, stream_id))
+  |> close_files(stream.files)
 }
 
-fn handle_stream_close_timeout(state: State, pid: process.Pid) -> State {
-  case dict.get(state.stream_pids, pid) {
-    Error(Nil) -> state
-    Ok(_stream_id) -> {
-      process.kill(pid)
+fn settle(state: State, stream_id: Int, stream: Stream) -> State {
+  case stream.outbound, stream.inbound, stream.worker {
+    Responded, Consumed, _worker | Responded, Received, None ->
+      State(..state, streams: dict.delete(state.streams, stream_id))
+    Responded, Receiving, None ->
+      State(..state, streams: dict.insert(state.streams, stream_id, stream))
+      |> reset(stream_id, frame.NoError)
+    _outbound, _inbound, _worker ->
+      State(..state, streams: dict.insert(state.streams, stream_id, stream))
+  }
+}
+
+fn receive_response(
+  state: State,
+  stream_id: Int,
+  response: Response(Body),
+) -> State {
+  case dict.get(state.streams, stream_id) {
+    Ok(Stream(outbound: AwaitingResponse, ..) as stream) ->
+      respond(state, stream_id, stream, response)
+    Ok(_stream) | Error(Nil) -> {
+      file.release_body(response.body)
       state
     }
   }
 }
 
-@internal
-pub type FrameResult {
-  Proceed(state: State)
-  ProceedWithOutbound(state: State, out: bytes_tree.BytesTree)
-  RejectStream(state: State, stream_id: Int, code: frame.ErrorCode)
-  Terminate(code: Option(frame.ErrorCode))
-}
-
-fn handle_frame(
-  state: State,
-  frame: frame.Frame,
-  connection: tup.Connection,
-) -> FrameResult {
-  case state.header_assembly {
-    Some(assembly) -> handle_continuation(state, assembly, frame)
-    None -> handle_new_frame(state, frame, connection)
-  }
-}
-
-fn handle_new_frame(
-  state: State,
-  frame: frame.Frame,
-  connection: tup.Connection,
-) -> FrameResult {
-  case frame {
-    frame.Settings(0, True, _params) -> Proceed(state)
-    frame.Settings(0, False, params) ->
-      handle_client_settings(state, params, connection)
-    frame.Settings(..) -> Terminate(Some(frame.ProtocolError))
-    frame.Headers(stream_id, end_stream, end_headers, payload) ->
-      handle_headers(state, stream_id, end_stream, end_headers, payload)
-    frame.Data(stream_id, end_stream, payload, flow_control_size) ->
-      case state.handshake {
-        AwaitingSettings -> Terminate(Some(frame.ProtocolError))
-        Connected ->
-          handle_data(state, stream_id, end_stream, payload, flow_control_size)
-      }
-    frame.RstStream(stream_id, _error_code) ->
-      case state.handshake {
-        AwaitingSettings -> Terminate(Some(frame.ProtocolError))
-        Connected -> handle_client_reset(state, stream_id)
-      }
-    frame.WindowUpdate(stream_id, increment) ->
-      case state.handshake {
-        AwaitingSettings -> Terminate(Some(frame.ProtocolError))
-        Connected ->
-          handle_window_update(state, stream_id, increment, connection)
-      }
-    frame.Ping(stream_id, ack, opaque_data) ->
-      case state.handshake {
-        AwaitingSettings -> Terminate(Some(frame.ProtocolError))
-        Connected -> handle_ping(state, stream_id, ack, opaque_data, connection)
-      }
-    frame.Continuation(..) | frame.PushPromise(..) ->
-      Terminate(Some(frame.ProtocolError))
-    frame.Priority(..) | frame.Goaway(..) | frame.Unknown(..) ->
-      case state.handshake {
-        AwaitingSettings -> Terminate(Some(frame.ProtocolError))
-        Connected -> Proceed(state)
-      }
-  }
-}
-
-fn handle_ping(
-  state: State,
-  stream_id: Int,
-  ack: Bool,
-  opaque_data: BitArray,
-  connection: tup.Connection,
-) -> FrameResult {
-  case stream_id != 0, ack {
-    True, _ack -> Terminate(Some(frame.ProtocolError))
-    False, True -> Proceed(state)
-    False, False ->
-      case send_frame(connection, frame.Ping(0, True, opaque_data)) {
-        Ok(Nil) -> Proceed(state)
-        Error(_reason) -> Terminate(None)
-      }
-  }
-}
-
-@internal
-pub fn handle_client_reset(state: State, stream_id: Int) -> FrameResult {
-  let #(state, tripped) = record_reset(state)
-
-  case
-    tripped,
-    dict.get(state.streams, stream_id),
-    stream_id > state.highest_client_stream_id_seen
-  {
-    True, _stream_lookup, _is_new_stream ->
-      Terminate(Some(frame.EnhanceYourCalm))
-    False, Error(Nil), True -> Terminate(Some(frame.ProtocolError))
-    False, Error(Nil), False -> Proceed(state)
-    False, Ok(entry), _is_new_stream ->
-      Proceed(reset_and_remove_stream(state, stream_id, entry))
-  }
-}
-
-fn record_reset(state: State) -> #(State, Bool) {
-  let now = monotonic_ms()
-
-  let new_window =
-    state.reset_count == 0
-    || now - state.reset_window_start > state.options.rapid_reset_window_ms
-
-  let #(reset_window_start, reset_count) = case new_window {
-    True -> #(now, 1)
-    False -> #(state.reset_window_start, state.reset_count + 1)
-  }
-
-  #(
-    State(..state, reset_window_start:, reset_count:),
-    reset_count > state.options.rapid_reset_threshold,
-  )
-}
-
-@external(erlang, "ewe_http2_ffi", "monotonic_ms")
-fn monotonic_ms() -> Int
-
-fn remove_stream(state: State, stream_id: Int, entry: Stream) -> State {
-  let stream_pids = case entry.status {
-    Computing(pid) -> dict.delete(state.stream_pids, pid)
-    Flushing | Finished -> state.stream_pids
-  }
-
-  State(..state, streams: dict.delete(state.streams, stream_id), stream_pids:)
-}
-
-fn finish_stream(state: State, stream_id: Int, entry: Stream) -> State {
-  Stream(
-    ..entry,
-    status: Finished,
-    pending: no_chunks(),
-    recv_buffer: bytes_tree.new(),
-    parked_reader: None,
-  )
-  |> store_stream(state, stream_id, _)
-}
-
-fn unfinished_stream(state: State, stream_id: Int) -> Result(Stream, Nil) {
-  case dict.get(state.streams, stream_id) {
-    Ok(Stream(status: Finished, ..)) -> Error(Nil)
-    lookup -> lookup
-  }
-}
-
-fn store_stream(state: State, stream_id: Int, entry: Stream) -> State {
-  let streams = case entry.status, entry.request_half_closed {
-    Finished, True -> dict.delete(state.streams, stream_id)
-    Finished, False | Computing(_pid), _half_closed | Flushing, _half_closed ->
-      dict.insert(state.streams, stream_id, entry)
-  }
-
-  State(..state, streams:)
-}
-
-fn clear_stream_pid(state: State, pid: process.Pid) -> State {
-  State(..state, stream_pids: dict.delete(state.stream_pids, pid))
-}
-
-@internal
-pub fn handle_headers(
-  state: State,
-  stream_id: Int,
-  end_stream: Bool,
-  end_headers: Bool,
-  payload: BitArray,
-) -> FrameResult {
-  case
-    dict.get(state.streams, stream_id),
-    is_new_client_stream_id(state, stream_id)
-  {
-    Ok(entry), _is_new_stream if !entry.request_half_closed ->
-      start_header_assembly(
-        state,
-        stream_id,
-        end_stream,
-        end_headers,
-        payload,
-        True,
-      )
-    Ok(_entry), _is_new_stream ->
-      RejectStream(state, stream_id, frame.StreamClosed)
-    Error(Nil), True -> {
-      State(..state, highest_client_stream_id_seen: stream_id)
-      |> start_header_assembly(
-        stream_id,
-        end_stream,
-        end_headers,
-        payload,
-        False,
-      )
-    }
-    Error(Nil), False -> Terminate(Some(frame.ProtocolError))
-  }
-}
-
-fn start_header_assembly(
-  state: State,
-  stream_id: Int,
-  end_stream: Bool,
-  end_headers: Bool,
-  payload: BitArray,
-  trailers: Bool,
-) -> FrameResult {
-  let assembly =
-    HeaderAssembly(
-      stream_id:,
-      end_stream:,
-      fragment_count: 1,
-      block: payload,
-      trailers:,
-    )
-
-  let oversized =
-    bit_array.byte_size(payload) > state.options.max_header_block_bytes
-
-  case oversized, end_headers, trailers {
-    True, _end_headers, _trailers -> Terminate(Some(frame.EnhanceYourCalm))
-    False, False, _trailers ->
-      Proceed(State(..state, header_assembly: Some(assembly)))
-    False, True, True -> complete_trailer_block(state, assembly)
-    False, True, False -> complete_header_block(state, assembly)
-  }
-}
-
-fn is_new_client_stream_id(state: State, stream_id: Int) -> Bool {
-  stream_id % 2 == 1 && stream_id > state.highest_client_stream_id_seen
-}
-
-@internal
-pub fn handle_data(
-  state: State,
-  stream_id: Int,
-  end_stream: Bool,
-  payload: BitArray,
-  size: Int,
-) -> FrameResult {
-  case
-    stream_id == 0,
-    dict.get(state.streams, stream_id),
-    stream_id > state.highest_client_stream_id_seen
-  {
-    True, _lookup, _is_new_stream -> Terminate(Some(frame.ProtocolError))
-    False, Error(Nil), True -> Terminate(Some(frame.ProtocolError))
-    False, Error(Nil), False ->
-      reject_closed_stream_data(state, stream_id, size)
-    False, Ok(entry), _is_new_stream if entry.request_half_closed ->
-      reject_data_after_half_close(state, stream_id, size)
-    False, Ok(entry), _is_new_stream ->
-      apply_data(state, stream_id, entry, end_stream, payload, size)
-  }
-}
-
-fn reject_closed_stream_data(
-  state: State,
-  stream_id: Int,
-  size: Int,
-) -> FrameResult {
-  let conn_recv_window = state.conn_recv_window - size
-
-  case conn_recv_window < 0 {
-    True -> Terminate(Some(frame.FlowControlError))
-    False -> {
-      let #(state, conn_increment) =
-        conn_recv_credit(State(..state, conn_recv_window:))
-
-      frame.RstStream(stream_id, frame.StreamClosed)
-      |> frame.encode
-      |> bytes_tree.from_bit_array
-      |> append_window_update(0, conn_increment)
-      |> ProceedWithOutbound(state, _)
-    }
-  }
-}
-
-fn reject_data_after_half_close(
-  state: State,
-  stream_id: Int,
-  size: Int,
-) -> FrameResult {
-  let conn_recv_window = state.conn_recv_window - size
-
-  case conn_recv_window < 0 {
-    True -> Terminate(Some(frame.FlowControlError))
-    False ->
-      State(..state, conn_recv_window:)
-      |> RejectStream(stream_id, frame.StreamClosed)
-  }
-}
-
-fn apply_data(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  end_stream: Bool,
-  payload: BitArray,
-  size: Int,
-) -> FrameResult {
-  let conn_recv_window = state.conn_recv_window - size
-  let recv_window = entry.recv_window - size
-  let state = State(..state, conn_recv_window:)
-
-  case conn_recv_window < 0, recv_window < 0 {
-    True, _recv_window_negative -> Terminate(Some(frame.FlowControlError))
-    False, True -> RejectStream(state, stream_id, frame.FlowControlError)
-    False, False ->
-      case content_length_violation(entry, payload, end_stream) {
-        True -> RejectStream(state, stream_id, frame.ProtocolError)
-        False -> {
-          let body_bytes_received =
-            entry.body_bytes_received + bit_array.byte_size(payload)
-          let #(state, conn_increment) = conn_recv_credit(state)
-          let entry = Stream(..entry, recv_window:, body_bytes_received:)
-          let #(entry, consumed) = case entry.status {
-            Finished -> #(
-              Stream(..entry, request_half_closed: end_stream),
-              True,
-            )
-            Computing(_pid) | Flushing ->
-              deliver_data(entry, payload, end_stream, [])
-          }
-
-          let #(entry, stream_increment) = case consumed {
-            True -> stream_recv_credit(entry, state.options)
-            False -> #(entry, 0)
-          }
-
-          let state = store_stream(state, stream_id, entry)
-
-          let out =
-            bytes_tree.new()
-            |> append_window_update(stream_id, stream_increment)
-            |> append_window_update(0, conn_increment)
-
-          case stream_increment > 0 || conn_increment > 0 {
-            False -> Proceed(state)
-            True -> ProceedWithOutbound(state, out)
-          }
+fn handle_command(state: State, command: http2.Command) -> State {
+  case command {
+    http2.ReadBody(stream_id:, reply_to:) ->
+      case dict.get(state.streams, stream_id) {
+        Ok(stream) ->
+          feed_reader(
+            state,
+            stream_id,
+            Stream(..stream, reader: Some(reply_to)),
+          )
+        Error(Nil) -> {
+          process.send(reply_to, http2.DoneEvent([]))
+          state
         }
       }
-  }
-}
-
-fn content_length_violation(
-  entry: Stream,
-  payload: BitArray,
-  end_stream: Bool,
-) -> Bool {
-  case entry.content_length {
-    None -> False
-    Some(expected) -> {
-      let total = entry.body_bytes_received + bit_array.byte_size(payload)
-      total > expected || { end_stream && total != expected }
-    }
-  }
-}
-
-fn deliver_data(
-  entry: Stream,
-  payload: BitArray,
-  end_stream: Bool,
-  trailers: List(#(String, String)),
-) -> #(Stream, Bool) {
-  let request_half_closed = entry.request_half_closed || end_stream
-  let entry = Stream(..entry, request_half_closed:)
-
-  case entry.parked_reader, payload, end_stream {
-    _reader, <<>>, False -> #(entry, False)
-    Some(reply_to), <<>>, True -> {
-      process.send(reply_to, http2.DoneEvent(trailers))
-      #(Stream(..entry, parked_reader: None), True)
-    }
-    Some(reply_to), _payload, True -> {
-      process.send(reply_to, http2.LastChunkEvent(payload, trailers))
-      #(Stream(..entry, parked_reader: None), True)
-    }
-    Some(reply_to), _payload, False -> {
-      process.send(reply_to, http2.ChunkEvent(payload))
-      #(Stream(..entry, parked_reader: None), True)
-    }
-    None, _payload, _end_stream -> {
-      let recv_buffer = bytes_tree.append(entry.recv_buffer, payload)
-      let trailers = case trailers {
-        [] -> entry.trailers
-        _received -> trailers
+    http2.WriteHeaders(stream_id:, ack:, status:, headers:, signals:) ->
+      case dict.get(state.streams, stream_id) {
+        Ok(Stream(outbound: AwaitingResponse, ..) as stream) ->
+          start_streaming(
+            state,
+            stream_id,
+            stream,
+            status,
+            headers,
+            signals,
+            ack,
+          )
+        Ok(_stream) | Error(Nil) -> refuse_write(state, ack)
       }
-
-      #(Stream(..entry, recv_buffer:, trailers:), False)
-    }
-  }
-}
-
-@internal
-pub fn handle_continuation(
-  state: State,
-  assembly: HeaderAssembly,
-  frame: frame.Frame,
-) -> FrameResult {
-  case frame {
-    frame.Continuation(stream_id, end_headers, payload)
-      if stream_id == assembly.stream_id
-    ->
-      case add_fragment(assembly, payload, state.options), end_headers {
-        Error(code), _end_headers -> Terminate(Some(code))
-        Ok(updated), False ->
-          Proceed(State(..state, header_assembly: Some(updated)))
-        Ok(updated), True if updated.trailers ->
-          complete_trailer_block(state, updated)
-        Ok(updated), True -> complete_header_block(state, updated)
-      }
-    frame.Continuation(..) -> Terminate(Some(frame.ProtocolError))
-    _frame -> Terminate(Some(frame.ProtocolError))
-  }
-}
-
-@internal
-pub fn add_fragment(
-  assembly: HeaderAssembly,
-  fragment: BitArray,
-  options: http2.Options,
-) -> Result(HeaderAssembly, frame.ErrorCode) {
-  let fragment_count = assembly.fragment_count + 1
-  let block = <<assembly.block:bits, fragment:bits>>
-
-  case
-    fragment_count > options.max_continuation_frames
-    || bit_array.byte_size(block) > options.max_header_block_bytes
-  {
-    True -> Error(frame.EnhanceYourCalm)
-    False -> Ok(HeaderAssembly(..assembly, fragment_count:, block:))
-  }
-}
-
-fn decode_and_validate_header_block(
-  state: State,
-  assembly: HeaderAssembly,
-) -> Result(#(State, List(#(BitArray, BitArray))), FrameResult) {
-  case alpacki.decode_header_block(assembly.block, state.hpack_decoder) {
-    Error(_decode_error) -> Error(Terminate(Some(frame.CompressionError)))
-    Ok(alpacki.DecodedHeaderBlock(
-      headers:,
-      decoded_size:,
-      dynamic_table:,
-      remaining:,
-    )) -> {
-      let header_list_size_exceeded = case state.options.max_header_list_size {
-        None -> False
-        Some(limit) -> decoded_size > limit
-      }
-
-      case
-        remaining != <<>>
-        || alpacki.dynamic_max_size(dynamic_table)
-        > state.options.header_table_size,
-        header_list_size_exceeded
-      {
-        True, _header_list_size_exceeded ->
-          Error(Terminate(Some(frame.CompressionError)))
-        False, True -> Error(Terminate(Some(frame.EnhanceYourCalm)))
-        False, False -> {
-          let next_state =
-            State(..state, header_assembly: None, hpack_decoder: dynamic_table)
-          Ok(#(next_state, headers))
-        }
-      }
-    }
-  }
-}
-
-@internal
-pub fn complete_header_block(
-  state: State,
-  assembly: HeaderAssembly,
-) -> FrameResult {
-  case decode_and_validate_header_block(state, assembly) {
-    Error(result) -> result
-    Ok(#(state, header_list)) ->
-      case headers.build_request(header_list, Nil, state.patterns) {
-        Error(_error) ->
-          RejectStream(state, assembly.stream_id, frame.ProtocolError)
-        Ok(headers.DecodedRequest(request:, content_length:, protocol:)) ->
-          case
-            protocol,
-            state.options.websocket,
-            assembly.end_stream,
-            content_length
-          {
-            Some(_protocol), False, _end_stream, _length ->
-              RejectStream(state, assembly.stream_id, frame.ProtocolError)
-            _protocol, _websocket, True, Some(expected) if expected != 0 ->
-              RejectStream(state, assembly.stream_id, frame.ProtocolError)
-            _protocol, _websocket, _end_stream, _content_length -> {
-              let connection =
-                connection.Http2(http2.Connection(
-                  connection: state.reply_subject,
-                  stream_id: assembly.stream_id,
-                  has_body: !assembly.end_stream,
-                  pending: <<>>,
-                  pending_trailers: None,
-                  read: 0,
-                  body_read_timeout: state.options.body_read_timeout,
-                  peer: state.peer,
-                  protocol:,
-                ))
-
-              spawn_stream(
+    http2.WriteData(stream_id:, data:, end_stream:, ack:) ->
+      case dict.get(state.streams, stream_id) {
+        Ok(Stream(outbound: Responding(outbox), ..) as stream) ->
+          case outbox.is_finished(outbox) {
+            False ->
+              queue_data(
                 state,
-                assembly.stream_id,
-                request.set_body(request, connection),
-                assembly.end_stream,
-                content_length,
+                stream_id,
+                stream,
+                outbox,
+                data,
+                end_stream,
+                ack,
               )
-            }
+            True -> refuse_write(state, ack)
           }
+        Ok(_stream) | Error(Nil) -> refuse_write(state, ack)
       }
   }
 }
 
-fn complete_trailer_block(
-  state: State,
-  assembly: HeaderAssembly,
-) -> FrameResult {
-  case decode_and_validate_header_block(state, assembly) {
-    Error(result) -> result
-    Ok(#(next_state, header_list)) ->
-      case
-        list.any(header_list, headers.is_pseudo_header),
-        assembly.end_stream
-      {
-        True, _end_stream ->
-          RejectStream(next_state, assembly.stream_id, frame.ProtocolError)
-        False, False ->
-          RejectStream(next_state, assembly.stream_id, frame.ProtocolError)
-        False, True ->
-          case headers.decode_trailers(state.patterns, header_list) {
-            Ok(trailers) ->
-              Proceed(finish_trailers(next_state, assembly.stream_id, trailers))
-            Error(_error) ->
-              RejectStream(next_state, assembly.stream_id, frame.ProtocolError)
-          }
-      }
-  }
-}
-
-fn finish_trailers(
-  state: State,
-  stream_id: Int,
-  trailers: List(#(String, String)),
-) -> State {
-  case dict.get(state.streams, stream_id) {
-    Error(Nil) -> state
-    Ok(entry) -> {
-      let #(entry, _delivered_to_reader) =
-        deliver_data(entry, <<>>, True, trailers)
-
-      store_stream(state, stream_id, entry)
-    }
-  }
-}
-
-fn spawn_stream(
-  state: State,
-  stream_id: Int,
-  request: Request(connection.Connection),
-  end_stream: Bool,
-  content_length: Option(Int),
-) -> FrameResult {
-  let concurrent_streams_exceeded = case state.options.max_concurrent_streams {
-    None -> False
-    Some(limit) -> dict.size(state.streams) >= limit
-  }
-
-  case state.draining || concurrent_streams_exceeded {
-    True -> RejectStream(state, stream_id, frame.RefusedStream)
-    False -> {
-      let pid =
-        stream.start(state.reply_subject, stream_id, request, state.handler)
-
-      track_stream(
-        state,
-        stream_id,
-        pid,
-        end_stream,
-        content_length,
-        request.method,
-      )
-      |> Proceed
-    }
-  }
-}
-
-fn track_stream(
-  state: State,
-  stream_id: Int,
-  pid: process.Pid,
-  end_stream: Bool,
-  content_length: Option(Int),
-  method: http.Method,
-) -> State {
-  let entry =
-    Stream(
-      status: Computing(pid),
-      method:,
-      send_window: state.peer_settings.initial_window_size,
-      pending: no_chunks(),
-      writer: None,
-      recv_window: state.options.initial_window_size,
-      recv_buffer: bytes_tree.new(),
-      request_half_closed: end_stream,
-      parked_reader: None,
-      content_length:,
-      body_bytes_received: 0,
-      trailers: [],
-    )
-
-  State(
-    ..state,
-    streams: dict.insert(state.streams, stream_id, entry),
-    stream_pids: dict.insert(state.stream_pids, pid, stream_id),
-  )
-}
-
-fn handle_client_settings(
-  state: State,
-  params: List(frame.Setting),
-  connection: tup.Connection,
-) -> FrameResult {
-  case send_frame(connection, frame.settings_ack) {
-    Error(_reason) -> Terminate(None)
-    Ok(Nil) -> {
-      let peer_settings = apply_settings(state.peer_settings, params)
-
-      let delta =
-        peer_settings.initial_window_size
-        - state.peer_settings.initial_window_size
-
-      let state = adjust_stream_windows(State(..state, peer_settings:), delta)
-      let state = case state.handshake {
-        AwaitingSettings -> {
-          connection.cancel_timer(state.timer)
-          State(..state, handshake: Connected, timer: None)
-        }
-        Connected -> state
-      }
-
-      case delta > 0 {
-        True -> flush_pending_streams(state, connection)
-        False -> Proceed(state)
-      }
-    }
-  }
-}
-
-@internal
-pub fn adjust_stream_windows(state: State, delta: Int) -> State {
-  case delta {
-    0 -> state
-    _delta -> {
-      let streams =
-        dict.map_values(state.streams, fn(_stream_id, entry) {
-          Stream(..entry, send_window: entry.send_window + delta)
-        })
-
-      State(..state, streams:)
-    }
-  }
-}
-
-fn terminate(
-  state: State,
-  connection: tup.Connection,
-  code: Option(frame.ErrorCode),
-) -> Next {
-  case code {
-    Some(error_code) -> {
-      let _sent =
-        send_frame(
-          connection,
-          frame.Goaway(0, state.highest_client_stream_id_seen, error_code, <<>>),
-        )
-      Nil
-    }
-    None -> Nil
-  }
-
-  stop_connection(state)
-}
-
-fn send_frame(
-  connection: tup.Connection,
-  frame: frame.Frame,
-) -> Result(Nil, socket.SocketError) {
-  frame.encode(frame)
-  |> bytes_tree.from_bit_array
-  |> tup.send(connection, _)
-}
-
-fn begin_drain(state: State, connection: tup.Connection) -> Next {
-  case state.draining {
-    True -> Continue(state)
-    False -> {
-      let timer =
-        process.send_after(
-          state.drain_subject,
-          state.options.drain_timeout_ms,
-          connection.Http2Drain,
-        )
-
-      let state = State(..state, draining: True, drain_timer: Some(timer))
-      let goaway =
-        frame.Goaway(
-          0,
-          state.highest_client_stream_id_seen,
-          frame.NoError,
-          <<>>,
-        )
-
-      case send_frame(connection, goaway) {
-        Ok(Nil) -> {
-          notify_draining(state)
-          finish_or_continue(state)
-        }
-        Error(_reason) -> stop_connection(state)
-      }
-    }
-  }
-}
-
-fn notify_draining(state: State) -> Nil {
-  use _stream_id, entry <- dict.each(state.streams)
-
-  case entry.writer {
-    None -> Nil
-    Some(notify) -> process.send(notify, http2.Draining)
-  }
-}
-
-fn finish_or_continue(state: State) -> Next {
-  case state.draining && dict.size(state.streams) == 0 {
-    True -> {
-      connection.cancel_timer(state.drain_timer)
-      Close
-    }
-    False -> Continue(state)
-  }
-}
-
-fn handle_stream_reply(
-  state: State,
-  reply: http2.Reply(connection.Body),
-  connection: tup.Connection,
-) -> Next {
-  case reply {
-    http2.Respond(stream_id, response) ->
-      case unfinished_stream(state, stream_id) {
-        Error(Nil) -> Continue(state)
-        Ok(entry) -> respond(state, stream_id, entry, response, connection)
-      }
-    http2.ReadBody(stream_id, reply_to) ->
-      handle_read_body(state, stream_id, reply_to, connection)
-    http2.WriteHeaders(stream_id, ack, status, headers, mode) ->
-      handle_write_headers(
-        state,
-        stream_id,
-        ack,
-        status,
-        headers,
-        mode,
-        connection,
-      )
-    http2.PushData(stream_id, chunk) ->
-      handle_push_data(state, stream_id, chunk, connection)
-  }
-}
-
-fn handle_read_body(
-  state: State,
-  stream_id: Int,
-  reply_to: process.Subject(http2.BodyEvent),
-  connection: tup.Connection,
-) -> Next {
-  case unfinished_stream(state, stream_id) {
-    Error(Nil) -> Continue(state)
-    Ok(entry) -> {
-      let buffered = bytes_tree.to_bit_array(entry.recv_buffer)
-      case buffered, entry.request_half_closed {
-        <<>>, True -> {
-          process.send(reply_to, http2.DoneEvent(entry.trailers))
-          Continue(state)
-        }
-        <<>>, False -> {
-          let entry = Stream(..entry, parked_reader: Some(reply_to))
-          let streams = dict.insert(state.streams, stream_id, entry)
-          Continue(State(..state, streams:))
-        }
-        _buffered, True -> {
-          process.send(reply_to, http2.LastChunkEvent(buffered, entry.trailers))
-          let drained_entry = Stream(..entry, recv_buffer: bytes_tree.new())
-          let streams = dict.insert(state.streams, stream_id, drained_entry)
-          Continue(State(..state, streams:))
-        }
-        _buffered, False -> {
-          process.send(reply_to, http2.ChunkEvent(buffered))
-          let drained_entry = Stream(..entry, recv_buffer: bytes_tree.new())
-          let #(drained_entry, stream_increment) =
-            stream_recv_credit(drained_entry, state.options)
-
-          let streams = dict.insert(state.streams, stream_id, drained_entry)
-          let state = State(..state, streams:)
-
-          case stream_increment > 0 {
-            False -> Continue(state)
-            True -> {
-              let out =
-                bytes_tree.new()
-                |> append_window_update(stream_id, stream_increment)
-              case tup.send(connection, out) {
-                Ok(Nil) -> Continue(state)
-                Error(_reason) -> terminate(state, connection, None)
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-@internal
-pub fn stream_recv_credit(
-  entry: Stream,
-  options: http2.Options,
-) -> #(Stream, Int) {
-  case entry.recv_window <= options.recv_window_low_water_mark {
-    True -> {
-      let increment = options.recv_window_high_water_mark - entry.recv_window
-
-      #(
-        Stream(..entry, recv_window: options.recv_window_high_water_mark),
-        increment,
-      )
-    }
-    False -> #(entry, 0)
-  }
-}
-
-@internal
-pub fn conn_recv_credit(state: State) -> #(State, Int) {
-  case state.conn_recv_window <= state.options.recv_window_low_water_mark {
-    True -> {
-      let increment =
-        state.options.recv_window_high_water_mark - state.conn_recv_window
-
-      #(
-        State(
-          ..state,
-          conn_recv_window: state.options.recv_window_high_water_mark,
-        ),
-        increment,
-      )
-    }
-    False -> #(state, 0)
-  }
-}
-
-fn append_window_update(
-  acc: bytes_tree.BytesTree,
-  stream_id: Int,
-  increment: Int,
-) -> bytes_tree.BytesTree {
-  case increment > 0 {
-    True ->
-      frame.encode(frame.WindowUpdate(stream_id, increment))
-      |> bytes_tree.append(acc, _)
-    False -> acc
-  }
-}
-
-fn response_body_size(body: connection.Body) -> Int {
-  case body {
-    connection.Bytes(tree) -> bytes_tree.byte_size(tree)
-    connection.Text(text) -> byte_size(text)
-    connection.Empty -> 0
-    connection.File(connection.OpenFile(length:, ..))
-    | connection.File(connection.PendingFile(length:, ..)) -> length
-    connection.Streaming(_metadata)
-    | connection.Sse(_metadata)
-    | connection.Websocket(_metadata) ->
-      panic as "a streamed body is written by its own stream process"
-  }
-}
-
-@external(erlang, "erlang", "byte_size")
-fn byte_size(text: String) -> Int
-
-fn open_pending(
-  body: connection.Body,
-  file_read_threshold: Int,
-) -> Result(Pending, file.FileError) {
-  case body {
-    // TODO: remove this to_bit_array perchance?
-    connection.Bytes(tree) -> Ok(closed_chunks(bytes_tree.to_bit_array(tree)))
-    connection.Text(text) -> Ok(closed_chunks(bit_array.from_string(text)))
-    connection.Empty -> Ok(no_chunks())
-    connection.File(connection.OpenFile(handle:, offset:, length:)) ->
-      Ok(PendingFile(handle, offset, length))
-    connection.File(connection.PendingFile(path:, offset:, length:))
-      if length <= file_read_threshold
-    -> file.read_range(path, offset, length) |> result.map(closed_chunks)
-    connection.File(connection.PendingFile(path:, offset:, length:)) ->
-      file.open(path) |> result.map(PendingFile(_, offset, length))
-    connection.Streaming(_metadata)
-    | connection.Sse(_metadata)
-    | connection.Websocket(_metadata) ->
-      panic as "a streamed body is written by its own stream process"
-  }
+fn refuse_write(state: State, ack: Subject(http2.WriteAck)) -> State {
+  process.send(ack, http2.Ended)
+  state
 }
 
 fn respond(
   state: State,
   stream_id: Int,
-  entry: Stream,
-  response: Response(connection.Body),
-  connection: tup.Connection,
-) -> Next {
-  case entry.method {
-    http.Head ->
-      send_response(
-        state,
-        stream_id,
-        entry,
-        response.status,
-        response.headers,
-        head_content_length(response.body),
-        no_chunks(),
-        connection,
+  stream: Stream,
+  response: Response(Body),
+) -> State {
+  let status = response.status
+
+  case status {
+    _status if status < 200 -> {
+      logging.log(
+        logging.Error,
+        "A handler answered with informational status "
+          <> int.to_string(status)
+          <> ", which cannot end an HTTP/2 response",
       )
-    _method ->
-      case open_pending(response.body, state.options.file_read_threshold) {
-        Ok(pending) ->
+      file.release_body(response.body)
+      reset(state, stream_id, frame.InternalError)
+    }
+    204 -> no_content(state, stream_id, stream, response, Omitted)
+    304 -> no_content(state, stream_id, stream, response, Unknown)
+    _status if stream.head_request ->
+      no_content(state, stream_id, stream, response, head_length(response.body))
+    _status ->
+      case open_body(response.body, state.options.file_read_threshold) {
+        Ok(#(pieces, size, files)) ->
           send_response(
             state,
             stream_id,
-            entry,
-            response.status,
+            Stream(..stream, files:),
+            status,
             response.headers,
-            Some(response_body_size(response.body)),
-            pending,
-            connection,
+            pieces,
+            content_length(stream, status, Length(size)),
           )
-        Error(_error) ->
-          send_response(
-            state,
-            stream_id,
-            entry,
-            500,
-            [],
-            Some(0),
-            no_chunks(),
-            connection,
+        Error(_file_error) -> {
+          logging.log(
+            logging.Error,
+            "Could not open the file of an HTTP/2 response",
           )
+          send_response(state, stream_id, stream, 500, [], [], Length(0))
+        }
       }
   }
 }
 
-fn head_content_length(body: connection.Body) -> Option(Int) {
+fn content_length(
+  stream: Stream,
+  status: Int,
+  length: ContentLength,
+) -> ContentLength {
+  case stream.tunnel && status >= 200 && status < 300 {
+    True -> Omitted
+    False -> length
+  }
+}
+
+fn no_content(
+  state: State,
+  stream_id: Int,
+  stream: Stream,
+  response: Response(Body),
+  length: ContentLength,
+) -> State {
+  file.release_body(response.body)
+  send_response(
+    state,
+    stream_id,
+    stream,
+    response.status,
+    response.headers,
+    [],
+    length,
+  )
+}
+
+fn head_length(body: Body) -> ContentLength {
   case body {
-    connection.Streaming(_metadata) | connection.Sse(_metadata) -> None
-    connection.Bytes(_tree)
-    | connection.Text(_text)
-    | connection.Empty
-    | connection.File(_file)
-    | connection.Websocket(_metadata) -> Some(response_body_size(body))
+    connection.Bytes(tree) -> Length(bytes_tree.byte_size(tree))
+    connection.Text(text) -> Length(string.byte_size(text))
+    connection.Empty -> Length(0)
+    connection.File(connection.OpenFile(length:, ..))
+    | connection.File(connection.PendingFile(length:, ..)) -> Length(length)
+    connection.Streaming(_streaming)
+    | connection.Sse(_sse)
+    | connection.Websocket(_websocket) -> Unknown
+  }
+}
+
+fn open_body(
+  body: Body,
+  threshold: Int,
+) -> Result(
+  #(List(outbox.Piece), Int, List(connection.FileDescriptor)),
+  file.FileError,
+) {
+  case body {
+    connection.Bytes(tree) -> {
+      let size = bytes_tree.byte_size(tree)
+      Ok(#([outbox.Bytes(tree, size)], size, []))
+    }
+    connection.Text(text) -> {
+      let size = string.byte_size(text)
+      Ok(#([outbox.Bytes(bytes_tree.from_string(text), size)], size, []))
+    }
+    connection.Empty -> Ok(#([], 0, []))
+    connection.File(connection.OpenFile(handle:, offset:, length:)) ->
+      Ok(#([outbox.File(handle, offset, length)], length, [handle]))
+    connection.File(connection.PendingFile(path:, offset:, length:))
+      if length <= threshold
+    -> {
+      use bits <- result.map(file.read_range(path, offset, length))
+      #([outbox.bytes(bits)], length, [])
+    }
+    connection.File(connection.PendingFile(path:, offset:, length:)) -> {
+      use handle <- result.map(file.open(path))
+      #([outbox.File(handle, offset, length)], length, [handle])
+    }
+    connection.Streaming(_streaming)
+    | connection.Sse(_sse)
+    | connection.Websocket(_websocket) -> Ok(#([], 0, []))
   }
 }
 
 fn send_response(
   state: State,
   stream_id: Int,
-  entry: Stream,
+  stream: Stream,
   status: Int,
   response_headers: List(#(String, String)),
-  content_length: Option(Int),
-  pending: Pending,
-  connection: tup.Connection,
-) -> Next {
-  let fields = headers.build_response_headers(response_headers, state.patterns)
-  let content_length_fields = case status, content_length {
-    status, _length if status == 204 || { status >= 100 && status < 200 } -> []
-    _status, None -> []
-    _status, Some(length) -> [
-      alpacki.HeaderField(
-        <<"content-length":utf8>>,
-        <<int.to_string(length):utf8>>,
-        alpacki.WithoutIndexing,
-      ),
-    ]
-  }
-
-  let has_body = pending_has_bytes(pending)
-  let #(state, out) =
-    encode_head(
-      state,
-      stream_id,
-      !has_body,
-      status,
-      content_length_fields,
-      fields,
-    )
-
-  case has_body {
-    False -> {
-      let state = finish_stream(state, stream_id, entry)
-      case tup.send(connection, out) {
-        Ok(Nil) -> finish_or_continue(state)
-        Error(_reason) -> terminate(state, connection, None)
-      }
-    }
-    True -> {
-      let pending_entry = Stream(..entry, status: Flushing, pending:)
-
-      flush_stream(state, stream_id, pending_entry, out, connection)
-      |> resolve_frame_result(state, connection)
-    }
-  }
-}
-
-fn encode_head(
-  state: State,
-  stream_id: Int,
-  end_stream: Bool,
-  status: Int,
-  reserved: List(alpacki.HeaderField),
-  fields: List(alpacki.HeaderField),
-) -> #(State, bytes_tree.BytesTree) {
-  let header_fields = [
-    alpacki.HeaderField(
-      <<":status":utf8>>,
-      <<int.to_string(status):utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-    alpacki.HeaderField(<<"date":utf8>>, clock.get(), alpacki.WithoutIndexing),
-    ..list.append(reserved, list.reverse(fields))
-  ]
-
-  let #(block, hpack_encoder) =
-    alpacki.encode_header_block(header_fields, state.hpack_encoder, True)
-
-  let out =
-    bytes_tree.new()
-    |> append_header_frames(
-      stream_id,
-      end_stream,
-      block,
-      state.peer_settings.max_frame_size,
-    )
-
-  #(State(..state, hpack_encoder:), out)
-}
-
-fn drop_sse_headers(
-  headers: List(#(String, String)),
-) -> List(#(String, String)) {
-  use #(name, _value) <- list.filter(headers)
-  name != "content-type" && name != "cache-control"
-}
-
-fn sse_fields() -> List(alpacki.HeaderField) {
-  [
-    alpacki.HeaderField(
-      <<"content-type":utf8>>,
-      <<"text/event-stream":utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-    alpacki.HeaderField(
-      <<"cache-control":utf8>>,
-      <<"no-cache":utf8>>,
-      alpacki.WithoutIndexing,
-    ),
-  ]
-}
-
-fn handle_write_headers(
-  state: State,
-  stream_id: Int,
-  ack: process.Subject(http2.WriteAck),
-  status: Int,
-  response_headers: List(#(String, String)),
-  mode: http2.ResponseMode,
-  connection: tup.Connection,
-) -> Next {
-  case unfinished_stream(state, stream_id) {
-    Error(Nil) -> Continue(state)
-    Ok(entry) -> {
-      let response_headers = case mode {
-        http2.PlainStream | http2.WebsocketStream(..) -> response_headers
-        http2.EventStream(..) -> drop_sse_headers(response_headers)
-      }
-      let fields =
-        headers.build_response_headers(response_headers, state.patterns)
-      let reserved_fields = case mode {
-        http2.PlainStream | http2.WebsocketStream(..) -> []
-        http2.EventStream(..) -> sse_fields()
-      }
-
-      let #(state, out) =
-        encode_head(state, stream_id, False, status, reserved_fields, fields)
-
-      case tup.send(connection, out) {
-        Ok(Nil) -> {
-          process.send(ack, http2.WriteAck)
-          Continue(register_writer(state, stream_id, entry, mode))
-        }
-        Error(_reason) -> terminate(state, connection, None)
-      }
-    }
-  }
-}
-
-fn register_writer(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  mode: http2.ResponseMode,
+  pieces: List(outbox.Piece),
+  length: ContentLength,
 ) -> State {
-  case mode {
-    http2.PlainStream -> state
-    http2.EventStream(notify:) | http2.WebsocketStream(notify:) -> {
-      let entry = Stream(..entry, writer: Some(notify))
+  case response_fields(status, response_headers, length, clock.get()) {
+    Error(UnsafeHeader(name)) -> {
+      log_unsafe_header(name)
 
-      State(..state, streams: dict.insert(state.streams, stream_id, entry))
+      state
+      |> close_files(stream.files)
+      |> send_response(
+        stream_id,
+        Stream(..stream, files: []),
+        500,
+        [],
+        [],
+        Length(0),
+      )
     }
-  }
-}
+    Ok(fields) -> {
+      let outbox =
+        list.fold(pieces, outbox.new(), outbox.push)
+        |> outbox.finish
 
-fn handle_push_data(
-  state: State,
-  stream_id: Int,
-  chunk: http2.Chunk,
-  connection: tup.Connection,
-) -> Next {
-  case unfinished_stream(state, stream_id) {
-    Error(Nil) -> Continue(state)
-    Ok(entry) -> {
-      let over_limit = over_send_buffer_limit(entry, state.options)
-
-      case push_chunk(entry.pending, chunk) {
-        Error(Nil) -> {
-          logging.log(
-            logging.Error,
-            "Dropped a queued write; the stream is already sending a file",
-          )
-
-          Continue(state)
-        }
-        Ok(_pending) if over_limit -> {
-          logging.log(
-            logging.Error,
-            "Reset a stream; it kept writing while over send_buffer_limit",
-          )
-
-          reject_stream(connection, state, stream_id, frame.InternalError)
-        }
-        Ok(pending) ->
-          Stream(..entry, pending:)
-          |> flush_stream(state, stream_id, _, bytes_tree.new(), connection)
-          |> resolve_frame_result(state, connection)
+      case outbox.size(outbox) {
+        0 ->
+          state
+          |> emit_headers(stream_id, fields, True)
+          |> close_files(stream.files)
+          |> settle(stream_id, Stream(..stream, outbound: Responded, files: []))
+        _size ->
+          state
+          |> emit_headers(stream_id, fields, False)
+          |> send_now(stream_id, Stream(..stream, outbound: Responding(outbox)))
       }
     }
   }
 }
 
-@internal
-pub fn over_send_buffer_limit(entry: Stream, options: http2.Options) -> Bool {
-  case entry.writer {
-    None -> False
-    Some(_notify) -> queued_bytes(entry.pending) > options.send_buffer_limit
-  }
-}
-
-fn resolve_frame_result(
-  result: FrameResult,
+fn start_streaming(
   state: State,
-  connection: tup.Connection,
-) -> Next {
-  case result {
-    Proceed(state) -> finish_or_continue(state)
-    ProceedWithOutbound(state, out) ->
-      case tup.send(connection, out) {
-        Ok(Nil) -> finish_or_continue(state)
-        Error(_reason) -> terminate(state, connection, None)
+  stream_id: Int,
+  stream: Stream,
+  status: Int,
+  response_headers: List(#(String, String)),
+  signals: Option(Subject(http2.StreamSignal)),
+  ack: Subject(http2.WriteAck),
+) -> State {
+  let length = content_length(stream, status, Unknown)
+
+  case response_fields(status, response_headers, length, clock.get()) {
+    Error(UnsafeHeader(name)) -> {
+      log_unsafe_header(name)
+
+      refuse_write(state, ack)
+      |> reset(stream_id, frame.InternalError)
+    }
+    Ok(fields) -> {
+      process.send(ack, http2.Written)
+
+      case state.lifecycle, signals {
+        Serving, _signals | _lifecycle, None -> Nil
+        _lifecycle, Some(signals) -> process.send(signals, http2.Draining)
       }
-    RejectStream(state, stream_id, code) ->
-      reject_stream(connection, state, stream_id, code)
-    Terminate(code) -> terminate(state, connection, code)
+
+      state
+      |> emit_headers(stream_id, fields, False)
+      |> settle(
+        stream_id,
+        Stream(..stream, outbound: Responding(outbox.new()), signals:),
+      )
+    }
   }
 }
 
-@internal
-pub fn append_header_frames(
-  acc: bytes_tree.BytesTree,
-  stream_id: Int,
-  end_stream: Bool,
-  block: BitArray,
-  max_frame_size: Int,
-) -> bytes_tree.BytesTree {
-  case block {
-    <<chunk:bytes-size(max_frame_size), remaining:bits>> if remaining != <<>> ->
-      frame.encode(frame.Headers(stream_id, end_stream, False, chunk))
-      |> bytes_tree.append(acc, _)
-      |> append_continuation_frames(stream_id, remaining, max_frame_size)
-    _block ->
-      frame.encode(frame.Headers(stream_id, end_stream, True, block))
-      |> bytes_tree.append(acc, _)
-  }
-}
-
-fn append_continuation_frames(
-  acc: bytes_tree.BytesTree,
-  stream_id: Int,
-  block: BitArray,
-  max_frame_size: Int,
-) -> bytes_tree.BytesTree {
-  case block {
-    <<chunk:bytes-size(max_frame_size), remaining:bits>> if remaining != <<>> ->
-      frame.encode(frame.Continuation(stream_id, False, chunk))
-      |> bytes_tree.append(acc, _)
-      |> append_continuation_frames(stream_id, remaining, max_frame_size)
-    _block ->
-      frame.encode(frame.Continuation(stream_id, True, block))
-      |> bytes_tree.append(acc, _)
-  }
-}
-
-@internal
-pub type FlushOutcome {
-  FlushAccumulated(state: State, out: bytes_tree.BytesTree, wrote: Bool)
-  FlushFileChunk(
-    state: State,
-    out: bytes_tree.BytesTree,
-    stream_id: Int,
-    entry: Stream,
-    descriptor: connection.FileDescriptor,
-    offset: Int,
-    remaining: Int,
-    chunk_size: Int,
+fn log_unsafe_header(name: String) -> Nil {
+  logging.log(
+    logging.Error,
+    "Handler produced an unsafe response header: " <> name,
   )
 }
 
-@internal
-pub fn do_flush_stream(
+fn queue_data(
   state: State,
   stream_id: Int,
-  entry: Stream,
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-) -> FlushOutcome {
-  case entry.pending {
-    PendingChunks(..) -> flush_chunks(state, stream_id, entry, out, wrote)
-    PendingFile(descriptor, _offset, 0) -> {
-      file.close(descriptor)
-
-      finish_stream(state, stream_id, entry)
-      |> FlushAccumulated(out, wrote)
-    }
-    PendingFile(descriptor, offset, remaining) -> {
-      let allowed =
-        int.min(state.conn_send_window, entry.send_window)
-        |> int.min(state.peer_settings.max_frame_size)
-
-      case allowed <= 0 {
-        True -> park_stream(state, stream_id, entry, out, wrote)
-        False -> {
-          let chunk_size = int.min(allowed, remaining)
-          let out =
-            frame.encode_data_header(
-              stream_id,
-              chunk_size == remaining,
-              chunk_size,
-            )
-            |> bytes_tree.append(out, _)
-
-          FlushFileChunk(
-            state,
-            out,
-            stream_id,
-            entry,
-            descriptor,
-            offset,
-            remaining,
-            chunk_size,
-          )
-        }
-      }
-    }
-  }
-}
-
-fn flush_chunks(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-) -> FlushOutcome {
-  case peek_chunk(entry.pending) {
-    Error(Nil) -> park_stream(state, stream_id, entry, out, wrote)
-    Ok(http2.Chunk(bytes:, ack:)) ->
-      flush_bytes(state, stream_id, entry, bytes, ack, False, out, wrote)
-    Ok(http2.Finish(bytes:, ack:)) ->
-      flush_bytes(state, stream_id, entry, bytes, ack, True, out, wrote)
-  }
-}
-
-fn flush_bytes(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  bytes: BitArray,
-  ack: Option(process.Subject(http2.WriteAck)),
+  stream: Stream,
+  outbox: Outbox,
+  data: BitArray,
   end_stream: Bool,
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-) -> FlushOutcome {
-  let allowed =
-    int.min(state.conn_send_window, entry.send_window)
-    |> int.min(state.peer_settings.max_frame_size)
-
-  case allowed <= 0 && bytes != <<>> {
-    True -> park_stream(state, stream_id, entry, out, wrote)
-    False ->
-      case bytes {
-        <<chunk:bytes-size(allowed), remaining:bits>> if remaining != <<>> -> {
-          let out =
-            frame.encode_data_header(stream_id, False, allowed)
-            |> bytes_tree.append(out, _)
-            |> bytes_tree.append(chunk)
-
-          let entry =
-            Stream(
-              ..entry,
-              send_window: entry.send_window - allowed,
-              pending: keep_chunk(
-                entry.pending,
-                partial_chunk(remaining, ack, end_stream),
-                allowed,
-              ),
-            )
-
-          let state =
-            State(..state, conn_send_window: state.conn_send_window - allowed)
-
-          do_flush_stream(state, stream_id, entry, out, True)
-        }
-        _bytes -> {
-          let sent = bit_array.byte_size(bytes)
-          let out =
-            frame.encode_data_header(stream_id, end_stream, sent)
-            |> bytes_tree.append(out, _)
-            |> bytes_tree.append(bytes)
-
-          acknowledge(ack)
-
-          let state =
-            State(..state, conn_send_window: state.conn_send_window - sent)
-
-          case end_stream {
-            True ->
-              finish_stream(state, stream_id, entry)
-              |> FlushAccumulated(out, True)
-            False ->
-              Stream(
-                ..entry,
-                send_window: entry.send_window - sent,
-                pending: drop_chunk(entry.pending),
-              )
-              |> do_flush_stream(state, stream_id, _, out, True)
-          }
-        }
-      }
+  ack: Subject(http2.WriteAck),
+) -> State {
+  let outbox = outbox.push(outbox, outbox.bytes(data))
+  let outbox = case end_stream {
+    True -> outbox.finish(outbox)
+    False -> outbox
   }
+
+  Stream(..stream, outbound: Responding(outbox), held_ack: Some(ack))
+  |> release_ack(state.options)
+  |> send_now(state, stream_id, _)
 }
 
-fn partial_chunk(
-  bytes: BitArray,
-  ack: Option(process.Subject(http2.WriteAck)),
-  end_stream: Bool,
-) -> http2.Chunk {
-  case end_stream {
-    True -> http2.Finish(bytes, ack)
-    False -> http2.Chunk(bytes, ack)
+fn release_ack(stream: Stream, options: http2.Options) -> Stream {
+  let queued = case stream.outbound {
+    Responding(outbox) -> outbox.size(outbox)
+    AwaitingResponse | Responded -> 0
   }
-}
 
-fn park_stream(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-) -> FlushOutcome {
-  State(..state, streams: dict.insert(state.streams, stream_id, entry))
-  |> FlushAccumulated(out, wrote)
-}
-
-fn queued_bytes(pending: Pending) -> Int {
-  case pending {
-    PendingChunks(bytes:, ..) -> bytes
-    PendingFile(..) -> 0
-  }
-}
-
-fn acknowledge(ack: Option(process.Subject(http2.WriteAck))) -> Nil {
-  case ack {
-    Some(reply_to) -> process.send(reply_to, http2.WriteAck)
-    None -> Nil
-  }
-}
-
-fn send_if_any(
-  connection: tup.Connection,
-  state: State,
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-) -> FrameResult {
-  case wrote {
-    False -> Proceed(state)
-    True ->
-      case tup.send(connection, out) {
-        Ok(Nil) -> Proceed(state)
-        Error(_reason) -> Terminate(None)
-      }
-  }
-}
-
-fn flush_many(
-  state: State,
-  streams: List(#(Int, Stream)),
-  out: bytes_tree.BytesTree,
-  wrote: Bool,
-  connection: tup.Connection,
-) -> FrameResult {
-  case streams {
-    [] -> send_if_any(connection, state, out, wrote)
-    [#(stream_id, entry), ..remaining] ->
-      case do_flush_stream(state, stream_id, entry, out, wrote) {
-        FlushAccumulated(state, out, wrote) ->
-          flush_many(state, remaining, out, wrote, connection)
-        FlushFileChunk(
-          state,
-          out,
-          stream_id,
-          entry,
-          descriptor,
-          offset,
-          file_remaining,
-          chunk_size,
-        ) ->
-          send_file_chunk(
-            state,
-            stream_id,
-            entry,
-            out,
-            File(descriptor:, offset:, remaining: file_remaining),
-            chunk_size,
-            remaining,
-            connection,
-          )
-      }
-  }
-}
-
-type File {
-  File(descriptor: connection.FileDescriptor, offset: Int, remaining: Int)
-}
-
-fn send_file_chunk(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  out: bytes_tree.BytesTree,
-  file: File,
-  chunk_size: Int,
-  rest: List(#(Int, Stream)),
-  connection: tup.Connection,
-) -> FrameResult {
-  let File(descriptor:, offset:, remaining:) = file
-
-  case tup.send(connection, out) {
-    Error(_reason) -> {
-      file.close(descriptor)
-      Terminate(None)
+  case stream.held_ack {
+    Some(ack) if queued <= options.send_buffer_limit -> {
+      process.send(ack, http2.Written)
+      Stream(..stream, held_ack: None)
     }
-    Ok(Nil) -> {
-      let #(transport, socket) = tup.socket(connection)
-
-      case file.send_chunk(transport, socket, descriptor, offset, chunk_size) {
-        Error(_reason) -> {
-          file.close(descriptor)
-          Terminate(None)
-        }
-        Ok(Nil) -> {
-          let state =
-            State(
-              ..state,
-              conn_send_window: state.conn_send_window - chunk_size,
-            )
-
-          case chunk_size == remaining {
-            True -> {
-              file.close(descriptor)
-
-              finish_stream(state, stream_id, entry)
-              |> flush_many(rest, bytes_tree.new(), False, connection)
-            }
-            False -> {
-              let entry =
-                Stream(
-                  ..entry,
-                  send_window: entry.send_window - chunk_size,
-                  pending: PendingFile(
-                    descriptor,
-                    offset + chunk_size,
-                    remaining - chunk_size,
-                  ),
-                )
-
-              flush_many(
-                state,
-                [#(stream_id, entry), ..rest],
-                bytes_tree.new(),
-                False,
-                connection,
-              )
-            }
-          }
-        }
-      }
-    }
+    Some(_ack) | None -> stream
   }
 }
 
-@internal
-pub fn flush_stream(
-  state: State,
-  stream_id: Int,
-  entry: Stream,
-  out: bytes_tree.BytesTree,
-  connection: tup.Connection,
-) -> FrameResult {
-  flush_many(state, [#(stream_id, entry)], out, False, connection)
-}
-
-@internal
-pub fn no_chunks() -> Pending {
-  PendingChunks([], [], 0)
-}
-
-@internal
-pub fn closed_chunks(bytes: BitArray) -> Pending {
-  case bytes {
-    <<>> -> no_chunks()
-    bytes ->
-      PendingChunks([http2.Finish(bytes, None)], [], bit_array.byte_size(bytes))
-  }
-}
-
-fn chunk_byte_size(chunk: http2.Chunk) -> Int {
-  case chunk {
-    http2.Chunk(bytes:, ..) | http2.Finish(bytes:, ..) ->
-      bit_array.byte_size(bytes)
-  }
-}
-
-@internal
-pub fn push_chunk(
-  pending: Pending,
-  chunk: http2.Chunk,
-) -> Result(Pending, Nil) {
-  case pending {
-    PendingChunks(front: [], bytes:, ..) ->
-      Ok(PendingChunks([chunk], [], bytes + chunk_byte_size(chunk)))
-    PendingChunks(front:, back:, bytes:) ->
-      Ok(PendingChunks(
-        front:,
-        back: [chunk, ..back],
-        bytes: bytes + chunk_byte_size(chunk),
-      ))
-    PendingFile(..) -> Error(Nil)
-  }
-}
-
-fn peek_chunk(pending: Pending) -> Result(http2.Chunk, Nil) {
-  case pending {
-    PendingChunks(front: [chunk, ..], ..) -> Ok(chunk)
-    PendingChunks(front: [], ..) -> Error(Nil)
-    PendingFile(..) -> Error(Nil)
-  }
-}
-
-fn drop_chunk(pending: Pending) -> Pending {
-  case pending {
-    PendingChunks(front: [chunk], back:, bytes:) ->
-      PendingChunks(list.reverse(back), [], bytes - chunk_byte_size(chunk))
-    PendingChunks(front: [chunk, ..remaining], back:, bytes:) ->
-      PendingChunks(remaining, back, bytes - chunk_byte_size(chunk))
-    PendingChunks(front: [], ..) -> pending
-    PendingFile(..) -> pending
-  }
-}
-
-fn keep_chunk(pending: Pending, chunk: http2.Chunk, written: Int) -> Pending {
-  case pending {
-    PendingChunks(front: [_drained, ..remaining], back:, bytes:) ->
-      PendingChunks([chunk, ..remaining], back, bytes - written)
-    PendingChunks(front: [], ..) -> pending
-    PendingFile(..) -> pending
-  }
-}
-
-fn has_pending(entry: Stream) -> Bool {
-  case entry.pending {
-    PendingChunks(front: [], ..) -> False
-    PendingChunks(..) -> True
-    PendingFile(_descriptor, _offset, remaining) -> remaining > 0
-  }
-}
-
-fn pending_has_bytes(pending: Pending) -> Bool {
-  case pending {
-    PendingChunks(bytes:, ..) -> bytes > 0
-    PendingFile(_descriptor, _offset, remaining) -> remaining > 0
-  }
-}
-
-fn handle_window_update(
-  state: State,
-  stream_id: Int,
-  increment: Int,
-  connection: tup.Connection,
-) -> FrameResult {
-  case increment > 0, stream_id {
-    False, 0 -> Terminate(Some(frame.ProtocolError))
-    False, _stream_id -> RejectStream(state, stream_id, frame.ProtocolError)
-    True, 0 -> connection_window_update(state, increment, connection)
-    True, _stream_id ->
-      stream_window_update(state, stream_id, increment, connection)
-  }
-}
-
-fn connection_window_update(
-  state: State,
-  increment: Int,
-  connection: tup.Connection,
-) -> FrameResult {
-  let new_window = state.conn_send_window + increment
-
-  case new_window > max_window_size {
-    True -> Terminate(Some(frame.FlowControlError))
-    False ->
-      flush_pending_streams(
-        State(..state, conn_send_window: new_window),
-        connection,
-      )
-  }
-}
-
-fn stream_window_update(
-  state: State,
-  stream_id: Int,
-  increment: Int,
-  connection: tup.Connection,
-) -> FrameResult {
-  case
-    dict.get(state.streams, stream_id),
-    stream_id > state.highest_client_stream_id_seen
-  {
-    Error(Nil), True -> Terminate(Some(frame.ProtocolError))
-    Error(Nil), False -> Proceed(state)
-    Ok(entry), _is_new_stream -> {
-      let new_window = entry.send_window + increment
-
-      case new_window > max_window_size {
-        True -> RejectStream(state, stream_id, frame.FlowControlError)
-        False -> {
-          let entry = Stream(..entry, send_window: new_window)
-
-          case entry.status, has_pending(entry) {
-            Computing(_pid), False | Finished, _has_pending -> {
-              let streams = dict.insert(state.streams, stream_id, entry)
-              Proceed(State(..state, streams:))
-            }
-            Computing(_pid), True | Flushing, _has_pending ->
-              flush_stream(
-                state,
-                stream_id,
-                entry,
-                bytes_tree.new(),
-                connection,
-              )
-          }
-        }
-      }
-    }
-  }
-}
-
-fn flush_pending_streams(
-  state: State,
-  connection: tup.Connection,
-) -> FrameResult {
-  case rotated_pending(state) {
-    [] -> Proceed(state)
-    [#(first, _entry), ..] as pending ->
-      State(..state, flush_cursor: first)
-      |> flush_many(pending, bytes_tree.new(), False, connection)
-  }
-}
-
-@internal
-pub fn rotated_pending(state: State) -> List(#(Int, Stream)) {
-  let #(after, before) =
-    dict.filter(state.streams, fn(_stream_id, entry) { has_pending(entry) })
-    |> dict.to_list
-    |> list.sort(fn(one, other) { int.compare(one.0, other.0) })
-    |> list.partition(fn(entry) { entry.0 > state.flush_cursor })
-
-  list.append(after, before)
-}
-
-fn handle_stream_exit(
-  state: State,
-  exit: process.ExitMessage,
-  connection: tup.Connection,
-) -> Next {
+fn handle_exit(state: State, exit: process.ExitMessage) -> Result(State, Halt) {
   case state.parent == Ok(exit.pid), exit.reason {
     True, process.Abnormal(reason) ->
       case http2.is_shutdown(reason) {
-        True -> begin_drain(state, connection)
-        False -> stop_connection(state)
+        True -> Ok(begin_shutdown(state))
+        False -> Error(Quit(state))
       }
-    True, process.Normal | True, process.Killed -> stop_connection(state)
-    False, _reason -> handle_child_exit(state, exit.pid, connection)
+    True, process.Normal | True, process.Killed -> Error(Quit(state))
+    False, _reason -> Ok(worker_exited(state, exit.pid))
   }
 }
 
-fn handle_child_exit(
-  state: State,
-  pid: process.Pid,
-  connection: tup.Connection,
-) -> Next {
-  case dict.get(state.stream_pids, pid) {
-    Error(Nil) -> finish_or_continue(state)
-    Ok(stream_id) ->
+fn worker_exited(state: State, pid: Pid) -> State {
+  case dict.get(state.workers, pid) {
+    Error(Nil) -> state
+    Ok(stream_id) -> {
+      let state = State(..state, workers: dict.delete(state.workers, pid))
+
       case dict.get(state.streams, stream_id) {
-        Ok(Stream(status: Computing(stream_pid), ..) as entry)
-          if stream_pid == pid
-        ->
-          remove_stream(state, stream_id, entry)
-          |> reject_stream(connection, _, stream_id, frame.InternalError)
-        _entry -> finish_or_continue(clear_stream_pid(state, pid))
+        Ok(Stream(worker: Some(worker), ..) as stream) if worker == pid -> {
+          let stream =
+            Stream(..stream, worker: None, held_ack: None, signals: None)
+          let unfinished = case stream.outbound {
+            AwaitingResponse -> True
+            Responding(outbox) -> !outbox.is_finished(outbox)
+            Responded -> False
+          }
+
+          case unfinished, stream.tunnel {
+            True, True -> abort(state, stream_id, stream, frame.Cancel)
+            True, False -> abort(state, stream_id, stream, frame.InternalError)
+            False, _tunnel -> settle(state, stream_id, stream)
+          }
+        }
+        Ok(_stream) | Error(Nil) -> state
+      }
+    }
+  }
+}
+
+fn abort(
+  state: State,
+  stream_id: Int,
+  stream: Stream,
+  error: ErrorCode,
+) -> State {
+  State(..state, streams: dict.insert(state.streams, stream_id, stream))
+  |> reset(stream_id, error)
+}
+
+fn kill_worker(state: State, pid: Pid) -> State {
+  case dict.has_key(state.workers, pid) {
+    True -> process.kill(pid)
+    False -> Nil
+  }
+  state
+}
+
+fn schedule(state: State, stream_id: Int, stream: Stream) -> State {
+  let sendable = case stream.outbound {
+    Responding(outbox) ->
+      case outbox.size(outbox) {
+        0 -> outbox.is_finished(outbox)
+        _size -> stream.send_window > 0
+      }
+    AwaitingResponse | Responded -> False
+  }
+
+  case sendable && !stream.scheduled {
+    True ->
+      State(
+        ..state,
+        ready: queue.push(state.ready, stream_id),
+        streams: dict.insert(
+          state.streams,
+          stream_id,
+          Stream(..stream, scheduled: True),
+        ),
+      )
+    False -> settle(state, stream_id, stream)
+  }
+}
+
+fn send_now(state: State, stream_id: Int, stream: Stream) -> State {
+  case queue.is_empty(state.ready), stream.outbound {
+    True, Responding(outbox) ->
+      case send_data(state, stream_id, stream, outbox) {
+        Sent(state, _size) -> state
+        ConnectionBlocked | StreamBlocked -> schedule(state, stream_id, stream)
+      }
+    _ready, _outbound -> schedule(state, stream_id, stream)
+  }
+}
+
+fn transmit(state: State, budget: Int) -> State {
+  case budget <= 0, queue.pop(state.ready) {
+    _exhausted, Error(Nil) -> state
+    True, Ok(_ready) -> resume_later(state)
+    False, Ok(#(stream_id, ready)) -> {
+      let state = State(..state, ready:)
+
+      case dict.get(state.streams, stream_id) {
+        Ok(Stream(outbound: Responding(outbox), ..) as stream) -> {
+          let stream = Stream(..stream, scheduled: False)
+
+          case send_data(state, stream_id, stream, outbox) {
+            Sent(state, size) -> transmit(state, budget - size)
+            ConnectionBlocked ->
+              State(
+                ..state,
+                ready: queue.push_front(state.ready, stream_id),
+                streams: dict.insert(
+                  state.streams,
+                  stream_id,
+                  Stream(..stream, scheduled: True),
+                ),
+              )
+            StreamBlocked ->
+              State(
+                ..state,
+                streams: dict.insert(state.streams, stream_id, stream),
+              )
+              |> transmit(budget)
+          }
+        }
+        Ok(_stream) | Error(Nil) -> transmit(state, budget)
+      }
+    }
+  }
+}
+
+type Transmitted {
+  Sent(State, size: Int)
+  ConnectionBlocked
+  StreamBlocked
+}
+
+fn send_data(
+  state: State,
+  stream_id: Int,
+  stream: Stream,
+  outbox: Outbox,
+) -> Transmitted {
+  let limit =
+    state.send_window
+    |> int.min(stream.send_window)
+    |> int.min(state.peer_max_frame_size)
+
+  case outbox.size(outbox), outbox.is_finished(outbox) {
+    0, True ->
+      state
+      |> emit(frame.data_header(stream_id, True, 0))
+      |> finish_response(stream_id, stream)
+      |> Sent(0)
+    0, False -> StreamBlocked
+    _size, _finished if stream.send_window <= 0 -> StreamBlocked
+    _size, _finished if limit <= 0 -> ConnectionBlocked
+    _size, _finished ->
+      case outbox.take(outbox, limit, file.read) {
+        Error(_file_error) -> {
+          logging.log(
+            logging.Error,
+            "Could not read the file of an HTTP/2 response",
+          )
+          Sent(abort(state, stream_id, stream, frame.InternalError), 0)
+        }
+        Ok(#(piece, last, outbox)) -> {
+          let size = outbox.piece_size(piece)
+          let state =
+            State(..state, send_window: state.send_window - size)
+            |> emit(frame.data_header(stream_id, last, size))
+            |> emit_piece(piece)
+          let stream =
+            Stream(
+              ..stream,
+              outbound: Responding(outbox),
+              send_window: stream.send_window - size,
+            )
+            |> release_ack(state.options)
+
+          case last {
+            True -> finish_response(state, stream_id, stream)
+            False -> schedule(state, stream_id, stream)
+          }
+          |> Sent(size)
+        }
       }
   }
 }
 
-@internal
-pub fn test_state() -> State {
-  let options = http2.default_options()
-
-  State(
-    buffer: <<>>,
-    handshake: Connected,
-    peer_settings: default_peer_settings,
-    timer: None,
-    hpack_decoder: alpacki.new_dynamic(options.header_table_size),
-    hpack_encoder: alpacki.new_dynamic(options.header_table_size),
-    header_assembly: None,
-    reply_subject: process.new_subject(),
-    handler: connection.Handler(
-      call: fn(_request) {
-        response.new(200) |> response.set_body(connection.Empty)
-      },
-      on_crash: response.new(500) |> response.set_body(connection.Empty),
-    ),
-    streams: dict.new(),
-    conn_send_window: default_send_window,
-    conn_recv_window: default_send_window,
-    stream_pids: dict.new(),
-    reset_window_start: 0,
-    reset_count: 0,
-    highest_client_stream_id_seen: 0,
-    flush_cursor: 0,
-    draining: False,
-    drain_subject: process.new_subject(),
-    drain_timer: None,
-    options:,
-    settings_frame: build_settings_frame(options),
-    patterns: headers.header_patterns(),
-    peer: tup.TcpEndpoint(tup.Ipv4(127, 0, 0, 1), 0),
-    parent: Error(Nil),
+fn finish_response(state: State, stream_id: Int, stream: Stream) -> State {
+  state
+  |> close_files(stream.files)
+  |> settle(
+    stream_id,
+    Stream(..stream, outbound: Responded, files: [], held_ack: None),
   )
 }
+
+fn hold_output(state: State) -> Bool {
+  state.output_size > 0
+  && state.output_size < cork_limit
+  && message_queue_length() > 0
+}
+
+fn resume_later(state: State) -> State {
+  case state.resuming {
+    True -> state
+    False -> {
+      process.send(state.self, connection.Http2Resume)
+      State(..state, resuming: True)
+    }
+  }
+}
+
+pub type ContentLength {
+  Length(Int)
+  Unknown
+  Omitted
+}
+
+pub type UnsafeHeader {
+  UnsafeHeader(name: String)
+}
+
+pub fn response_fields(
+  status: Int,
+  headers: List(#(String, String)),
+  content_length: ContentLength,
+  date: BitArray,
+) -> Result(List(alpacki.HeaderField), UnsafeHeader) {
+  use fields <- result.map(
+    list.try_fold(headers, [], fn(fields, header) {
+      case header.0, content_length {
+        ":" <> _name, _length
+        | "connection", _length
+        | "keep-alive", _length
+        | "proxy-connection", _length
+        | "transfer-encoding", _length
+        | "upgrade", _length
+        | "te", _length
+        | "date", _length
+        | "content-length", Length(_length)
+        | "content-length", Omitted
+        -> Ok(fields)
+        name, _length ->
+          case
+            find_unsafe_header_byte(name),
+            find_unsafe_header_byte(header.1)
+          {
+            Error(Nil), Error(Nil) ->
+              Ok([response_field(name, header.1), ..fields])
+            _name, _value -> Error(UnsafeHeader(name))
+          }
+      }
+    }),
+  )
+
+  let fields = list.reverse(fields)
+
+  let fields = case content_length {
+    Length(length) -> [
+      response_field("content-length", int.to_string(length)),
+      ..fields
+    ]
+    Unknown | Omitted -> fields
+  }
+
+  [
+    response_field(":status", int.to_string(status)),
+    alpacki.HeaderField(<<"date":utf8>>, date, alpacki.WithIndexing),
+    ..fields
+  ]
+}
+
+fn response_field(name: String, value: String) -> alpacki.HeaderField {
+  let indexing = case name {
+    ":status"
+    | "accept-ranges"
+    | "access-control-allow-credentials"
+    | "access-control-allow-headers"
+    | "access-control-allow-methods"
+    | "access-control-allow-origin"
+    | "access-control-expose-headers"
+    | "access-control-max-age"
+    | "allow"
+    | "cache-control"
+    | "content-encoding"
+    | "content-language"
+    | "content-security-policy"
+    | "content-type"
+    | "cross-origin-embedder-policy"
+    | "cross-origin-opener-policy"
+    | "cross-origin-resource-policy"
+    | "link"
+    | "location"
+    | "permissions-policy"
+    | "referrer-policy"
+    | "server"
+    | "strict-transport-security"
+    | "trailer"
+    | "vary"
+    | "x-content-type-options"
+    | "x-frame-options"
+    | "x-xss-protection" -> alpacki.WithIndexing
+    "set-cookie" -> alpacki.NeverIndexed
+    _name -> alpacki.WithoutIndexing
+  }
+
+  alpacki.HeaderField(<<name:utf8>>, <<value:utf8>>, indexing)
+}
+
+@external(erlang, "ewe_ffi", "find_unsafe_header_byte")
+fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
+
+fn emit_headers(
+  state: State,
+  stream_id: Int,
+  fields: List(alpacki.HeaderField),
+  end_stream: Bool,
+) -> State {
+  let #(block, encoder) =
+    alpacki.encode_header_block(fields, state.encoder, True)
+  let max_frame_size = state.peer_max_frame_size
+
+  let frames = case block {
+    <<fragment:bytes-size(max_frame_size), rest:bits>> if rest != <<>> -> <<
+      frame.encode(frame.Headers(
+        stream_id:,
+        end_stream:,
+        end_headers: False,
+        dependency: None,
+        fragment:,
+      )):bits,
+      continuation_frames(stream_id, rest, max_frame_size):bits,
+    >>
+    _block ->
+      frame.encode(frame.Headers(
+        stream_id:,
+        end_stream:,
+        end_headers: True,
+        dependency: None,
+        fragment: block,
+      ))
+  }
+
+  emit(State(..state, encoder:), frames)
+}
+
+fn continuation_frames(
+  stream_id: Int,
+  block: BitArray,
+  max_frame_size: Int,
+) -> BitArray {
+  case block {
+    <<fragment:bytes-size(max_frame_size), rest:bits>> if rest != <<>> -> <<
+      frame.encode(frame.Continuation(stream_id:, end_headers: False, fragment:)):bits,
+      continuation_frames(stream_id, rest, max_frame_size):bits,
+    >>
+    _block ->
+      frame.encode(frame.Continuation(
+        stream_id:,
+        end_headers: True,
+        fragment: block,
+      ))
+  }
+}
+
+fn emit(state: State, bits: BitArray) -> State {
+  let output = case state.output {
+    [Frames(frames), ..output] -> [
+      Frames(bytes_tree.append(frames, bits)),
+      ..output
+    ]
+    output -> [Frames(bytes_tree.from_bit_array(bits)), ..output]
+  }
+
+  State(
+    ..state,
+    output:,
+    output_size: state.output_size + bit_array.byte_size(bits),
+  )
+}
+
+fn emit_piece(state: State, piece: outbox.Piece) -> State {
+  let #(output, size) = case piece, state.output {
+    outbox.Bytes(bytes:, size:), [Frames(frames), ..output] -> #(
+      [Frames(bytes_tree.append_tree(frames, bytes)), ..output],
+      size,
+    )
+    outbox.Bytes(bytes:, size:), output -> #([Frames(bytes), ..output], size)
+    outbox.File(descriptor:, offset:, length:), output -> #(
+      [SendFile(descriptor:, offset:, length:), ..output],
+      length,
+    )
+  }
+
+  State(..state, output:, output_size: state.output_size + size)
+}
+
+fn close_files(state: State, files: List(connection.FileDescriptor)) -> State {
+  let output =
+    list.fold(files, state.output, fn(output, descriptor) {
+      [CloseFile(descriptor), ..output]
+    })
+
+  State(..state, output:)
+}
+
+fn write(state: State, connection: tup.Connection) -> Result(State, Nil) {
+  let #(transport, socket) = tup.socket(connection)
+
+  list.reverse(state.output)
+  |> list.try_each(fn(segment) {
+    case segment {
+      Frames(frames) ->
+        tup.send(connection, frames) |> result.replace_error(Nil)
+      SendFile(descriptor:, offset:, length:) ->
+        file.send_chunk(transport, socket, descriptor, offset, length)
+        |> result.replace_error(Nil)
+      CloseFile(descriptor) -> Ok(file.close(descriptor))
+    }
+  })
+  |> result.replace(State(..state, output: [], output_size: 0))
+}
+
+fn begin_shutdown(state: State) -> State {
+  case state.lifecycle {
+    Announcing | Closing(..) -> state
+    Serving -> {
+      dict.each(state.streams, fn(_stream_id, stream) {
+        case stream.signals {
+          Some(signals) -> process.send(signals, http2.Draining)
+          None -> Nil
+        }
+      })
+
+      process.send_after(
+        state.self,
+        state.options.drain_timeout_ms,
+        connection.Http2DrainTimeout,
+      )
+
+      State(..state, lifecycle: Announcing)
+      |> emit(
+        frame.encode(
+          frame.Goaway(
+            last_stream_id: max_stream_id,
+            error: frame.NoError,
+            debug: <<>>,
+          ),
+        ),
+      )
+      |> emit(frame.encode(frame.Ping(ack: False, data: shutdown_ping)))
+    }
+  }
+}
+
+fn idle_timeout(state: State) -> Result(State, Halt) {
+  let idle_for = monotonic_ms() - state.last_activity
+  let timeout = state.options.idle_timeout_ms
+  let quiet = dict.is_empty(state.streams) && dict.is_empty(state.workers)
+
+  case quiet && idle_for >= timeout {
+    True -> Error(Fail(state, frame.NoError))
+    False -> {
+      let wait = case quiet {
+        True -> timeout - idle_for
+        False -> timeout
+      }
+      process.send_after(state.self, wait, connection.Http2IdleTimeout)
+      Ok(state)
+    }
+  }
+}
+
+fn stop(state: State) -> Next {
+  stop_workers(state)
+  Close
+}
+
+pub fn stop_workers(state: State) -> Nil {
+  use pid, _stream_id <- dict.each(state.workers)
+  process.send_abnormal_exit(pid, "connection_closed")
+}
+
+@external(erlang, "ewe_ffi", "message_queue_length")
+fn message_queue_length() -> Int
+
+@external(erlang, "ewe_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
