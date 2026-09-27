@@ -18,7 +18,7 @@ with Deno.
 ./throughput.sh # runs full matrix and its like ~80 min
 ./latency.sh    # runs full ladder for ~50 min
 
-./throughput.sh --servers ewe@5,roadrunner --cases hello,sse_big
+./throughput.sh --servers ewe@9,roadrunner --cases hello,sse_big
 ./latency.sh --cases hello
 ```
 
@@ -34,8 +34,8 @@ end. To rerender one later:
 
 | name |
 | ---  |
-| `ewe@5` |
-| `ewe@4` |
+| `ewe@9` |
+| `ewe@8` |
 | `mist` |
 | `elli` |
 | `bandit` |

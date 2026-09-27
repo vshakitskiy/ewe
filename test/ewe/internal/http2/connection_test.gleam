@@ -55,6 +55,11 @@ fn app(req: request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
       ewe.finish_chunk(writer, <<"never sent":utf8>>)
     }
     ["informational"] -> text(103, "")
+    ["out-of-range"] -> text(600, "")
+    ["streamed-out-of-range"] -> {
+      use writer <- ewe.stream_response(response.new(600))
+      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+    }
     ["unsafe"] -> text(200, "") |> response.set_header("x-a", "a\r\nb")
     ["unsafe-stream"] -> {
       use writer <- ewe.stream_response(
@@ -644,6 +649,18 @@ pub fn trailers_reach_the_handler_test() {
 pub fn informational_final_status_is_internal_error_test() {
   ready()
   |> client.get(1, "/informational")
+  |> expect_reset(1, frame.InternalError)
+}
+
+pub fn out_of_range_status_is_internal_error_test() {
+  ready()
+  |> client.get(1, "/out-of-range")
+  |> expect_reset(1, frame.InternalError)
+}
+
+pub fn streamed_out_of_range_status_is_internal_error_test() {
+  ready()
+  |> client.get(1, "/streamed-out-of-range")
   |> expect_reset(1, frame.InternalError)
 }
 

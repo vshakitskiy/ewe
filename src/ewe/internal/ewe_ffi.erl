@@ -35,6 +35,7 @@
     find_space/1,
     find_question/1,
     find_close_bracket/1,
+    find_authority_end/1,
     find_unsafe_header_byte/1,
     split_comma/1,
     lowercase_ascii/1,
@@ -62,6 +63,7 @@ init() ->
   pattern(question, <<"?">>),
   pattern(comma, <<",">>),
   pattern(close_bracket, <<"]">>),
+  pattern(authority_end, [<<"/">>, <<"?">>]),
   pattern(at, <<"@">>),
   pattern(upper, [<<Byte>> || Byte <- lists:seq($A, $Z)]),
   pattern(unsafe_header, [<<"\r">>, <<"\n">>, <<0>>]),
@@ -240,6 +242,7 @@ find_colon(Bin) -> find(Bin, colon).
 find_space(Bin) -> find(Bin, space).
 find_question(Bin) -> find(Bin, question).
 find_close_bracket(Bin) -> find(Bin, close_bracket).
+find_authority_end(Bin) -> find(Bin, authority_end).
 find_unsafe_header_byte(Bin) -> find(Bin, unsafe_header).
 
 find(Bin, Key) ->

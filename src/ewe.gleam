@@ -380,9 +380,12 @@ pub type Http1Options {
     /// limit is refused with status code 431: Request Header Fields Too Large.
     max_headers: Int,
     /// The longest chunk size line accepted in a chunked body. A longer chunk 
-    /// line is refused with status code 413: Content Too Large.
+    /// line is refused with status code 400: Bad Request.
     max_chunk_size_line: Int,
-    /// How long a connection may stay idle before it is closed.
+    /// How long a connection may wait for the next request before it is 
+    /// closed. The whole request line and headers must arrive within this 
+    /// time, so a client cannot hold the connection open by sending them a 
+    /// byte at a time.
     idle_timeout: Int,
     /// How long `read_body` and `read_body_chunk` wait for the client to send
     /// more of the body before they fail.
@@ -1495,8 +1498,10 @@ pub type ResponseWriter =
 /// Set the body of a response to be a streamed body.
 ///
 /// The handler is given a writer and must finish the body with `finish_chunk` 
-/// or `finish_response`. A handler that returns without calling either still 
-/// has its body closed but the connection is not reused for the next request.
+/// or `finish_response`. A handler that returns without calling either leaves
+/// the body cut short: HTTP/1.1 closes the connection without the final chunk
+/// and HTTP/2 resets the stream, so the client does not mistake the partial
+/// body for a complete one.
 ///
 /// # Examples
 ///

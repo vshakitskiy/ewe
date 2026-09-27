@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Usage: ./throughput.sh [--servers ewe@5,bandit] [--cases sse_big]
+# Usage: ./throughput.sh [--servers ewe@9,bandit] [--cases sse_big]
 #                        [--profiles h1,h2,h2-serial]
 
 set -u

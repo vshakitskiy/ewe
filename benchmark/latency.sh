@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Usage: ./latency.sh [--servers ewe@5,bandit] [--cases hello,sse_big]
+# Usage: ./latency.sh [--servers ewe@9,bandit] [--cases hello,sse_big]
 
 set -u
 

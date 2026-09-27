@@ -80,7 +80,11 @@ fn deliver(
 }
 
 fn has_content(status: Int, method: http.Method) -> Bool {
-  method != http.Head && status >= 200 && status != 204 && status != 304
+  method != http.Head
+  && status >= 200
+  && status <= 599
+  && status != 204
+  && status != 304
 }
 
 fn exit_with(outcome: connection.Outcome) -> Nil {
