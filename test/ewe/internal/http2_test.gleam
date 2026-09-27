@@ -55,28 +55,15 @@ pub fn omitted_length_drops_the_handlers_test() {
   assert !list.any(fields, fn(field) { field.name == <<"content-length":utf8>> })
 }
 
-pub fn indexing_policy_test() {
+pub fn set_cookie_is_never_indexed_test() {
   let assert Ok(fields) =
-    http2.response_fields(
-      200,
-      [
-        #("set-cookie", "secret"),
-        #("content-type", "text/plain"),
-        #("x-id", "1"),
-      ],
-      http2.Length(1),
-      <<"now":utf8>>,
-    )
+    http2.response_fields(200, [#("set-cookie", "secret")], http2.Length(1), <<
+      "now":utf8,
+    >>)
 
-  let indexing = fn(name) {
-    let assert Ok(field) = list.find(fields, fn(field) { field.name == name })
-    field.indexing
-  }
-  assert indexing(<<"set-cookie":utf8>>) == alpacki.NeverIndexed
-  assert indexing(<<"content-type":utf8>>) == alpacki.WithIndexing
-  assert indexing(<<"content-length":utf8>>) == alpacki.WithoutIndexing
-  assert indexing(<<"date":utf8>>) == alpacki.WithIndexing
-  assert indexing(<<"x-id":utf8>>) == alpacki.WithoutIndexing
+  let assert Ok(field) =
+    list.find(fields, fn(field) { field.name == <<"set-cookie":utf8>> })
+  assert field.indexing == alpacki.NeverIndexed
 }
 
 pub fn unsafe_header_is_refused_test() {

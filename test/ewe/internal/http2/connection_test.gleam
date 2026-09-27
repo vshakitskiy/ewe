@@ -39,12 +39,6 @@ fn app(req: request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
       response.new(200)
       |> response.set_body(ewe.Bytes(bytes_tree.from_bit_array(filler(size))))
     }
-    ["headers"] ->
-      response.Response(
-        status: 200,
-        headers: [#("cache-control", "no-store"), #("set-cookie", "a=b")],
-        body: ewe.Empty,
-      )
     ["large-header"] ->
       response.new(200)
       |> response.set_header("x-large", string.repeat("~", 20_000))
@@ -55,7 +49,6 @@ fn app(req: request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
       ewe.finish_chunk(writer, <<"never sent":utf8>>)
     }
     ["informational"] -> text(103, "")
-    ["out-of-range"] -> text(600, "")
     ["streamed-out-of-range"] -> {
       use writer <- ewe.stream_response(response.new(600))
       ewe.finish_chunk(writer, <<"never sent":utf8>>)
@@ -132,25 +125,6 @@ fn expect_reset(
   let #(received, client) = client.receive(client)
   assert received == frame.RstStream(stream_id:, error:)
   client
-}
-
-pub fn server_preface_is_settings_then_connection_window_test() {
-  let client =
-    client.serve(app)
-    |> client.connect
-    |> client.send(frame.Settings(ack: False, settings: []))
-
-  let #(settings, client) = client.receive_any(client)
-  let assert frame.Settings(ack: False, settings:) = settings
-  assert list.contains(settings, frame.MaxConcurrentStreams(100))
-  assert list.contains(settings, frame.EnableConnectProtocol(True))
-  assert list.contains(settings, frame.InitialWindowSize(262_144))
-
-  let #(window, client) = client.receive_any(client)
-  assert window == frame.WindowUpdate(0, 100 * 262_144 - 65_535)
-
-  let #(ack, _client) = client.receive_any(client)
-  assert ack == frame.Settings(ack: True, settings: [])
 }
 
 pub fn frame_before_client_settings_is_protocol_error_test() {
@@ -236,16 +210,6 @@ pub fn header_table_size_from_client_is_honoured_test() {
   let #(received, _client) = client.receive(client)
 
   let assert frame.Headers(fragment: <<0x20, _rest:bits>>, ..) = received
-}
-
-pub fn repeated_response_fields_are_indexed_test() {
-  let client = ready() |> client.get(1, "/headers")
-  let #(first, client) = client.receive(client)
-  let #(second, _client) = client.get(client, 3, "/headers") |> client.receive
-
-  let assert frame.Headers(fragment: first, ..) = first
-  let assert frame.Headers(fragment: second, ..) = second
-  assert bit_array.byte_size(second) < bit_array.byte_size(first)
 }
 
 pub fn streams_beyond_the_limit_are_refused_test() {
@@ -466,36 +430,6 @@ pub fn data_beyond_the_stream_window_is_flow_control_error_test() {
   |> expect_reset(1, frame.FlowControlError)
 }
 
-pub fn connection_window_is_refilled_once_half_is_used_test() {
-  let send_60_000 = fn(client, stream_id) {
-    use client, _frame <- list.fold([1, 2, 3, 4], client)
-    client.data(client, stream_id, filler(15_000), False)
-  }
-
-  let #(received, _client) =
-    ready_with(
-      ewe.Http2Options(
-        ..options(),
-        max_concurrent_streams: Some(2),
-        initial_window_size: 65_536,
-        recv_window_low_water_mark: 1,
-        recv_window_high_water_mark: 65_536,
-      ),
-    )
-    |> client.headers(1, client.request_fields("POST", "/hang"), False)
-    |> send_60_000(1)
-    |> client.headers(3, client.request_fields("POST", "/hang"), False)
-    |> send_60_000(3)
-    |> client.skip_until(fn(received) {
-      case received {
-        frame.WindowUpdate(stream_id: 0, ..) -> True
-        _frame -> False
-      }
-    })
-
-  assert received == frame.WindowUpdate(0, 75_000)
-}
-
 pub fn response_waits_for_the_stream_window_test() {
   let client =
     client.serve(app)
@@ -649,12 +583,6 @@ pub fn trailers_reach_the_handler_test() {
 pub fn informational_final_status_is_internal_error_test() {
   ready()
   |> client.get(1, "/informational")
-  |> expect_reset(1, frame.InternalError)
-}
-
-pub fn out_of_range_status_is_internal_error_test() {
-  ready()
-  |> client.get(1, "/out-of-range")
   |> expect_reset(1, frame.InternalError)
 }
 

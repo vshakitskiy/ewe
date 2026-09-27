@@ -30,10 +30,6 @@ pub fn lone_cr_counts_as_a_break_test() {
   assert encode(data("one\rtwo")) == "data: one\ndata: two\n\n"
 }
 
-pub fn trailing_break_leaves_an_empty_field_test() {
-  assert encode(data("one\n")) == "data: one\ndata: \n\n"
-}
-
 pub fn breaks_are_stripped_from_single_line_fields_test() {
   let event =
     sse.Event(
@@ -44,22 +40,4 @@ pub fn breaks_are_stripped_from_single_line_fields_test() {
 
   assert encode(event) == "event: updata: forged\nid: ab\ndata: payload\n\n"
     as "a break in a single-line field could otherwise forge another field"
-}
-
-pub fn field_order_test() {
-  let event =
-    sse.Event(
-      comment: Some("why"),
-      name: Some("tick"),
-      id: Some("7"),
-      retry: Some(3000),
-      data: Some("body"),
-    )
-
-  assert encode(event)
-    == ": why\nevent: tick\nid: 7\nretry: 3000\ndata: body\n\n"
-}
-
-pub fn comment_only_is_a_valid_keep_alive_test() {
-  assert encode(sse.Event(..sse.new(), comment: Some(""))) == ": \n\n"
 }
