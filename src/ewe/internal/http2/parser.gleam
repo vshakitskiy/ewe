@@ -186,10 +186,9 @@ fn default_port(scheme: http.Scheme) -> Int {
 fn parse_authority(
   authority: BitArray,
 ) -> Result(#(String, Option(Int)), Malformed) {
-  case has_userinfo(authority), target.split_host_port(authority) {
-    False, Ok(#(host, port)) if host != <<>> ->
-      Ok(#(unsafe_to_string(host), port))
-    _userinfo, _split -> Error(InvalidAuthority)
+  case target.parse_authority(authority) {
+    Ok(#(host, port)) -> Ok(#(unsafe_to_string(host), port))
+    Error(Nil) -> Error(InvalidAuthority)
   }
 }
 
@@ -362,9 +361,6 @@ fn is_field_name(name: BitArray) -> Bool
 
 @external(erlang, "ewe_ffi", "is_field_value")
 fn is_field_value(value: BitArray) -> Bool
-
-@external(erlang, "ewe_ffi", "has_userinfo")
-fn has_userinfo(authority: BitArray) -> Bool
 
 @external(erlang, "ewe_ffi", "split_query")
 fn split_query(path: String) -> Result(#(String, String), Nil)

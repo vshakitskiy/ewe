@@ -2,8 +2,8 @@
 
 # name|directory|start command|http/1 port|http/2 port
 SERVERS=(
-  "ewe@5|ewe@5|gleam run|3006|3006"
-  "ewe@4|ewe@4|gleam run|3001|-"
+  "ewe@9|ewe@9|gleam run|3006|3006"
+  "ewe@8|ewe@8|gleam run|3001|3001"
   "mist|mist|gleam run|3002|-"
   "elli|elli|./run.sh|3003|-"
   "bandit|bandit|./run.sh|3004|3004"
@@ -82,8 +82,8 @@ latency_rates() {
 
 server_package() {
   case "$1" in
-    ewe@5 | httpd) echo "-" ;;
-    ewe@4) echo "ewe" ;;
+    ewe@9 | httpd) echo "-" ;;
+    ewe@8) echo "ewe" ;;
     *) echo "$1" ;;
   esac
 }

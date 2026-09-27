@@ -27,6 +27,15 @@ pub fn split_host_port(
   }
 }
 
+pub fn parse_authority(
+  authority: BitArray,
+) -> Result(#(BitArray, Option(Int)), Nil) {
+  case has_userinfo(authority), split_host_port(authority) {
+    False, Ok(#(host, port)) if host != <<>> -> Ok(#(host, port))
+    _userinfo, _split -> Error(Nil)
+  }
+}
+
 fn split_bracketed_host(
   value: BitArray,
 ) -> Result(#(BitArray, Option(Int)), Nil) {
@@ -86,6 +95,9 @@ pub fn is_valid_path(method: http.Method, path: String) -> Bool {
 
 @external(erlang, "ewe_ffi", "find_colon")
 fn find_colon(bits: BitArray) -> Result(Int, Nil)
+
+@external(erlang, "ewe_ffi", "has_userinfo")
+fn has_userinfo(authority: BitArray) -> Bool
 
 @external(erlang, "ewe_ffi", "find_close_bracket")
 fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)

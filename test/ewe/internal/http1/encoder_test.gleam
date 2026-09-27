@@ -62,9 +62,31 @@ pub fn not_modified_carries_no_body_test() {
   assert remainder == encoder.NoRemainder
 }
 
-pub fn informational_status_carries_no_framing_test() {
-  let #(out, remainder) = encode(100, [], connection.Empty)
+fn encode_status(status: Int) -> Result(encoder.Encoded, encoder.EncodeError) {
+  response.Response(status:, headers: [], body: connection.Empty)
+  |> encoder.encode_response(http.Get, parser.Http11, http1.KeepAlive)
+}
 
-  assert occurrences(out, "content-length:") == 0
-  assert remainder == encoder.NoRemainder
+pub fn informational_status_refused_test() {
+  assert encode_status(100) == Error(encoder.InvalidStatus(100))
+    as "a 1xx is interim, so the client would keep waiting for the real response"
+}
+
+pub fn status_outside_valid_range_refused_test() {
+  assert encode_status(42) == Error(encoder.InvalidStatus(42))
+  assert encode_status(600) == Error(encoder.InvalidStatus(600))
+}
+
+fn frame(chunk: BitArray) -> BitArray {
+  encoder.frame(bytes_tree.from_bit_array(chunk), http1.ChunkedStream)
+  |> bytes_tree.to_bit_array
+}
+
+pub fn chunk_is_framed_with_its_size_test() {
+  assert frame(<<"hello world!":utf8>>) == <<"C\r\nhello world!\r\n":utf8>>
+}
+
+pub fn empty_chunk_is_not_framed_test() {
+  assert frame(<<>>) == <<>>
+    as "a zero-size chunk is the last-chunk marker and would end the body"
 }

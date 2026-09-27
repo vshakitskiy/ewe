@@ -4,6 +4,7 @@ import gleam/bit_array
 import gleam/http
 import gleam/list
 import gleam/option
+import gleam/result
 
 pub type Version {
   Http10
@@ -27,6 +28,7 @@ pub type Metadata {
     framing: http1.Framing,
     keep_alive: http1.KeepAlive,
     upgrade: option.Option(http1.Upgrade),
+    expect_continue: Bool,
   )
 }
 
@@ -171,7 +173,7 @@ fn parse_request_line(
   options: http1.Options,
 ) -> Step(#(http.Method, BitArray, Version, BitArray)) {
   use #(line, remaining) <- try_step(extract_line(
-    buffer,
+    skip_empty_line(buffer),
     options.max_request_line,
     RequestLineTooLong,
     BadRequestLine,
@@ -182,6 +184,13 @@ fn parse_request_line(
   use #(target, version) <- try_step(parse_target_version(target_and_version))
 
   StepDone(#(method, target, version, remaining))
+}
+
+fn skip_empty_line(buffer: BitArray) -> BitArray {
+  case buffer {
+    <<"\r\n":utf8, remaining:bits>> -> remaining
+    _buffer -> buffer
+  }
 }
 
 fn parse_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
@@ -302,11 +311,54 @@ fn resolve_target(
         Error(Nil) -> ParseError(BadTarget)
       }
     _method -> {
-      use #(path, query) <- try_step(split_target(target))
+      use #(authority, origin) <- try_step(split_absolute_form(target))
+      use #(path, query) <- try_step(split_target(origin))
       use path <- try_step(validate_path(method, path))
-      use #(host, port) <- try_step(resolve_host(version, header_host))
+      use header_host <- try_step(resolve_host(version, header_host))
+      let #(host, port) = option.unwrap(authority, header_host)
       StepDone(#(host, port, path, query))
     }
+  }
+}
+
+fn split_absolute_form(
+  target: BitArray,
+) -> Step(#(option.Option(#(String, option.Option(Int))), BitArray)) {
+  case target {
+    <<"/":utf8, _path:bits>> -> StepDone(#(option.None, target))
+    <<scheme:bytes-size(4), "://":utf8, remaining:bits>>
+    | <<scheme:bytes-size(5), "://":utf8, remaining:bits>> ->
+      case lowercase_ascii(scheme) {
+        <<"http":utf8>> | <<"https":utf8>> -> split_authority(remaining)
+        _scheme -> ParseError(BadTarget)
+      }
+    _target -> StepDone(#(option.None, target))
+  }
+}
+
+fn split_authority(
+  bits: BitArray,
+) -> Step(#(option.Option(#(String, option.Option(Int))), BitArray)) {
+  let position =
+    find_authority_end(bits) |> result.unwrap(bit_array.byte_size(bits))
+
+  case bits {
+    <<authority:bytes-size(position), origin:bits>> ->
+      case target.parse_authority(authority) {
+        Ok(#(host, port)) -> {
+          use host <- try_step(decode_component(host, BadTarget))
+          StepDone(#(option.Some(#(host, port)), origin_form(origin)))
+        }
+        Error(Nil) -> ParseError(BadTarget)
+      }
+    _bits -> ParseError(BadTarget)
+  }
+}
+
+fn origin_form(origin: BitArray) -> BitArray {
+  case origin {
+    <<"/":utf8, _path:bits>> -> origin
+    _query -> <<"/":utf8, origin:bits>>
   }
 }
 
@@ -344,6 +396,7 @@ pub type HeaderState {
     websocket_version: option.Option(String),
     websocket_extensions: option.Option(String),
     host: option.Option(#(String, option.Option(Int))),
+    expect_continue: Bool,
   )
 }
 
@@ -358,6 +411,7 @@ pub fn initial_header_state() -> HeaderState {
     websocket_version: option.None,
     websocket_extensions: option.None,
     host: option.None,
+    expect_continue: False,
   )
 }
 
@@ -388,7 +442,18 @@ fn complete_metadata(
     NothingRequested, Http11 -> http1.KeepAlive
     NothingRequested, Http10 -> http1.CloseAfterResponse
   }
-  Metadata(framing:, keep_alive:, upgrade: resolve_upgrade(state))
+  let expect_continue = case framing, version {
+    http1.NoBody, _version | http1.Fixed(0), _version | _framing, Http10 ->
+      False
+    http1.Fixed(_length), Http11 | http1.Chunked, Http11 ->
+      state.expect_continue
+  }
+  Metadata(
+    framing:,
+    keep_alive:,
+    upgrade: resolve_upgrade(state),
+    expect_continue:,
+  )
 }
 
 fn resolve_upgrade(state: HeaderState) -> option.Option(http1.Upgrade) {
@@ -434,18 +499,18 @@ fn parse_header_line(
 ) -> Step(#(#(String, String), HeaderState)) {
   case find_colon(line) {
     Error(Nil) -> ParseError(BadHeader)
-    Ok(0) -> ParseError(BadHeader)
     Ok(position) ->
       case line {
         <<name:bytes-size(position), ":":utf8, value:bits>> -> {
           let name = lowercase_ascii(name)
           let value = trim_ows(value)
-          case bit_array_to_string(name), bit_array_to_string(value) {
-            Ok(name_text), Ok(value_text) -> {
-              use state <- try_step(classify(name_text, value, state))
-              StepDone(#(#(name_text, value_text), state))
+          case is_field_name(name) && is_field_value(value) {
+            True -> {
+              let name = unsafe_to_string(name)
+              use state <- try_step(classify(name, value, state))
+              StepDone(#(#(name, unsafe_to_string(value)), state))
             }
-            _name, _value -> ParseError(BadHeader)
+            False -> ParseError(BadHeader)
           }
         }
         _bad -> ParseError(BadHeader)
@@ -472,9 +537,12 @@ fn classify(
           }
       }
     "transfer-encoding" -> {
-      let transfer_encoding = case value |> lowercase_ascii |> tokens {
-        [<<"chunked":utf8>>] -> ChunkedFinal
-        _other -> UnsupportedFinal
+      let transfer_encoding = case
+        state.transfer_encoding,
+        value |> lowercase_ascii |> tokens
+      {
+        NoTransferEncoding, [<<"chunked":utf8>>] -> ChunkedFinal
+        _transfer_encoding, _codings -> UnsupportedFinal
       }
       StepDone(HeaderState(..state, transfer_encoding:))
     }
@@ -513,6 +581,10 @@ fn classify(
     "sec-websocket-extensions" -> {
       let lowered = value |> lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, websocket_extensions: option.Some(lowered)))
+    }
+    "expect" -> {
+      let expect_continue = lowercase_ascii(value) == <<"100-continue":utf8>>
+      StepDone(HeaderState(..state, expect_continue:))
     }
     "host" ->
       case state.host {
@@ -562,7 +634,7 @@ fn trim_ows(bits: BitArray) -> BitArray {
   |> trim_trailing_ows
 }
 
-fn trim_leading_ows(bits: BitArray) -> BitArray {
+pub fn trim_leading_ows(bits: BitArray) -> BitArray {
   case bits {
     <<" ", remaining:bits>> -> trim_leading_ows(remaining)
     <<"\t", remaining:bits>> -> trim_leading_ows(remaining)
@@ -601,6 +673,15 @@ fn find_space(bits: BitArray) -> Result(Int, Nil)
 
 @external(erlang, "ewe_ffi", "find_question")
 fn find_question(bits: BitArray) -> Result(Int, Nil)
+
+@external(erlang, "ewe_ffi", "find_authority_end")
+fn find_authority_end(bits: BitArray) -> Result(Int, Nil)
+
+@external(erlang, "ewe_ffi", "is_field_name")
+fn is_field_name(name: BitArray) -> Bool
+
+@external(erlang, "ewe_ffi", "is_field_value")
+fn is_field_value(value: BitArray) -> Bool
 
 @external(erlang, "ewe_ffi", "find_unsafe_header_byte")
 pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)

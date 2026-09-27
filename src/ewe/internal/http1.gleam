@@ -42,16 +42,12 @@ type Sent {
 }
 
 pub fn handle_message(state: State, connection: tup.Connection) -> Next {
-  connection.cancel_timer(state.idle_timer)
-
   case parser.parse(state.buffer, state.options) {
-    Ok(parser.Complete(head, metadata, remaining)) ->
+    Ok(parser.Complete(head, metadata, remaining)) -> {
+      connection.cancel_timer(state.idle_timer)
       handle_request(state, connection, head, metadata, remaining)
-    Ok(parser.Incomplete) -> {
-      let idle_timer =
-        connection.start_idle_timer(state.self, state.options.idle_timeout)
-      Continue(State(..state, idle_timer:))
     }
+    Ok(parser.Incomplete) -> Continue(state)
     Error(error) -> {
       logging.log(
         logging.Error,
@@ -93,6 +89,7 @@ fn handle_request(
       chunk_remaining: 0,
       options: state.options,
       upgrade: metadata.upgrade,
+      expect_continue: metadata.expect_continue,
     )
 
   let request = to_request(head, connection, body_connection)
@@ -144,11 +141,8 @@ fn respond(
       let #(transport, socket) = tup.socket(connection)
       send_response(encoded, transport, socket, self)
     }
-    Error(encoder.UnsafeHeader(name)) -> {
-      logging.log(
-        logging.Error,
-        "Handler produced an unsafe response header: " <> name,
-      )
+    Error(error) -> {
+      logging.log(logging.Error, encoder.error_to_string(error))
       file.release_body(response.body)
 
       refuse(connection, encoder.internal_server_error())
@@ -169,15 +163,13 @@ fn await_next_request(
   buffer: BitArray,
   connection: tup.Connection,
 ) -> Next {
+  let idle_timer =
+    connection.start_idle_timer(state.self, state.options.idle_timeout)
+  let state = State(..state, buffer:, idle_timer:)
+
   case buffer {
-    <<>> -> {
-      let idle_timer =
-        connection.start_idle_timer(state.self, state.options.idle_timeout)
-      Continue(State(..state, buffer:, idle_timer:))
-    }
-    _buffer ->
-      State(..state, buffer:, idle_timer: option.None)
-      |> handle_message(connection)
+    <<>> -> Continue(state)
+    _buffer -> handle_message(state, connection)
   }
 }
 
@@ -260,10 +252,7 @@ fn send_response(
           case drained.stream {
             option.Some(http1.StreamFinished(keep_alive:)) ->
               Ok(to_sent(keep_alive))
-            option.None -> {
-              let _sent = encoder.end_stream(transport, socket, framing)
-              Ok(SentClose)
-            }
+            option.None -> Ok(SentClose)
           }
         }
       }
@@ -330,8 +319,16 @@ fn resolve_body(
     option.Some(http1.BodyAbandoned) ->
       ResolvedBody(<<>>, http1.CloseAfterResponse)
     option.Some(http1.BodyProgress(buffer:, read:, chunk_remaining:)) ->
-      http1.Connection(..conn, buffer:, read:, chunk_remaining:)
+      http1.Connection(
+        ..conn,
+        buffer:,
+        read:,
+        chunk_remaining:,
+        expect_continue: False,
+      )
       |> drain_remaining(options)
+    option.None if conn.expect_continue ->
+      ResolvedBody(<<>>, http1.CloseAfterResponse)
     option.None -> drain_remaining(conn, options)
   }
 }
@@ -487,10 +484,24 @@ pub fn pull_chunk(
     http1.NoBody -> Ok(PulledDone([], buffer))
     http1.Fixed(length) if length > limit -> Error(BodyTooLarge)
     http1.Fixed(length) ->
-      pull_fixed_chunk(conn, length, read, max_chunk_bytes) |> to_body_result
-    http1.Chunked ->
-      pull_chunked_chunk(conn, limit, read, chunk_remaining, max_chunk_bytes)
+      send_continue(conn)
+      |> pull_fixed_chunk(length, read, max_chunk_bytes)
       |> to_body_result
+    http1.Chunked ->
+      send_continue(conn)
+      |> pull_chunked_chunk(limit, read, chunk_remaining, max_chunk_bytes)
+      |> to_body_result
+  }
+}
+
+fn send_continue(conn: http1.Connection) -> http1.Connection {
+  case conn.expect_continue {
+    False -> conn
+    True -> {
+      let continue = bytes_tree.from_bit_array(encoder.continue)
+      let _sent = socket.send(conn.transport, conn.socket, continue)
+      http1.Connection(..conn, expect_continue: False)
+    }
   }
 }
 
@@ -682,7 +693,12 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
       parse_hex_digits(remaining, acc * 16 + { byte - 87 }, True)
     <<byte, remaining:bits>> if byte >= 65 && byte <= 70 ->
       parse_hex_digits(remaining, acc * 16 + { byte - 55 }, True)
-    _bits if any -> Ok(acc)
+    <<>> if any -> Ok(acc)
+    _extension if any ->
+      case parser.trim_leading_ows(bits) {
+        <<";":utf8, _extension:bits>> -> Ok(acc)
+        _bits -> Error(Nil)
+      }
     _bits -> Error(Nil)
   }
 }

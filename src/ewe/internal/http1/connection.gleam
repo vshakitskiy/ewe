@@ -42,6 +42,7 @@ pub type Connection {
     chunk_remaining: Int,
     options: Options,
     upgrade: option.Option(Upgrade),
+    expect_continue: Bool,
   )
 }
 

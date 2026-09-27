@@ -17,6 +17,17 @@ import websocks
 
 pub type EncodeError {
   UnsafeHeader(name: String)
+  InvalidStatus(status: Int)
+}
+
+pub fn error_to_string(error: EncodeError) -> String {
+  case error {
+    UnsafeHeader(name) -> "Handler produced an unsafe response header: " <> name
+    InvalidStatus(status) ->
+      "A handler answered with status "
+      <> int.to_string(status)
+      <> ", which cannot end an HTTP/1.1 response"
+  }
 }
 
 type EncodeState {
@@ -55,6 +66,7 @@ pub fn encode_response(
   version: parser.Version,
   keep_alive: http1.KeepAlive,
 ) -> Result(Encoded, EncodeError) {
+  use Nil <- result.try(validate_status(response.status, response.body))
   use state <- result.try(encode_headers(
     response.headers,
     reserved(response.body),
@@ -76,8 +88,19 @@ pub fn encode_response(
   })
 }
 
+fn validate_status(
+  status: Int,
+  body: connection.Body,
+) -> Result(Nil, EncodeError) {
+  case body {
+    connection.Websocket(..) -> Ok(Nil)
+    _body if status >= 200 && status <= 599 -> Ok(Nil)
+    _body -> Error(InvalidStatus(status))
+  }
+}
+
 fn is_bodyless(status: Int) -> Bool {
-  status == 204 || status == 304 || { status >= 100 && status < 200 }
+  status == 204 || status == 304
 }
 
 fn bodyless(
@@ -254,18 +277,20 @@ pub type ResponseWriter =
 
 const last_chunk = <<"0\r\n\r\n":utf8>>
 
+pub const continue = <<"HTTP/1.1 100 Continue\r\n\r\n":utf8>>
+
 pub fn frame(
   chunk: bytes_tree.BytesTree,
   framing: http1.StreamFraming,
 ) -> bytes_tree.BytesTree {
-  case framing {
-    http1.ChunkedStream ->
+  case framing, bytes_tree.byte_size(chunk) {
+    http1.CloseDelimitedStream, _size | http1.ChunkedStream, 0 -> chunk
+    http1.ChunkedStream, size ->
       bytes_tree.new()
-      |> bytes_tree.append_string(int.to_base16(bytes_tree.byte_size(chunk)))
+      |> bytes_tree.append_string(int.to_base16(size))
       |> bytes_tree.append(<<"\r\n":utf8>>)
       |> bytes_tree.append_tree(chunk)
       |> bytes_tree.append(<<"\r\n":utf8>>)
-    http1.CloseDelimitedStream -> chunk
   }
 }
 
@@ -273,9 +298,13 @@ pub fn send_chunk(
   writer: ResponseWriter,
   chunk: BitArray,
 ) -> Result(ResponseWriter, socket.SocketError) {
-  frame(bytes_tree.from_bit_array(chunk), writer.framing)
-  |> write(writer, _)
-  |> result.replace(writer)
+  case chunk {
+    <<>> -> Ok(writer)
+    _chunk ->
+      frame(bytes_tree.from_bit_array(chunk), writer.framing)
+      |> write(writer, _)
+      |> result.replace(writer)
+  }
 }
 
 pub fn finish_chunk(

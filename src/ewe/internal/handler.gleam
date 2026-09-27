@@ -110,27 +110,21 @@ fn detect(
   data: BitArray,
   connection: tup.Connection,
 ) -> tup.Next(State, connection.Message) {
-  connection.cancel_timer(detection.idle_timer)
   let buffer = connection.append_buffer(detection.buffer, data)
 
   case detection.expected, sniff_preface(buffer) {
-    _expected, Http2Preface(remaining:) ->
+    _expected, Http2Preface(remaining:) -> {
+      connection.cancel_timer(detection.idle_timer)
       start_http2(connection, detection, remaining)
-    _expected, NeedMoreData -> {
-      let idle_timer =
-        connection.start_idle_timer(
-          detection.self,
-          detection.http1_options.idle_timeout,
-        )
-
-      tup.continue(Detecting(Detection(..detection, buffer:, idle_timer:)))
     }
+    _expected, NeedMoreData ->
+      tup.continue(Detecting(Detection(..detection, buffer:)))
     Http1OrHttp2, NotHttp2 ->
       http1.State(
         handler: detection.handler,
         self: detection.self,
         buffer:,
-        idle_timer: option.None,
+        idle_timer: detection.idle_timer,
         options: detection.http1_options,
       )
       |> http1.handle_message(connection)

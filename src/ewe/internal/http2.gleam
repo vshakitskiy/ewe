@@ -1149,10 +1149,10 @@ fn respond(
   let status = response.status
 
   case status {
-    _status if status < 200 -> {
+    _status if status < 200 || status > 599 -> {
       logging.log(
         logging.Error,
-        "A handler answered with informational status "
+        "A handler answered with status "
           <> int.to_string(status)
           <> ", which cannot end an HTTP/2 response",
       )

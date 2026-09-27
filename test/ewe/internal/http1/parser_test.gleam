@@ -381,3 +381,146 @@ pub fn websocket_headers_without_an_upgrade_are_ignored_test() {
 
   assert metadata.upgrade == None
 }
+
+pub fn whitespace_before_header_colon_rejected_test() {
+  let buffer = <<
+    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.BadHeader)
+    as "a name of `content-length ` would leave the body to be read as the next request"
+}
+
+pub fn empty_header_name_rejected_test() {
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n: value\r\n\r\n":utf8>>
+  assert parse(buffer) == Error(parser.BadHeader)
+}
+
+pub fn nul_in_header_value_rejected_test() {
+  let buffer = <<
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: a":utf8,
+    0,
+    "b\r\n\r\n":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.BadHeader)
+}
+
+pub fn bare_cr_in_header_value_rejected_test() {
+  let buffer = <<
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: a\rb\r\n\r\n":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.BadHeader)
+}
+
+pub fn absolute_form_authority_replaces_host_test() {
+  let buffer = <<
+    "GET HTTP://api.example.com:8080/users?id=1 HTTP/1.1\r\nHost: other.com\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
+
+  assert head.host == "api.example.com"
+  assert head.port == Some(8080)
+  assert head.path == "/users"
+  assert head.query == Some("id=1")
+}
+
+pub fn absolute_form_without_path_test() {
+  let buffer = <<
+    "GET https://example.com?id=1 HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
+
+  assert head.host == "example.com"
+  assert head.port == None
+  assert head.path == "/"
+  assert head.query == Some("id=1")
+}
+
+pub fn absolute_form_with_userinfo_rejected_test() {
+  let buffer = <<
+    "GET http://user@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.BadTarget)
+}
+
+pub fn absolute_form_with_empty_host_rejected_test() {
+  let buffer = <<"GET http:///path HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  assert parse(buffer) == Error(parser.BadTarget)
+}
+
+pub fn absolute_form_with_other_scheme_rejected_test() {
+  let buffer = <<
+    "GET wss://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
+  >>
+  assert parse(buffer) == Error(parser.BadTarget)
+}
+
+pub fn absolute_form_still_requires_host_on_http11_test() {
+  let buffer = <<"GET http://example.com/ HTTP/1.1\r\n\r\n":utf8>>
+  assert parse(buffer) == Error(parser.MissingHost)
+}
+
+pub fn empty_line_before_request_line_ignored_test() {
+  let buffer = <<"\r\nGET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let assert Ok(parser.Complete(head, _metadata, remaining)) = parse(buffer)
+
+  assert head.path == "/"
+  assert remaining == <<>>
+}
+
+pub fn lone_empty_line_waits_for_more_test() {
+  assert parse(<<"\r\n":utf8>>) == Ok(parser.Incomplete)
+}
+
+pub fn chunked_after_another_coding_across_headers_rejected_test() {
+  let buffer = <<
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
+    as "repeated headers combine into `gzip, chunked`, the same as one header"
+}
+
+pub fn chunked_twice_across_headers_rejected_test() {
+  let buffer = <<
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
+  >>
+
+  assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
+}
+
+pub fn expect_continue_with_body_test() {
+  let buffer = <<
+    "POST / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
+
+  assert metadata.expect_continue
+}
+
+pub fn expect_continue_without_body_ignored_test() {
+  let buffer = <<
+    "GET / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
+
+  assert !metadata.expect_continue
+}
+
+pub fn expect_continue_on_http10_ignored_test() {
+  let buffer = <<
+    "POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n":utf8,
+  >>
+
+  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
+
+  assert !metadata.expect_continue
+    as "RFC 9110 §10.1.1 requires ignoring the expectation in HTTP/1.0"
+}
