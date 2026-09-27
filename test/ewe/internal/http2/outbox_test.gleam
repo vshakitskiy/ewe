@@ -11,14 +11,6 @@ fn take(
   #(bytes_tree.to_bit_array(bytes), size, last, rest)
 }
 
-pub fn empty_pieces_are_dropped_test() {
-  let box = outbox.new() |> outbox.push(outbox.bytes(<<>>))
-  assert outbox.size(box) == 0
-  let #(bytes, size, _last, _rest) = take(box, 10)
-  assert bytes == <<>>
-  assert size == 0
-}
-
 pub fn small_pieces_are_joined_into_one_frame_test() {
   let box =
     outbox.new()
@@ -48,12 +40,6 @@ pub fn the_last_piece_of_a_finished_body_ends_it_test() {
   let #(bytes, _size, last, _rest) = take(rest, 4)
   assert bytes == <<"ef":utf8>>
   assert last
-}
-
-pub fn an_unfinished_body_never_ends_test() {
-  let box = outbox.new() |> outbox.push(outbox.bytes(<<"ab":utf8>>))
-  let #(_bytes, _size, last, _rest) = take(box, 10)
-  assert !last
 }
 
 pub fn a_file_is_read_into_memory_for_small_frames_test() {

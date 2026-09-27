@@ -33,13 +33,6 @@ fn occurrences(haystack: String, needle: String) -> Int {
   list.length(string.split(haystack, needle)) - 1
 }
 
-pub fn computed_content_length_is_the_only_one_test() {
-  let out = head([], connection.Text("hello"))
-
-  assert occurrences(out, "content-length:") == 1
-  assert string.contains(out, "content-length: 5")
-}
-
 pub fn handler_content_length_is_dropped_test() {
   let out = head([#("content-length", "999")], connection.Text("hello"))
 

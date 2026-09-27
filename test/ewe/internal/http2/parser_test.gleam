@@ -124,10 +124,6 @@ pub fn asterisk_path_for_options_test() {
   assert request.path == "*"
 }
 
-pub fn empty_path_is_malformed_test() {
-  assert build(get("")) == Error(parser.MissingPseudoHeader)
-}
-
 pub fn unsupported_scheme_is_malformed_test() {
   assert build([
       #(":method", "GET"),

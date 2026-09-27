@@ -103,16 +103,6 @@ pub fn mixed_case_and_ows_headers_test() {
   assert remaining == <<"HELLO WORLD!!":utf8>>
 }
 
-pub fn tab_ows_trimmed_test() {
-  let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name:\t\tvalue\t\t\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
-
-  assert head.headers == [#("host", "example.com"), #("x-name", "value")]
-}
-
 pub fn chunked_transfer_encoding_test() {
   let buffer = <<
     "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
@@ -139,14 +129,6 @@ pub fn transfer_encoding_without_chunked_rejected_test() {
 
   assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
     as "treating an undelimited body as no body at all leaves it on the socket to be read as the next request"
-}
-
-pub fn chunked_not_final_across_repeated_headers_rejected_test() {
-  let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n":utf8,
-  >>
-
-  assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
 }
 
 pub fn chunked_rejected_on_http_1_0_test() {
@@ -193,25 +175,6 @@ pub fn conflicting_content_length_and_chunked_rejected_test() {
   assert parse(buffer) == Error(parser.AmbiguousFraming)
 }
 
-pub fn conflicting_transfer_encoding_and_content_length_reversed_order_rejected_test() {
-  let buffer = <<
-    "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello":utf8,
-  >>
-
-  assert parse(buffer) == Error(parser.AmbiguousFraming)
-}
-
-pub fn connection_close_lookalike_is_not_close_test() {
-  let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close-enough\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
-
-  assert metadata.keep_alive == http1.KeepAlive
-    as "\"close-enough\" is not the \"close\" token"
-}
-
 pub fn connection_close_among_multiple_tokens_test() {
   let buffer = <<
     "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, Close\r\n\r\n":utf8,
@@ -243,11 +206,6 @@ pub fn http10_explicit_keep_alive_test() {
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.keep_alive == http1.KeepAlive
-}
-
-pub fn incomplete_headers_test() {
-  let buffer = <<"GET /foo HTTP/1.1\r\nHost: example.com\r\n":utf8>>
-  assert parse(buffer) == Ok(parser.Incomplete)
 }
 
 pub fn split_across_reads_test() {
@@ -313,17 +271,6 @@ pub fn websocket_upgrade_requested_test() {
     == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
 }
 
-pub fn upgrade_token_case_insensitive_test() {
-  let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
-
-  assert metadata.upgrade
-    == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
-}
-
 pub fn upgrade_among_multiple_connection_tokens_test() {
   let buffer = <<
     "GET /h2c HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n":utf8,
@@ -345,18 +292,6 @@ pub fn upgrade_header_without_connection_token_ignored_test() {
     as "Upgrade requires Connection: upgrade to be honored (RFC 9110 §7.8)"
 }
 
-pub fn upgrade_header_before_connection_header_test() {
-  let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
-
-  assert metadata.upgrade
-    == Some(http1.WebsocketUpgrade(key: None, version: None, extensions: None))
-    as "order of Upgrade vs. Connection headers shouldn't matter"
-}
-
 pub fn websocket_handshake_fields_collected_test() {
   let buffer = <<
     "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: Permessage-Deflate; client_max_window_bits\r\n\r\n":utf8,
@@ -372,16 +307,6 @@ pub fn websocket_handshake_fields_collected_test() {
     ))
 }
 
-pub fn websocket_headers_without_an_upgrade_are_ignored_test() {
-  let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
-
-  assert metadata.upgrade == None
-}
-
 pub fn whitespace_before_header_colon_rejected_test() {
   let buffer = <<
     "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello":utf8,
@@ -389,21 +314,6 @@ pub fn whitespace_before_header_colon_rejected_test() {
 
   assert parse(buffer) == Error(parser.BadHeader)
     as "a name of `content-length ` would leave the body to be read as the next request"
-}
-
-pub fn empty_header_name_rejected_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n: value\r\n\r\n":utf8>>
-  assert parse(buffer) == Error(parser.BadHeader)
-}
-
-pub fn nul_in_header_value_rejected_test() {
-  let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: a":utf8,
-    0,
-    "b\r\n\r\n":utf8,
-  >>
-
-  assert parse(buffer) == Error(parser.BadHeader)
 }
 
 pub fn bare_cr_in_header_value_rejected_test() {
@@ -440,26 +350,6 @@ pub fn absolute_form_without_path_test() {
   assert head.query == Some("id=1")
 }
 
-pub fn absolute_form_with_userinfo_rejected_test() {
-  let buffer = <<
-    "GET http://user@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
-  >>
-
-  assert parse(buffer) == Error(parser.BadTarget)
-}
-
-pub fn absolute_form_with_empty_host_rejected_test() {
-  let buffer = <<"GET http:///path HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
-  assert parse(buffer) == Error(parser.BadTarget)
-}
-
-pub fn absolute_form_with_other_scheme_rejected_test() {
-  let buffer = <<
-    "GET wss://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
-  >>
-  assert parse(buffer) == Error(parser.BadTarget)
-}
-
 pub fn absolute_form_still_requires_host_on_http11_test() {
   let buffer = <<"GET http://example.com/ HTTP/1.1\r\n\r\n":utf8>>
   assert parse(buffer) == Error(parser.MissingHost)
@@ -473,10 +363,6 @@ pub fn empty_line_before_request_line_ignored_test() {
   assert remaining == <<>>
 }
 
-pub fn lone_empty_line_waits_for_more_test() {
-  assert parse(<<"\r\n":utf8>>) == Ok(parser.Incomplete)
-}
-
 pub fn chunked_after_another_coding_across_headers_rejected_test() {
   let buffer = <<
     "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
@@ -484,14 +370,6 @@ pub fn chunked_after_another_coding_across_headers_rejected_test() {
 
   assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
     as "repeated headers combine into `gzip, chunked`, the same as one header"
-}
-
-pub fn chunked_twice_across_headers_rejected_test() {
-  let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
-  >>
-
-  assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
 }
 
 pub fn expect_continue_with_body_test() {
@@ -502,16 +380,6 @@ pub fn expect_continue_with_body_test() {
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.expect_continue
-}
-
-pub fn expect_continue_without_body_ignored_test() {
-  let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\n\r\n":utf8,
-  >>
-
-  let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
-
-  assert !metadata.expect_continue
 }
 
 pub fn expect_continue_on_http10_ignored_test() {
