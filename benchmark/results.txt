@@ -1,12 +1,12 @@
-date        2026-08-17T18:11:08Z
+date        2026-09-26T17:35:25Z
 load        h2load, 4 threads
             h1         h1, 50 connections x 1 stream(s)
             h2         h2, 50 connections x 10 stream(s)
-duration    10s measured, 3s warmup, 5 repeats per cell
+duration    10s measured, 3s warmup, 3 repeats per cell
 cpu         server on 0-5, load generator on 6-11
 toolchain   gleam 1.18.0, OTP 29, elixir 1.19.4
-tools       nghttp2 1.69.0, wrk2 44a94c1
-packages    ewe@4       4.0.1
+tools       nghttp2 1.70.0, wrk2 44a94c1
+packages    ewe@8       8.0.0
             mist        6.0.3
             elli        3.3.0
             bandit      1.12.0
@@ -15,164 +15,164 @@ packages    ewe@4       4.0.1
 
 throughput req/s
 
-case                profile          bandit  chatterbox        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+case                profile          bandit  chatterbox        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 -------------------------------------------------------------------------------------------------------------------------------
-hello               h1              145,446           -     260,834     177,750     263,626     100,347     195,679     245,115
-hello_headers       h1              120,482           -     214,961     142,136     212,005      84,057     152,771     197,112
-echo_1kb            h1              133,830           -     231,526     157,622     219,243      73,699     172,493     210,856
-echo_1kb_headers    h1              113,018           -     205,897     126,760     177,036      55,418     142,050     185,680
-echo_10kb           h1              114,652           -     166,859     144,334     190,931      12,497     155,218     183,455
-echo_chunked_10kb   h1              104,944           -           -     136,069     194,402           -     155,080     183,763
-file_tiny           h1               50,007           -      38,745           -      68,969      33,566      37,649      37,699
-file_small          h1               45,293           -      35,743           -      60,213      29,604      35,123      35,303
-file_big            h1                3,346           -       3,369           -       3,411       1,314       3,420       3,376
-stream              h1               82,577           -           -           -     139,207      98,329           -      34,513
-stream_small        h1                6,801           -           -           -       7,921       7,890           -       6,384
-stream_big          h1                6,729           -           -           -       7,853       7,692           -       7,313
-sse                 h1                    -           -           -           -      17,398           -           -      12,350
-sse_small           h1                    -           -           -           -       6,122           -           -       6,039
-sse_big             h1                    -           -           -           -       5,867           -           -       2,432
-hello               h2               77,163       8,307           -           -     161,818           -           -     208,646
-hello_headers       h2               70,781       8,307           -           -     132,414           -           -     170,414
-echo_1kb            h2               66,793       7,087           -           -     114,323           -           -     179,320
-echo_1kb_headers    h2               60,932       7,072           -           -     100,474           -           -     146,623
-echo_10kb           h2               55,153       8,695           -           -      94,743           -           -     139,063
-echo_chunked_10kb   h2               52,649       8,688           -           -      91,506           -           -     134,671
-file_tiny           h2               40,192       8,372           -           -      82,601           -           -      34,653
-file_small          h2               30,246      26,198           -           -      51,610           -           -      24,965
-file_big            h2                  750         527           -           -         497           -           -       1,005
-stream              h2               50,032       8,764           -           -      88,401           -           -     114,733
-stream_small        h2                4,455      10,687           -           -       5,086           -           -       6,149
-stream_big          h2                4,554           -           -           -       5,189           -           -       6,428
-sse                 h2                    -           -           -           -      10,955           -           -      15,414
-sse_small           h2                    -           -           -           -       3,817           -           -       5,547
-sse_big             h2                    -           -           -           -       3,323           -           -       2,162
+hello               h1              149,214           -     267,914     282,622     275,439     102,489     201,897     254,256
+hello_headers       h1              122,866           -     222,884     225,152     232,846      85,989     157,902     205,181
+echo_1kb            h1              136,389           -     247,351     233,779     229,498      74,874     177,461     221,814
+echo_1kb_headers    h1              114,188           -     208,486     204,050     202,558      56,074     146,355     191,658
+echo_10kb           h1              119,884           -     170,952     194,201     193,708      12,551     160,960     187,372
+echo_chunked_10kb   h1              107,016           -           -     195,798     193,991           -     158,704     188,410
+file_tiny           h1               49,586           -      40,097      69,561      68,920      32,893      38,755      38,291
+file_small          h1               47,540           -      36,939      60,381      59,293      28,671      36,221      35,725
+file_big            h1                3,691           -       3,669       3,762       3,730       1,317       3,754       3,727
+stream              h1               86,545           -           -     142,925     148,422     102,764           -      34,977
+stream_small        h1                7,214           -           -       8,207       8,374       8,288           -       6,785
+stream_big          h1                7,343           -           -       8,726       8,697       8,510           -       7,691
+sse                 h1                    -           -           -      18,341      18,606           -           -      12,796
+sse_small           h1                    -           -           -       6,598       6,577           -           -       6,264
+sse_big             h1                    -           -           -       6,781       6,486           -           -       2,444
+hello               h2               80,467       8,307           -     163,450     363,035           -           -     216,188
+hello_headers       h2               72,721       8,309           -     137,648     259,101           -           -     178,425
+echo_1kb            h2               68,590       7,097           -     120,417     211,514           -           -     186,200
+echo_1kb_headers    h2               63,238       7,061           -     110,368     167,435           -           -     155,359
+echo_10kb           h2               57,553       8,685           -      99,088     137,507           -           -     140,386
+echo_chunked_10kb   h2               54,651       8,693           -      93,774     141,614           -           -     136,139
+file_tiny           h2               40,707       8,386           -      81,861     129,972           -           -      35,029
+file_small          h2               31,624      26,619           -      49,874      47,999           -           -      25,559
+file_big            h2                  749         472           -         493         949           -           -       1,074
+stream              h2               52,299       8,799           -      88,386     200,561           -           -     128,305
+stream_small        h2                4,541      10,530           -       5,122      12,490           -           -       6,657
+stream_big          h2                4,937           -           -       5,441      11,938           -           -       6,945
+sse                 h2                    -           -           -       9,899      23,603           -           -      16,456
+sse_small           h2                    -           -           -       3,579       8,512           -           -       5,809
+sse_big             h2                    -           -           -       3,257       4,842           -           -       2,256
 
 messages/s
 
-case                profile          bandit  chatterbox        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+case                profile          bandit  chatterbox        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 -------------------------------------------------------------------------------------------------------------------------------
-stream              h1              165,154           -           -           -     278,414     196,658           -      69,026
-stream_small        h1              680,100           -           -           -     792,090     788,960           -     638,440
-stream_big          h1              430,682           -           -           -     502,592     492,307           -     468,019
-sse                 h1                    -           -           -           -     556,720           -           -     395,184
-sse_small           h1                    -           -           -           -     612,230           -           -     603,940
-sse_big             h1                    -           -           -           -     375,482           -           -     155,616
-stream              h2              100,065      17,528           -           -     176,801           -           -     229,466
-stream_small        h2              445,520   1,068,680           -           -     508,620           -           -     614,900
-stream_big          h2              291,462           -           -           -     332,109           -           -     411,392
-sse                 h2                    -           -           -           -     350,566           -           -     493,258
-sse_small           h2                    -           -           -           -     381,710           -           -     554,720
-sse_big             h2                    -           -           -           -     212,672           -           -     138,394
+stream              h1              173,089           -           -     285,850     296,844     205,528           -      69,953
+stream_small        h1              721,400           -           -     820,670     837,410     828,840           -     678,450
+stream_big          h1              469,952           -           -     558,451     556,614     544,627           -     492,218
+sse                 h1                    -           -           -     586,896     595,376           -           -     409,475
+sse_small           h1                    -           -           -     659,800     657,650           -           -     626,360
+sse_big             h1                    -           -           -     433,952     415,098           -           -     156,410
+stream              h2              104,597      17,597           -     176,771     401,122           -           -     256,610
+stream_small        h2              454,070   1,053,010           -     512,160   1,248,960           -           -     665,650
+stream_big          h2              315,974           -           -     348,243     764,038           -           -     444,461
+sse                 h2                    -           -           -     316,774     755,302           -           -     526,576
+sse_small           h2                    -           -           -     357,910     851,180           -           -     580,920
+sse_big             h2                    -           -           -     208,461     309,914           -           -     144,352
 
 p99 at a fixed offered rate for http1
 
 hello
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-50,000              2.43ms      1.91ms      2.18ms      1.83ms      3.80ms      2.06ms      1.86ms
-100,000             3.69ms      2.82ms      3.38ms      3.01ms     16.91ms      3.53ms      2.89ms
-150,000            53.98ms      3.84ms      4.96ms      3.97ms           -      4.09ms      4.03ms
+50,000              2.33ms      1.89ms      1.80ms      1.78ms      3.75ms      2.05ms      1.83ms
+100,000             3.53ms      3.24ms      2.72ms      2.78ms      7.67ms      3.54ms      2.79ms
+150,000            23.66ms      4.20ms      3.61ms      4.18ms           -      3.82ms      3.70ms
 
 hello_headers
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-50,000              2.78ms      2.03ms      2.55ms      2.00ms      3.68ms      2.47ms      2.07ms
-100,000             4.00ms      3.33ms      3.82ms      3.65ms           -      3.66ms      3.74ms
-150,000                  -      3.85ms    872.96ms      3.67ms           -      9.94ms      3.89ms
+50,000              2.77ms      1.97ms      2.01ms      2.02ms      3.98ms      2.34ms      2.12ms
+100,000             4.20ms      3.54ms      3.30ms      4.02ms           -      3.60ms      3.40ms
+150,000                  -      3.74ms      3.43ms      4.07ms           -      8.28ms      3.99ms
 
 echo_1kb
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-50,000              2.77ms      2.04ms      2.51ms      2.13ms      3.43ms      2.37ms      2.13ms
-100,000             3.90ms      3.77ms      3.75ms      3.91ms           -      3.69ms      3.63ms
-150,000                  -      4.16ms     15.09ms      4.32ms           -      6.55ms      4.12ms
+50,000              2.73ms      1.98ms      1.98ms      2.10ms      3.60ms      2.33ms      2.11ms
+100,000             3.81ms      3.50ms      3.48ms      3.85ms           -      3.77ms      3.61ms
+150,000                  -      3.75ms      3.58ms      4.32ms           -      6.86ms      4.25ms
 
 echo_1kb_headers
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-40,000              2.42ms      1.70ms      2.16ms      1.80ms      3.66ms      2.12ms      1.81ms
-80,000              3.65ms      2.99ms      3.34ms      3.12ms           -      3.60ms      3.27ms
-120,000           893.44ms      4.26ms     10.15ms      3.97ms           -      6.31ms      4.10ms
+40,000              2.26ms      1.70ms      1.70ms      1.75ms      3.94ms      2.01ms      1.81ms
+80,000              3.88ms      2.82ms      2.91ms      3.38ms           -      3.70ms      3.61ms
+120,000           611.84ms      3.46ms      3.56ms      4.10ms           -      5.58ms      4.09ms
 
 echo_10kb
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-20,000              1.82ms      1.68ms      1.74ms      1.66ms           -      1.73ms      1.67ms
-60,000              3.50ms      2.83ms      3.09ms      2.59ms           -      2.92ms      2.65ms
-100,000             6.43ms      4.52ms      3.86ms      3.75ms           -      4.17ms      3.78ms
+20,000              1.79ms      1.69ms      1.63ms      1.65ms           -      1.70ms      1.65ms
+60,000              3.56ms      2.76ms      2.48ms      2.55ms           -      3.14ms      2.60ms
+100,000             5.78ms      4.04ms      3.53ms      3.84ms           -      3.85ms      3.88ms
 
 echo_chunked_10kb
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-40,000              3.63ms           -      2.86ms      2.12ms           -      2.77ms      2.14ms
-70,000              7.70ms           -      3.57ms      3.57ms           -      3.49ms      3.50ms
-100,000                  -           -    511.49ms      4.01ms           -      7.12ms      3.88ms
+40,000              3.39ms           -      2.14ms      2.17ms           -      2.58ms      2.13ms
+70,000              8.93ms           -      3.50ms      3.90ms           -      3.82ms      3.60ms
+100,000                  -           -      4.15ms      4.02ms           -      6.45ms      4.03ms
 
 file_tiny
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-20,000              3.72ms      2.58ms           -      3.63ms      3.84ms      3.00ms      2.85ms
-40,000             10.02ms    207.10ms           -      4.50ms           -           -    483.33ms
-60,000                   -           -           -     43.65ms           -           -           -
+20,000              3.96ms      2.76ms      3.48ms      3.43ms      3.73ms      3.43ms      3.10ms
+40,000             10.71ms     97.02ms      4.53ms      4.94ms           -    579.07ms    215.93ms
+60,000                   -           -     40.86ms     60.38ms           -           -           -
 
 file_small
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-15,000              3.04ms      2.18ms           -      2.50ms      2.77ms      2.30ms      2.22ms
-30,000              4.49ms      4.73ms           -      4.65ms    191.74ms      6.08ms      5.13ms
-45,000            233.60ms           -           -     11.31ms           -           -           -
+15,000              2.85ms      2.19ms      2.88ms      2.25ms      2.74ms      2.38ms      2.22ms
+30,000              4.82ms      4.97ms      4.80ms      4.43ms     78.01ms      5.34ms      5.56ms
+45,000            237.95ms           -      9.38ms      9.45ms           -           -           -
 
 file_big
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-500                 4.58ms      4.60ms           -      4.49ms      6.17ms      4.43ms      4.81ms
-1,000               4.58ms      4.71ms           -      4.67ms      7.17ms      4.64ms      4.47ms
-1,500               4.72ms      4.76ms           -      4.61ms           -      4.89ms      4.72ms
+500                 4.73ms      4.30ms      4.30ms      4.34ms      6.09ms      4.36ms      4.58ms
+1,000               4.39ms      4.46ms      4.32ms      4.39ms      6.64ms      4.46ms      4.43ms
+1,500               4.69ms      4.59ms      4.90ms      4.82ms      9.44ms      4.60ms      4.74ms
 
 stream
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-20,000              2.01ms           -           -      1.80ms      1.92ms           -      2.41ms
-40,000              3.11ms           -           -      2.45ms      2.94ms           -           -
-60,000              4.28ms           -           -      3.33ms      3.85ms           -           -
+20,000              1.98ms           -      1.74ms      1.74ms      1.87ms           -      2.35ms
+40,000              3.30ms           -      2.41ms      2.40ms      2.85ms           -           -
+60,000              3.94ms           -      3.17ms      3.41ms      3.64ms           -           -
 
 stream_small
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-3,000               3.74ms           -           -      3.35ms      3.34ms           -      3.88ms
-5,000              11.87ms           -           -      5.19ms      4.54ms           -      8.42ms
-7,000                    -           -           -     39.58ms     27.98ms           -           -
+3,000               3.57ms           -      3.23ms      3.24ms      3.16ms           -      3.49ms
+5,000               8.94ms           -      5.10ms      4.53ms      4.46ms           -      7.40ms
+7,000             445.18ms           -     24.27ms     12.46ms     13.83ms           -           -
 
 stream_big
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-3,000               3.59ms           -           -      3.30ms      3.29ms           -      3.48ms
-5,000               9.20ms           -           -      4.48ms      4.43ms           -      5.13ms
-7,000                    -           -           -     71.68ms     55.36ms           -     63.87ms
+3,000               3.44ms           -      3.21ms      3.08ms      3.17ms           -      3.40ms
+5,000               7.74ms           -      4.41ms      4.33ms      4.26ms           -      4.80ms
+7,000             185.98ms           -     20.78ms     15.92ms     11.19ms           -     33.12ms
 
 sse
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-6,000                    -           -      3.36ms      2.59ms           -      3.12ms      2.83ms
-10,000                   -           -           -      4.19ms           -           -      5.57ms
-14,000                   -           -           -     10.43ms           -           -           -
+6,000                    -           -      2.59ms      2.58ms           -      3.04ms      2.82ms
+10,000                   -           -      4.03ms      4.00ms           -     83.58ms      5.61ms
+14,000                   -           -      7.38ms      7.50ms           -           -           -
 
 sse_small
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-3,000                    -           -      5.02ms      3.98ms           -      4.89ms      3.87ms
-5,000                    -           -           -     17.90ms           -           -     16.01ms
+3,000                    -           -      3.87ms      3.81ms           -      5.01ms      3.82ms
+5,000                    -           -     18.14ms     12.53ms           -           -     11.50ms
 
 sse_big
-target req/s        bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+target req/s        bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------
-3,000                    -           -      4.07ms      3.67ms           -      3.99ms           -
-5,000                    -           -     89.47ms     16.75ms           -     53.25ms           -
+3,000                    -           -      3.72ms      3.55ms           -      3.89ms           -
+5,000                    -           -      9.85ms      9.31ms           -     11.09ms           -
 
 highest rung held, req/s
 
-case                      bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+case                      bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------------
 hello                    150,000     150,000     150,000     150,000     100,000     150,000     150,000
 hello_headers            100,000     150,000     150,000     150,000      50,000     150,000     150,000
@@ -180,32 +180,32 @@ echo_1kb                 100,000     150,000     150,000     150,000      50,000
 echo_1kb_headers         120,000     120,000     120,000     120,000      40,000     120,000     120,000
 echo_10kb                100,000     100,000     100,000     100,000           -     100,000     100,000
 echo_chunked_10kb         70,000           -     100,000     100,000           -     100,000     100,000
-file_tiny                 40,000      40,000           -      60,000      20,000      20,000      40,000
-file_small                45,000      30,000           -      45,000      30,000      30,000      30,000
-file_big                   1,500       1,500           -       1,500       1,000       1,500       1,500
-stream                    60,000           -           -      60,000      60,000           -      20,000
-stream_small               5,000           -           -       7,000       7,000           -       5,000
-stream_big                 5,000           -           -       7,000       7,000           -       7,000
-sse                            -           -       6,000      14,000           -       6,000      10,000
-sse_small                      -           -       3,000       5,000           -       3,000       5,000
+file_tiny                 40,000      40,000      60,000      60,000      20,000      40,000      40,000
+file_small                45,000      30,000      45,000      45,000      30,000      30,000      30,000
+file_big                   1,500       1,500       1,500       1,500       1,500       1,500       1,500
+stream                    60,000           -      60,000      60,000      60,000           -      20,000
+stream_small               7,000           -       7,000       7,000       7,000           -       5,000
+stream_big                 7,000           -       7,000       7,000       7,000           -       7,000
+sse                            -           -      14,000      14,000           -      10,000      10,000
+sse_small                      -           -       5,000       5,000           -       3,000       5,000
 sse_big                        -           -       5,000       5,000           -       5,000           -
 
 CO gap at the highest rung held
 
-case                      bandit        elli       ewe@4       ewe@5       httpd        mist  roadrunner
+case                      bandit        elli       ewe@8       ewe@9       httpd        mist  roadrunner
 --------------------------------------------------------------------------------------------------------
-hello                      89.2x        8.6x        7.5x        9.1x       18.6x        6.4x        9.2x
-hello_headers               3.9x        7.0x     1374.7x        7.4x        3.2x       16.3x        6.4x
-echo_1kb                    3.8x        6.6x       23.1x        7.0x        2.5x       10.6x        6.0x
-echo_1kb_headers         1197.6x        6.6x       13.6x        5.8x        2.3x        6.0x        6.1x
-echo_10kb                   5.7x        6.2x        4.5x        6.2x           -        4.9x        6.3x
-echo_chunked_10kb           5.7x           -      574.7x        4.5x           -        6.2x        4.6x
-file_tiny                   2.4x       64.1x           -       10.0x        1.9x        2.0x      161.6x
-file_small                 50.1x        1.9x           -        3.0x       55.9x        2.0x        2.2x
-file_big                    1.3x        1.3x           -        1.3x        1.1x        1.3x        1.3x
-stream                      2.7x           -           -        4.4x        3.7x           -        3.0x
-stream_small                1.1x           -           -        3.5x        2.6x           -        1.1x
-stream_big                  1.1x           -           -        5.9x        4.8x           -        4.4x
-sse                            -           -        1.5x        2.2x           -        1.6x        1.2x
-sse_small                      -           -        1.2x        1.5x           -        1.2x        1.2x
-sse_big                        -           -        6.4x        1.4x           -        4.1x           -
+hello                      39.4x        9.2x        9.3x        9.2x        7.8x        6.4x        8.9x
+hello_headers               3.8x        6.8x        7.5x        7.1x        3.2x       13.1x        6.8x
+echo_1kb                    4.2x        6.7x        6.9x        7.1x        2.6x       10.1x        6.9x
+echo_1kb_headers          845.1x        6.4x        6.2x        5.9x        2.3x        5.3x        6.4x
+echo_10kb                   5.3x        6.1x        6.3x        6.3x           -        5.4x        6.1x
+echo_chunked_10kb           6.3x           -        4.9x        4.8x           -        5.5x        4.6x
+file_tiny                   2.5x       31.9x        9.8x       14.0x        1.8x      174.9x       72.7x
+file_small                 53.2x        2.2x        2.6x        2.4x       22.6x        1.9x        2.1x
+file_big                    1.3x        1.3x        1.3x        1.3x        1.0x        1.4x        1.3x
+stream                      2.8x           -        5.0x        5.0x        4.0x           -        3.1x
+stream_small               34.0x           -        2.4x        1.4x        1.5x           -        1.1x
+stream_big                 13.3x           -        2.2x        1.7x        1.3x           -        2.5x
+sse                            -           -        1.7x        1.6x           -       13.8x        1.2x
+sse_small                      -           -        1.5x        1.1x           -        1.2x        1.1x
+sse_big                        -           -        1.1x        1.1x           -        1.1x           -
