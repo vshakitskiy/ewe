@@ -2,7 +2,7 @@ import ewe/internal/connection
 import ewe/internal/rescue
 import gleam/bit_array
 import gleam/erlang/process
-import gleam/option.{type Option}
+import gleam/option
 import websocks
 
 pub type Message(user_message) {
@@ -224,8 +224,8 @@ pub fn close_frame(reason: websocks.CloseReason) -> BitArray {
 }
 
 pub fn compression(
-  extensions: Option(String),
-) -> Option(websocks.CompressionExtensions) {
+  extensions: option.Option(String),
+) -> option.Option(websocks.CompressionExtensions) {
   case extensions {
     option.Some(header) ->
       case websocks.has_deflate(header) {

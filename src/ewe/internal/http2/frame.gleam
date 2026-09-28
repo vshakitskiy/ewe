@@ -1,6 +1,6 @@
 import gleam/bit_array
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 
 pub type Frame {
   Data(stream_id: Int, end_stream: Bool, data: BitArray, size: Int)
@@ -8,7 +8,7 @@ pub type Frame {
     stream_id: Int,
     end_stream: Bool,
     end_headers: Bool,
-    dependency: Option(Int),
+    dependency: option.Option(Int),
     fragment: BitArray,
   )
   Priority(stream_id: Int, dependency: Int)
@@ -245,7 +245,7 @@ fn unpad(
 fn priority_fields(
   present: Bool,
   content: BitArray,
-  decode: fn(Option(Int), BitArray) -> Decoded,
+  decode: fn(option.Option(Int), BitArray) -> Decoded,
 ) -> Decoded {
   case present, content {
     False, _content -> decode(None, content)
@@ -274,7 +274,7 @@ fn decode_settings(
 fn decode_setting(
   identifier: Int,
   value: Int,
-) -> Result(Option(Setting), ErrorCode) {
+) -> Result(option.Option(Setting), ErrorCode) {
   case identifier, value {
     0x1, _value -> Ok(Some(HeaderTableSize(value)))
     0x2, 0 -> Ok(Some(EnablePush(False)))

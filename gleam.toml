@@ -11,9 +11,9 @@ internal_modules = ["ewe/internal/*"]
 
 [documentation]
 pages = [
-    { title = "Migrating from v4 to latest", path = "migration.html", source = "./MIGRATING.md" },
-    { title = "Using ewe with Wisp", path = "wisp.html", source = "./WISP.md" },
-    { title = "Benchmarks", path = "benchmarks.html", source = "benchmark/RESULTS.md" },
+    { title = "Migrating from v4 to latest", path = "migration.html", source = "./docs/migration.md" },
+    { title = "Using ewe with Wisp", path = "wisp.html", source = "./docs/wisp.md" },
+    { title = "Benchmarks", path = "benchmarks.html", source = "./docs/benchmarks.md" },
 ]
 
 [dependencies]

@@ -7,7 +7,7 @@ import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import logging
 
@@ -113,7 +113,7 @@ fn send_headers(
   commands: process.Subject(http2.Command),
   stream_id: Int,
   response: response.Response(connection.Body),
-  signals: Option(process.Subject(http2.StreamSignal)),
+  signals: option.Option(process.Subject(http2.StreamSignal)),
   stream: fn(http2.ResponseWriter) -> Nil,
 ) -> Nil {
   process.trap_exits(True)

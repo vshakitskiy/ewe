@@ -1,6 +1,6 @@
 import ewe
 import examples/pubsub
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process
 import gleam/http/request
 import gleam/http/response
 import gleam/otp/static_supervisor as supervisor
@@ -39,7 +39,7 @@ pub fn main() {
 
 fn handle_request(
   req: request.Request(ewe.Connection),
-  pubsub: Subject(pubsub.Message(Broadcast)),
+  pubsub: process.Subject(pubsub.Message(Broadcast)),
 ) -> response.Response(ewe.Body) {
   case request.path_segments(req) {
     ["topic", topic] -> handle_topic(req, pubsub, topic)
@@ -51,9 +51,9 @@ fn handle_request(
 
 type WebsocketState {
   WebsocketState(
-    pubsub: Subject(pubsub.Message(Broadcast)),
+    pubsub: process.Subject(pubsub.Message(Broadcast)),
     topic: String,
-    client: Subject(Broadcast),
+    client: process.Subject(Broadcast),
   )
 }
 
@@ -65,7 +65,7 @@ type Broadcast {
 
 fn handle_topic(
   req: request.Request(ewe.Connection),
-  pubsub: Subject(pubsub.Message(Broadcast)),
+  pubsub: process.Subject(pubsub.Message(Broadcast)),
   topic: String,
 ) -> response.Response(ewe.Body) {
   // Upgrade the HTTP connection to WebSocket. Unlike SSE, WebSocket is

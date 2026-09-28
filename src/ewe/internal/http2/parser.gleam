@@ -1,8 +1,8 @@
 import ewe/internal/target
 import gleam/http
-import gleam/http/request.{type Request, Request}
+import gleam/http/request.{Request}
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 
@@ -26,24 +26,24 @@ pub type Malformed {
 
 pub type DecodedRequest {
   DecodedRequest(
-    request: Request(Nil),
-    content_length: Option(Int),
-    protocol: Option(String),
+    request: request.Request(Nil),
+    content_length: option.Option(Int),
+    protocol: option.Option(String),
   )
 }
 
 type Section {
   Section(
-    method: Option(BitArray),
-    scheme: Option(BitArray),
-    authority: Option(BitArray),
-    path: Option(BitArray),
-    protocol: Option(BitArray),
+    method: option.Option(BitArray),
+    scheme: option.Option(BitArray),
+    authority: option.Option(BitArray),
+    path: option.Option(BitArray),
+    protocol: option.Option(BitArray),
     seen_regular: Bool,
     headers: List(#(String, String)),
     cookies: List(String),
-    host: Option(String),
-    content_length: Option(Int),
+    host: option.Option(String),
+    content_length: option.Option(Int),
   )
 }
 
@@ -119,7 +119,7 @@ fn empty_section() -> Section {
 fn target_request(
   section: Section,
   method: http.Method,
-) -> Result(Request(Nil), Malformed) {
+) -> Result(request.Request(Nil), Malformed) {
   use scheme <- result.try(required(section.scheme))
   use scheme <- result.try(case scheme {
     <<"https":utf8>> -> Ok(http.Https)
@@ -152,7 +152,7 @@ fn target_request(
 fn resolve_authority(
   section: Section,
   scheme: http.Scheme,
-) -> Result(#(String, Option(Int)), Malformed) {
+) -> Result(#(String, option.Option(Int)), Malformed) {
   case section.authority, section.host {
     Some(authority), None -> parse_authority(authority)
     None, Some(host) -> parse_authority(<<host:utf8>>)
@@ -185,21 +185,23 @@ fn default_port(scheme: http.Scheme) -> Int {
 
 fn parse_authority(
   authority: BitArray,
-) -> Result(#(String, Option(Int)), Malformed) {
+) -> Result(#(String, option.Option(Int)), Malformed) {
   case target.parse_authority(authority) {
     Ok(#(host, port)) -> Ok(#(unsafe_to_string(host), port))
     Error(Nil) -> Error(InvalidAuthority)
   }
 }
 
-fn no_content_length(content_length: Option(Int)) -> Result(Nil, Malformed) {
+fn no_content_length(
+  content_length: option.Option(Int),
+) -> Result(Nil, Malformed) {
   case content_length {
     None -> Ok(Nil)
     Some(_length) -> Error(ContentOnConnect)
   }
 }
 
-fn required(value: Option(a)) -> Result(a, Malformed) {
+fn required(value: option.Option(a)) -> Result(a, Malformed) {
   option.to_result(value, MissingPseudoHeader)
 }
 
@@ -258,10 +260,10 @@ fn add_pseudo(
 }
 
 fn once(
-  current: Option(BitArray),
+  current: option.Option(BitArray),
   value: BitArray,
   validate: Bool,
-  set: fn(Option(BitArray)) -> Result(Section, Malformed),
+  set: fn(option.Option(BitArray)) -> Result(Section, Malformed),
 ) -> Result(Section, Malformed) {
   case current, value {
     Some(_current), _value -> Error(DuplicatePseudoHeader)

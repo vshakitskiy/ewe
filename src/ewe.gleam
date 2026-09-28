@@ -171,7 +171,7 @@ import gleam/http/response
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -332,7 +332,7 @@ fn to_internal_key(key_type: TlsKeyType, key: BitArray) -> tup.TlsPrivateKey {
 
 fn to_internal_tls(
   tls: Tls,
-  client_verification: Option(ClientVerification),
+  client_verification: option.Option(ClientVerification),
 ) -> tup.Tls {
   let certificate = case tls {
     Disk(cert:, key:) -> tup.Disk(cert:, key:)
@@ -346,12 +346,12 @@ fn to_internal_tls(
     |> tup.with_alpn(["h2", "http/1.1"])
 
   case client_verification {
-    Some(verification) ->
+    option.Some(verification) ->
       tup.verifying_clients(
         tls,
         tup.Required(trusting: to_internal_trust_store(verification)),
       )
-    None -> tls
+    option.None -> tls
   }
 }
 
@@ -458,13 +458,13 @@ fn within(
 }
 
 fn optional_at_least(
-  value: Option(Int),
+  value: option.Option(Int),
   minimum: Int,
-  default: Option(Int),
+  default: option.Option(Int),
   field: String,
-) -> Option(Int) {
+) -> option.Option(Int) {
   case value {
-    Some(limit) if limit < minimum -> {
+    option.Some(limit) if limit < minimum -> {
       out_of_range(field, int.to_string(limit), limit_to_string(default))
       default
     }
@@ -472,10 +472,10 @@ fn optional_at_least(
   }
 }
 
-fn limit_to_string(limit: Option(Int)) -> String {
+fn limit_to_string(limit: option.Option(Int)) -> String {
   case limit {
-    Some(limit) -> int.to_string(limit)
-    None -> "no limit"
+    option.Some(limit) -> int.to_string(limit)
+    option.None -> "no limit"
   }
 }
 
@@ -555,14 +555,14 @@ pub type Http2Options {
   Http2Options(
     /// The most streams a client may have open at once. The default is 100.
     /// `None` means no limit.
-    max_concurrent_streams: Option(Int),
+    max_concurrent_streams: option.Option(Int),
     /// How much request body a client may send on a new stream before the
     /// server allows more. Must be within 0 and 2147483647.
     initial_window_size: Int,
     /// The largest frame the server accepts. Must be within 16384 and 16777215.
     max_frame_size: Int,
     /// The largest header list the server accepts. `None` means no limit.
-    max_header_list_size: Option(Int),
+    max_header_list_size: option.Option(Int),
     /// How much HPACK dynamic table the server keeps for decoding.
     header_table_size: Int,
     /// The most CONTINUATION frames one header block may use.
@@ -790,11 +790,11 @@ pub opaque type Builder {
     handler: fn(request.Request(Connection)) -> response.Response(Body),
     on_crash: response.Response(Body),
     bind_target: BindTarget,
-    tls: Option(Tls),
-    client_verification: Option(ClientVerification),
+    tls: option.Option(Tls),
+    client_verification: option.Option(ClientVerification),
     http1: Http1Options,
     http2: Http2Options,
-    name: Option(process.Name(tup.Server)),
+    name: option.Option(process.Name(tup.Server)),
     on_start: fn(http.Scheme, SocketAddress) -> Nil,
     shutdown_timeout: Int,
     buffer_size: Int,
@@ -834,11 +834,11 @@ pub fn new(
     handler:,
     on_crash: response.set_body(response.new(500), Empty),
     bind_target: TcpBind(interface: "127.0.0.1", port: 3000, ipv6: False),
-    tls: None,
-    client_verification: None,
+    tls: option.None,
+    client_verification: option.None,
     http1: default_http1_options(),
     http2: default_http2_options(),
-    name: None,
+    name: option.None,
     on_start: fn(scheme, address) {
       case address {
         TcpSocketAddress(ip_address:, port:) -> {
@@ -882,7 +882,7 @@ pub fn new(
 /// // -> Ok(TcpSocketAddress(IpV4(127, 0, 0, 1), 54321))
 /// ```
 pub fn named(builder: Builder, name: process.Name(tup.Server)) -> Builder {
-  Builder(..builder, name: Some(name))
+  Builder(..builder, name: option.Some(name))
 }
 
 /// Set the network interface the server listens on. `"127.0.0.1"` and
@@ -955,7 +955,7 @@ pub fn unix(builder: Builder, path: String) -> Builder {
 /// ewe.with_tls(builder, ewe.Der(cert, key, ewe.RsaPrivateKey))
 /// ```
 pub fn with_tls(builder: Builder, tls: Tls) -> Builder {
-  Builder(..builder, tls: Some(tls))
+  Builder(..builder, tls: option.Some(tls))
 }
 
 /// Set the function to run once the server is listening. It is given the
@@ -1036,7 +1036,7 @@ pub fn with_client_verification(
   builder: Builder,
   ca_cert: ClientVerification,
 ) -> Builder {
-  Builder(..builder, client_verification: Some(ca_cert))
+  Builder(..builder, client_verification: option.Some(ca_cert))
 }
 
 fn to_internal_crash_response(
@@ -1124,15 +1124,15 @@ pub fn start(
     ))
 
   let pool = case builder.name {
-    Some(name) -> tup.named(pool, name)
-    None -> pool
+    option.Some(name) -> tup.named(pool, name)
+    option.None -> pool
   }
 
   let pool = case builder.tls {
-    Some(tls) ->
+    option.Some(tls) ->
       to_internal_tls(tls, builder.client_verification)
       |> tup.with_tls(pool, _)
-    None -> pool
+    option.None -> pool
   }
 
   let pool = case builder.bind_target {
@@ -1152,8 +1152,8 @@ pub fn start(
   let address = from_internal_endpoint(endpoint)
 
   let scheme = case builder.tls {
-    Some(_tls) -> http.Https
-    None -> http.Http
+    option.Some(_tls) -> http.Https
+    option.None -> http.Http
   }
   builder.on_start(scheme, address)
 
@@ -1220,8 +1220,8 @@ fn from_internal_file_error(error: file.FileError) -> FileError {
 pub fn file(
   connection: Connection,
   path: String,
-  offset offset: Option(Int),
-  limit limit: Option(Int),
+  offset offset: option.Option(Int),
+  limit limit: option.Option(Int),
 ) -> Result(Body, FileError) {
   case file.resolve(connection, path, offset, limit) {
     Ok(file) -> Ok(File(file))
@@ -1577,7 +1577,7 @@ pub fn finish_response(writer: ResponseWriter) -> Result(Nil, SendError) {
 /// Create one with `continue`, `continue_with_selector`, `stop` or
 /// `stop_abnormal`.
 pub opaque type Next(user_state, user_message) {
-  Continue(user_state, Option(process.Selector(user_message)))
+  Continue(user_state, option.Option(process.Selector(user_message)))
   Stop
   StopAbnormal(reason: String)
 }
@@ -1585,7 +1585,7 @@ pub opaque type Next(user_state, user_message) {
 /// Carry on handling further messages with the given state and the selector
 /// the connection already uses.
 pub fn continue(user_state: user_state) -> Next(user_state, user_message) {
-  Continue(user_state, None)
+  Continue(user_state, option.None)
 }
 
 /// Carry on using the given selector from here on.
@@ -1593,7 +1593,7 @@ pub fn continue_with_selector(
   user_state: user_state,
   selector: process.Selector(user_message),
 ) -> Next(user_state, user_message) {
-  Continue(user_state, Some(selector))
+  Continue(user_state, option.Some(selector))
 }
 
 /// End the connection. To tell a WebSocket client the reason use 
@@ -1641,7 +1641,7 @@ pub type SseEvent =
 /// |> event_id("1")
 /// ```
 pub fn event(data: String) -> SseEvent {
-  sse.Event(..sse.new(), data: Some(data))
+  sse.Event(..sse.new(), data: option.Some(data))
 }
 
 /// Create a comment.
@@ -1649,23 +1649,23 @@ pub fn event(data: String) -> SseEvent {
 /// Sending one every so often is the usual way to keep an idle stream from
 /// being closed by a proxy in between.
 pub fn comment(text: String) -> SseEvent {
-  sse.Event(..sse.new(), comment: Some(text))
+  sse.Event(..sse.new(), comment: option.Some(text))
 }
 
 /// Set the name of an event which clients use to route it to a listener.
 pub fn event_name(event: SseEvent, name: String) -> SseEvent {
-  sse.Event(..event, name: Some(name))
+  sse.Event(..event, name: option.Some(name))
 }
 
 /// Set the ID of an event. A reconnecting client sends the last ID it saw back
 /// in the `last-event-id` header.
 pub fn event_id(event: SseEvent, id: String) -> SseEvent {
-  sse.Event(..event, id: Some(id))
+  sse.Event(..event, id: option.Some(id))
 }
 
 /// Set how long, in milliseconds, the client waits before reconnecting.
 pub fn event_retry(event: SseEvent, retry: Int) -> SseEvent {
-  sse.Event(..event, retry: Some(retry))
+  sse.Event(..event, retry: option.Some(retry))
 }
 
 /// Send an event to the client of a Server-Sent Events stream.
@@ -2015,10 +2015,10 @@ fn extension_headers(
   compression: option.Option(websocks.CompressionExtensions),
 ) -> List(#(String, String)) {
   case compression {
-    Some(extensions) -> [
+    option.Some(extensions) -> [
       #("sec-websocket-extensions", compression_header(extensions)),
     ]
-    None -> []
+    option.None -> []
   }
 }
 
@@ -2052,11 +2052,11 @@ fn append_flag(
 
 fn append_window_bits(
   parameters: List(String),
-  bits: Option(Int),
+  bits: option.Option(Int),
   name: String,
 ) -> List(String) {
   case bits {
-    Some(bits) -> [name <> "=" <> int.to_string(bits), ..parameters]
-    None -> parameters
+    option.Some(bits) -> [name <> "=" <> int.to_string(bits), ..parameters]
+    option.None -> parameters
   }
 }
