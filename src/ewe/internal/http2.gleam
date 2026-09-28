@@ -1,23 +1,23 @@
 import alpacki
 import ewe/internal/clock
-import ewe/internal/connection.{type Body}
+import ewe/internal/connection
 import ewe/internal/file
 import ewe/internal/http2/connection as http2
-import ewe/internal/http2/frame.{type ErrorCode}
-import ewe/internal/http2/outbox.{type Outbox}
+import ewe/internal/http2/frame
+import ewe/internal/http2/outbox
 import ewe/internal/http2/parser
 import ewe/internal/http2/worker
-import ewe/internal/queue.{type Queue}
+import ewe/internal/queue
 import gleam/bit_array
-import gleam/bytes_tree.{type BytesTree}
-import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Pid, type Subject}
+import gleam/bytes_tree
+import gleam/dict
+import gleam/erlang/process
 import gleam/http
 import gleam/http/request
-import gleam/http/response.{type Response}
+import gleam/http/response
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
@@ -44,9 +44,9 @@ pub opaque type State {
     decoder: alpacki.DynamicTable,
     decoder_limit: Int,
     encoder: alpacki.DynamicTable,
-    streams: Dict(Int, Stream),
-    workers: Dict(Pid, Int),
-    ready: Queue(Int),
+    streams: dict.Dict(Int, Stream),
+    workers: dict.Dict(process.Pid, Int),
+    ready: queue.Queue(Int),
     resuming: Bool,
     reset_streams: List(Int),
     last_stream_id: Int,
@@ -54,12 +54,12 @@ pub opaque type State {
     recv_window: Int,
     resets: ResetBudget,
     last_activity: Int,
-    self: Subject(connection.Message),
-    commands: Subject(http2.Command),
+    self: process.Subject(connection.Message),
+    commands: process.Subject(http2.Command),
     handler: connection.Handler,
     peer: tup.Endpoint,
     scheme: http.Scheme,
-    parent: Result(Pid, Nil),
+    parent: Result(process.Pid, Nil),
   )
 }
 
@@ -74,7 +74,7 @@ type FieldBlock {
     stream_id: Int,
     purpose: Purpose,
     end_stream: Bool,
-    dependency: Option(Int),
+    dependency: option.Option(Int),
     fragments: BitArray,
     continuations: Int,
   )
@@ -87,7 +87,7 @@ type Purpose {
 }
 
 type Segment {
-  Frames(BytesTree)
+  Frames(bytes_tree.BytesTree)
   SendFile(descriptor: connection.FileDescriptor, offset: Int, length: Int)
   CloseFile(connection.FileDescriptor)
 }
@@ -104,25 +104,25 @@ type Stream {
     outbound: Outbound,
     inbound: Inbound,
     tunnel: Bool,
-    worker: Option(Pid),
+    worker: option.Option(process.Pid),
     send_window: Int,
     recv_window: Int,
     scheduled: Bool,
-    held_ack: Option(Subject(http2.WriteAck)),
-    signals: Option(Subject(http2.StreamSignal)),
+    held_ack: option.Option(process.Subject(http2.WriteAck)),
+    signals: option.Option(process.Subject(http2.StreamSignal)),
     files: List(connection.FileDescriptor),
-    unread: BytesTree,
+    unread: bytes_tree.BytesTree,
     unread_size: Int,
-    reader: Option(Subject(http2.BodyEvent)),
+    reader: option.Option(process.Subject(http2.BodyEvent)),
     trailers: List(#(String, String)),
-    content_length: Option(Int),
+    content_length: option.Option(Int),
     received_size: Int,
   )
 }
 
 type Outbound {
   AwaitingResponse
-  Responding(Outbox)
+  Responding(outbox.Outbox)
   Responded
 }
 
@@ -137,7 +137,7 @@ type ResetBudget {
 }
 
 type Halt {
-  Fail(state: State, error: ErrorCode)
+  Fail(state: State, error: frame.ErrorCode)
   Quit(state: State)
 }
 
@@ -157,9 +157,9 @@ pub fn start(
   connection: tup.Connection,
   handler: connection.Handler,
   options: http2.Options,
-  self: Subject(connection.Message),
-  commands: Subject(http2.Command),
-  parent: Result(Pid, Nil),
+  self: process.Subject(connection.Message),
+  commands: process.Subject(http2.Command),
+  parent: Result(process.Pid, Nil),
   rest: BitArray,
 ) -> Next {
   let scheme = case tup.socket(connection).0 {
@@ -485,7 +485,7 @@ fn receive_stream_data(
 }
 
 fn content_length_mismatch(
-  content_length: Option(Int),
+  content_length: option.Option(Int),
   received: Int,
   complete: Bool,
 ) -> Bool {
@@ -514,7 +514,7 @@ fn feed_reader(state: State, stream_id: Int, stream: Stream) -> State {
   settle(state, stream_id, stream)
 }
 
-fn body_event(stream: Stream) -> Option(#(http2.BodyEvent, Inbound)) {
+fn body_event(stream: Stream) -> option.Option(#(http2.BodyEvent, Inbound)) {
   case stream.unread_size, stream.inbound {
     0, Receiving -> None
     _size, Receiving ->
@@ -559,7 +559,7 @@ fn begin_field_block(
   stream_id: Int,
   end_stream: Bool,
   end_headers: Bool,
-  dependency: Option(Int),
+  dependency: option.Option(Int),
   fragment: BitArray,
 ) -> Result(State, Halt) {
   let purpose = case lookup(state, stream_id) {
@@ -751,7 +751,11 @@ fn start_request(
   }
 }
 
-fn new_stream(state: State, end_stream: Bool, worker: Option(Pid)) -> Stream {
+fn new_stream(
+  state: State,
+  end_stream: Bool,
+  worker: option.Option(process.Pid),
+) -> Stream {
   Stream(
     head_request: False,
     outbound: AwaitingResponse,
@@ -979,7 +983,7 @@ fn send_final_goaway(state: State) -> State {
   )
 }
 
-fn receive_goaway(state: State, error: ErrorCode) -> Result(State, Halt) {
+fn receive_goaway(state: State, error: frame.ErrorCode) -> Result(State, Halt) {
   case error, state.lifecycle {
     frame.NoError, Closing(..) -> Ok(state)
     frame.NoError, Serving | frame.NoError, Announcing ->
@@ -991,7 +995,7 @@ fn receive_goaway(state: State, error: ErrorCode) -> Result(State, Halt) {
 fn stream_error(
   state: State,
   stream_id: Int,
-  error: ErrorCode,
+  error: frame.ErrorCode,
 ) -> Result(State, Halt) {
   case lookup(state, stream_id) {
     Idle -> Error(Fail(state, error))
@@ -1003,7 +1007,7 @@ fn stream_error(
   }
 }
 
-fn reset(state: State, stream_id: Int, error: ErrorCode) -> State {
+fn reset(state: State, stream_id: Int, error: frame.ErrorCode) -> State {
   let state =
     State(
       ..state,
@@ -1073,7 +1077,7 @@ fn settle(state: State, stream_id: Int, stream: Stream) -> State {
 fn receive_response(
   state: State,
   stream_id: Int,
-  response: Response(Body),
+  response: response.Response(connection.Body),
 ) -> State {
   case dict.get(state.streams, stream_id) {
     Ok(Stream(outbound: AwaitingResponse, ..) as stream) ->
@@ -1135,7 +1139,7 @@ fn handle_command(state: State, command: http2.Command) -> State {
   }
 }
 
-fn refuse_write(state: State, ack: Subject(http2.WriteAck)) -> State {
+fn refuse_write(state: State, ack: process.Subject(http2.WriteAck)) -> State {
   process.send(ack, http2.Ended)
   state
 }
@@ -1144,7 +1148,7 @@ fn respond(
   state: State,
   stream_id: Int,
   stream: Stream,
-  response: Response(Body),
+  response: response.Response(connection.Body),
 ) -> State {
   let status = response.status
 
@@ -1201,7 +1205,7 @@ fn no_content(
   state: State,
   stream_id: Int,
   stream: Stream,
-  response: Response(Body),
+  response: response.Response(connection.Body),
   length: ContentLength,
 ) -> State {
   file.release_body(response.body)
@@ -1216,7 +1220,7 @@ fn no_content(
   )
 }
 
-fn head_length(body: Body) -> ContentLength {
+fn head_length(body: connection.Body) -> ContentLength {
   case body {
     connection.Bytes(tree) -> Length(bytes_tree.byte_size(tree))
     connection.Text(text) -> Length(string.byte_size(text))
@@ -1230,7 +1234,7 @@ fn head_length(body: Body) -> ContentLength {
 }
 
 fn open_body(
-  body: Body,
+  body: connection.Body,
   threshold: Int,
 ) -> Result(
   #(List(outbox.Piece), Int, List(connection.FileDescriptor)),
@@ -1314,8 +1318,8 @@ fn start_streaming(
   stream: Stream,
   status: Int,
   response_headers: List(#(String, String)),
-  signals: Option(Subject(http2.StreamSignal)),
-  ack: Subject(http2.WriteAck),
+  signals: option.Option(process.Subject(http2.StreamSignal)),
+  ack: process.Subject(http2.WriteAck),
 ) -> State {
   let length = content_length(stream, status, Unknown)
 
@@ -1355,10 +1359,10 @@ fn queue_data(
   state: State,
   stream_id: Int,
   stream: Stream,
-  outbox: Outbox,
+  outbox: outbox.Outbox,
   data: BitArray,
   end_stream: Bool,
-  ack: Subject(http2.WriteAck),
+  ack: process.Subject(http2.WriteAck),
 ) -> State {
   let outbox = outbox.push(outbox, outbox.bytes(data))
   let outbox = case end_stream {
@@ -1398,7 +1402,7 @@ fn handle_exit(state: State, exit: process.ExitMessage) -> Result(State, Halt) {
   }
 }
 
-fn worker_exited(state: State, pid: Pid) -> State {
+fn worker_exited(state: State, pid: process.Pid) -> State {
   case dict.get(state.workers, pid) {
     Error(Nil) -> state
     Ok(stream_id) -> {
@@ -1430,13 +1434,13 @@ fn abort(
   state: State,
   stream_id: Int,
   stream: Stream,
-  error: ErrorCode,
+  error: frame.ErrorCode,
 ) -> State {
   State(..state, streams: dict.insert(state.streams, stream_id, stream))
   |> reset(stream_id, error)
 }
 
-fn kill_worker(state: State, pid: Pid) -> State {
+fn kill_worker(state: State, pid: process.Pid) -> State {
   case dict.has_key(state.workers, pid) {
     True -> process.kill(pid)
     False -> Nil
@@ -1527,7 +1531,7 @@ fn send_data(
   state: State,
   stream_id: Int,
   stream: Stream,
-  outbox: Outbox,
+  outbox: outbox.Outbox,
 ) -> Transmitted {
   let limit =
     state.send_window

@@ -1,10 +1,10 @@
 import gleam/bit_array
 import gleam/http
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 
 pub fn split_host_port(
   value: BitArray,
-) -> Result(#(BitArray, Option(Int)), Nil) {
+) -> Result(#(BitArray, option.Option(Int)), Nil) {
   case value {
     <<"[":utf8, _remaining:bits>> -> split_bracketed_host(value)
     _value ->
@@ -29,7 +29,7 @@ pub fn split_host_port(
 
 pub fn parse_authority(
   authority: BitArray,
-) -> Result(#(BitArray, Option(Int)), Nil) {
+) -> Result(#(BitArray, option.Option(Int)), Nil) {
   case has_userinfo(authority), split_host_port(authority) {
     False, Ok(#(host, port)) if host != <<>> -> Ok(#(host, port))
     _userinfo, _split -> Error(Nil)
@@ -38,7 +38,7 @@ pub fn parse_authority(
 
 fn split_bracketed_host(
   value: BitArray,
-) -> Result(#(BitArray, Option(Int)), Nil) {
+) -> Result(#(BitArray, option.Option(Int)), Nil) {
   case find_close_bracket(value) {
     Error(Nil) -> Error(Nil)
     Ok(position) -> {

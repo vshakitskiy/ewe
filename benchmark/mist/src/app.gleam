@@ -1,6 +1,6 @@
 import gleam/bit_array
 import gleam/bytes_tree
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -131,7 +131,7 @@ fn stream_hello(
   mist.chunked(
     request:,
     response: response.new(200),
-    init: fn(subject: Subject(StreamMessage)) {
+    init: fn(subject: process.Subject(StreamMessage)) {
       process.send(subject, StreamChunk(bit_array.from_string("hello, ")))
       process.send(subject, StreamChunk(bit_array.from_string("Joe!")))
       process.send(subject, StreamDone)
@@ -161,7 +161,7 @@ fn stream_burst(
   mist.chunked(
     request:,
     response: response.new(200),
-    init: fn(subject: Subject(Tick)) {
+    init: fn(subject: process.Subject(Tick)) {
       process.send(subject, Tick(1))
       subject
     },
@@ -188,7 +188,7 @@ fn sse_burst(
   mist.server_sent_events(
     request:,
     initial_response: response.new(200),
-    init: fn(subject: Subject(Tick)) {
+    init: fn(subject: process.Subject(Tick)) {
       process.send(subject, Tick(1))
       subject
     },

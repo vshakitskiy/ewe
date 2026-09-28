@@ -1,17 +1,17 @@
-import ewe/internal/connection.{type FileDescriptor}
-import ewe/internal/queue.{type Queue}
+import ewe/internal/connection
+import ewe/internal/queue
 import gleam/bit_array
-import gleam/bytes_tree.{type BytesTree}
+import gleam/bytes_tree
 import gleam/int
 import gleam/result
 
 pub opaque type Outbox {
-  Outbox(items: Queue(Piece), size: Int, finished: Bool)
+  Outbox(items: queue.Queue(Piece), size: Int, finished: Bool)
 }
 
 pub type Piece {
-  Bytes(bytes: BytesTree, size: Int)
-  File(descriptor: FileDescriptor, offset: Int, length: Int)
+  Bytes(bytes: bytes_tree.BytesTree, size: Int)
+  File(descriptor: connection.FileDescriptor, offset: Int, length: Int)
 }
 
 const file_chunk = 65_536
@@ -47,7 +47,7 @@ pub fn is_finished(outbox: Outbox) -> Bool {
 pub fn take(
   outbox: Outbox,
   limit: Int,
-  read: fn(FileDescriptor, Int, Int) -> Result(BitArray, error),
+  read: fn(connection.FileDescriptor, Int, Int) -> Result(BitArray, error),
 ) -> Result(#(Piece, Bool, Outbox), error) {
   case queue.pop(outbox.items) {
     Error(Nil) -> Ok(#(Bytes(bytes_tree.new(), 0), outbox.finished, outbox))
@@ -73,12 +73,12 @@ pub fn take(
 }
 
 fn rest_of_file(
-  items: Queue(Piece),
-  descriptor: FileDescriptor,
+  items: queue.Queue(Piece),
+  descriptor: connection.FileDescriptor,
   offset: Int,
   taken: Int,
   length: Int,
-) -> Queue(Piece) {
+) -> queue.Queue(Piece) {
   case length - taken {
     0 -> items
     left -> queue.push_front(items, File(descriptor, offset + taken, left))
@@ -88,20 +88,20 @@ fn rest_of_file(
 fn finish_take(
   outbox: Outbox,
   taken: Piece,
-  items: Queue(Piece),
+  items: queue.Queue(Piece),
 ) -> #(Piece, Bool, Outbox) {
   let size = outbox.size - piece_size(taken)
   #(taken, outbox.finished && size == 0, Outbox(..outbox, items:, size:))
 }
 
 fn gather(
-  acc: BytesTree,
+  acc: bytes_tree.BytesTree,
   acc_size: Int,
-  bytes: BytesTree,
+  bytes: bytes_tree.BytesTree,
   size: Int,
-  items: Queue(Piece),
+  items: queue.Queue(Piece),
   limit: Int,
-) -> #(BytesTree, Int, Queue(Piece)) {
+) -> #(bytes_tree.BytesTree, Int, queue.Queue(Piece)) {
   let room = limit - acc_size
 
   case size <= room {
