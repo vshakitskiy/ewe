@@ -1688,7 +1688,7 @@ pub fn send_event(
 ///   program sends this stream to and returns the starting state along with
 ///   that selector.
 /// - `handler` is called for each message the selector selects.
-/// - `on_close` is called once when the stream ends.
+/// - `on_close` is called once with the last state after the stream has ended.
 ///
 /// The `content-type` and `cache-control` headers the stream needs are set by
 /// ewe.
@@ -1713,7 +1713,7 @@ pub fn send_event(
 ///       Error(_send_error) -> ewe.stop()
 ///     }
 ///   },
-///   on_close: fn(_conn, _sent) { Nil },
+///   on_close: fn(_sent) { Nil },
 /// )
 /// ```
 pub fn sse(
@@ -1722,7 +1722,7 @@ pub fn sse(
     #(user_state, process.Selector(user_message)),
   handler handler: fn(SseConnection, user_state, user_message) ->
     Next(user_state, user_message),
-  on_close on_close: fn(SseConnection, user_state) -> Nil,
+  on_close on_close: fn(user_state) -> Nil,
 ) -> response.Response(Body) {
   let handler = fn(conn, state, message) {
     handler(conn, state, message) |> to_internal_next
@@ -1898,7 +1898,8 @@ pub fn send_close_frame(
 ///   with that selector.
 /// - `handler` is called for each frame from the client and each message the
 ///   selector picks up.
-/// - `on_close` is called when the WebSocket ends.
+/// - `on_close` is called once with the last state after the WebSocket has
+///   ended.
 ///
 /// A request that is not a valid handshake is answered with status code 400:
 /// Bad Request.
@@ -1919,7 +1920,7 @@ pub fn send_close_frame(
 ///         ewe.continue(count)
 ///     }
 ///   },
-///   on_close: fn(_conn, _count) { Nil },
+///   on_close: fn(_count) { Nil },
 /// )
 /// ```
 pub fn websocket(
@@ -1931,7 +1932,7 @@ pub fn websocket(
     user_state,
     WebsocketMessage(user_message),
   ) -> Next(user_state, user_message),
-  on_close on_close: fn(WebsocketConnection, user_state) -> Nil,
+  on_close on_close: fn(user_state) -> Nil,
 ) -> response.Response(Body) {
   let handler = fn(conn, state, message) {
     handler(conn, state, from_internal_websocket_message(message))

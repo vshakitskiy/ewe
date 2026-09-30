@@ -13,7 +13,7 @@ type Session(user_state, user_message) {
     conn: http1_connection.SseConnection,
     handler: fn(connection.SseConnection, user_state, user_message) ->
       connection.Next(user_state, user_message),
-    on_close: fn(connection.SseConnection, user_state) -> Nil,
+    on_close: fn(user_state) -> Nil,
     selector: process.Selector(http1.SocketEvent(user_message)),
     state: user_state,
     reuse: Reuse,
@@ -31,7 +31,7 @@ pub fn run(
     #(user_state, process.Selector(user_message)),
   handler: fn(connection.SseConnection, user_state, user_message) ->
     connection.Next(user_state, user_message),
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
+  on_close: fn(user_state) -> Nil,
 ) -> connection.Outcome {
   let #(state, messages) =
     on_init(connection.Http1Sse(conn), process.new_selector())
@@ -116,14 +116,16 @@ fn ended(
   outcome: connection.Outcome,
   keep_alive: http1_connection.KeepAlive,
 ) -> connection.Outcome {
-  let handle = connection.Http1Sse(session.conn)
-  rescue.logged("server-sent events close handler", fn() {
-    session.on_close(handle, session.state)
-  })
+  let conn = session.conn
+  let _sent = encoder.end_stream(conn.transport, conn.socket, conn.framing)
 
   http1_connection.StreamFinished(keep_alive:)
   |> http1_connection.StreamSignal
-  |> process.send(session.conn.self, _)
+  |> process.send(conn.self, _)
+
+  rescue.logged("server-sent events close handler", fn() {
+    session.on_close(session.state)
+  })
 
   outcome
 }

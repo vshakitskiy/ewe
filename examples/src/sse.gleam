@@ -87,7 +87,7 @@ fn handle_request(
           }
         },
         // Clean up when the client disconnects.
-        on_close: fn(_conn, client) {
+        on_close: fn(client) {
           pubsub.unsubscribe(pubsub, topic:, client:)
         },
       )

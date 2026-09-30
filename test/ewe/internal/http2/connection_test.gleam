@@ -361,7 +361,7 @@ pub fn sse_ends_on_reset_during_a_blocked_write_test() {
         process.send(ticks, Nil)
         ewe.continue(ticks)
       },
-      on_close: fn(_conn, _ticks) { process.send(closed, Nil) },
+      on_close: fn(_ticks) { process.send(closed, Nil) },
     )
   }
 
@@ -839,7 +839,7 @@ pub fn websocket_over_extended_connect_test() {
             ewe.continue(state)
         }
       },
-      on_close: fn(_conn, _state) { Nil },
+      on_close: fn(_state) { Nil },
     )
   }
 
@@ -908,15 +908,17 @@ pub fn reading_the_body_again_after_the_stream_ended_returns_at_once_test() {
   assert process.receive(parent, 1000) == Ok(Ok(<<>>))
 }
 
-pub fn websocket_on_close_can_still_send_test() {
+pub fn websocket_on_close_runs_after_stream_ends_test() {
+  let closing = process.new_subject()
   let handler = fn(req: request.Request(ewe.Connection)) {
     ewe.websocket(
       request: req,
       on_init: fn(_conn, selector) { #(Nil, selector) },
       handler: fn(_conn, _state, _message) { ewe.stop() },
-      on_close: fn(conn, _state) {
-        let assert Ok(Nil) = ewe.send_text_frame(conn, "bye")
-        Nil
+      on_close: fn(_state) {
+        let release = process.new_subject()
+        process.send(closing, release)
+        process.receive_forever(release)
       },
     )
   }
@@ -927,12 +929,12 @@ pub fn websocket_on_close_can_still_send_test() {
     |> client.headers(1, websocket_request(), False)
   let #(_headers, client) = client.receive(client)
 
-  let #(goodbye, client) =
+  let #(ended, _client) =
     client
     |> client.data(1, <<0x81, 0x82, 0:32, "hi":utf8>>, False)
     |> client.receive
-  assert goodbye == frame.Data(1, False, <<0x81, 0x03, "bye":utf8>>, 5)
-
-  let #(ended, _client) = client.receive(client)
   assert ended == frame.Data(1, True, <<>>, 0)
+
+  let assert Ok(release) = process.receive(closing, 1000)
+  process.send(release, Nil)
 }

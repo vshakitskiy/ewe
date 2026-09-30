@@ -37,7 +37,7 @@ type Session(raw, user_state, user_message) {
       user_state,
       Message(user_message),
     ) -> connection.Next(user_state, user_message),
-    on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+    on_close: fn(user_state) -> Nil,
     context: websocks.Context,
     selector: process.Selector(raw),
     state: user_state,
@@ -51,7 +51,7 @@ pub fn run(
     #(user_state, process.Selector(user_message)),
   handler: fn(connection.WebsocketConnection, user_state, Message(user_message)) ->
     connection.Next(user_state, user_message),
-  on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+  on_close: fn(user_state) -> Nil,
 ) -> connection.Outcome {
   let #(state, messages) =
     on_init(transport.handle(context), process.new_selector())
@@ -168,18 +168,16 @@ fn close(
 fn finish(
   session: Session(raw, user_state, user_message),
 ) -> connection.Outcome {
-  let outcome = ended(session, connection.Stopped)
   let _sent = session.transport.close(<<>>)
-  outcome
+  ended(session, connection.Stopped)
 }
 
 fn ended(
   session: Session(raw, user_state, user_message),
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  let handle = session.transport.handle(session.context)
   rescue.logged("websocket close handler", fn() {
-    session.on_close(handle, session.state)
+    session.on_close(session.state)
   })
 
   websocks.close_context(session.context)

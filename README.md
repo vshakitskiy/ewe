@@ -343,7 +343,7 @@ fn handle_topic(
     },
     handler: handle_websocket_message,
     // Called once however the WebSocket ended.
-    on_close: fn(_conn, state) {
+    on_close: fn(state) {
       pubsub.unsubscribe(state.pubsub, topic: state.topic, client: state.client)
     },
   )
@@ -412,7 +412,7 @@ response.new(200)
       Error(_send_error) -> ewe.stop()
     }
   },
-  on_close: fn(_conn, client) {
+  on_close: fn(client) {
     pubsub.unsubscribe(pubsub, topic:, client:)
   },
 )

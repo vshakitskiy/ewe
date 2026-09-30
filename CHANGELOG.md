@@ -34,7 +34,8 @@
 - Fix streamed HTTP/2 1xx, 204 and 304 responses sending a body.
 - Fix silent truncation when a file shrinks while sent over TLS.
 - Fix writes to a closed HTTP/2 stream hanging the handler.
-- Fix HTTP/2 WebSocket `on_close` running after its stream ended.
+- `on_close` of `sse` and `websocket` now receives only the state and runs
+  after the stream has ended.
 - Fix HTTP/2 SSE and WebSockets not ending after a reset or disconnect when the
   handler ignores a failed write.
 - Accept absolute form HTTP/1 request targets.

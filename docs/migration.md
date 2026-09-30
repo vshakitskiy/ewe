@@ -1,11 +1,10 @@
 # Migrating from v4 to latest
 
-Since v5 that breaks most of the v4 API, there are quite some changes that needs 
-to be happened when moving on to the latest version. Luckily the compiler will 
-catch most of the changes. It is recommended to see [Behaviour changes](#behaviour-changes) 
-as well.
+v5 broke most of the v4 API so quite a few changes are needed when moving on to
+the latest version. Luckily the compiler will catch most of them. It is
+recommended to see [Behaviour changes](#behaviour-changes) as well.
 
-Every example below is v4 on one side and the latest version (which is v8) on 
+Every example below is v4 on one side and the latest version (which is v9) on 
 the other.
 
 ## Builder functions
@@ -84,7 +83,8 @@ case ewe.get_server_info(name) {
 }
 ```
 
-`start` returns the address the server listens on as the started data:
+`start` returns the address the server listens on as the started data instead of
+the supervisor; `supervised` returns `ChildSpecification(SocketAddress)`:
 
 ```gleam
 let assert Ok(actor.Started(data: ewe.TcpSocketAddress(port:, ..), ..)) =
@@ -97,7 +97,7 @@ let assert Ok(actor.Started(data: ewe.TcpSocketAddress(port:, ..), ..)) =
 `Result`, which is an error when no server runs under that name, or when it 
 does not answer within a second.
 
-`on_start` receives a `SocketAddress`.
+`on_start` receives the scheme and a `SocketAddress`.
 
 `get_client_info` returns the `SocketAddress`, so there is no `Error` 
 case to handle:
@@ -278,7 +278,8 @@ The names lost their uppercase `SSE` (like `ewe.SSEConnection` to
 the stream connection and an empty selector to add your own subjects to and
 returns the starting state along with that selector. What the handler returns is
 now the shared `Next`, so `sse_continue` and `sse_stop` are `continue` and
-`stop`.
+`stop`. `on_close` receives only the last state and runs after the stream has
+ended.
 
 ```gleam
 // v4
@@ -304,7 +305,7 @@ response.new(200)
       Error(_send_error) -> ewe.stop()
     }
   },
-  on_close: fn(_conn, _sent) { Nil },
+  on_close: fn(_sent) { Nil },
 )
 ```
 
@@ -317,6 +318,9 @@ ewe.upgrade_websocket(request, on_init:, handler:, on_close:)
 // latest
 ewe.websocket(request:, on_init:, handler:, on_close:)
 ```
+
+`on_close` receives only the last state and runs after the WebSocket has ended.
+To send a last frame, send it from the handler before returning `stop()`.
 
 The message variants were renamed:
 ```gleam
@@ -441,3 +445,6 @@ too, through the extended `CONNECT` of RFC 8441. Set `websocket: False` on
   can use `ewe.finish_chunk`.
 - An SSE stream can swap the selector it listens on with
   `ewe.continue_with_selector`, which only WebSockets could do before.
+- `ewe.shutdown_timeout` sets how long connections get to finish when the
+  server shuts down in a supervision tree.
+- `ewe.buffer_size` sets the most bytes a single socket read buffers.

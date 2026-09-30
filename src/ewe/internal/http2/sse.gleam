@@ -13,7 +13,7 @@ type Session(user_state, user_message) {
     conn: http2.SseConnection,
     handler: fn(connection.SseConnection, user_state, user_message) ->
       connection.Next(user_state, user_message),
-    on_close: fn(connection.SseConnection, user_state) -> Nil,
+    on_close: fn(user_state) -> Nil,
     selector: process.Selector(Event(user_message)),
     state: user_state,
   )
@@ -25,7 +25,7 @@ pub fn run(
     #(user_state, process.Selector(user_message)),
   handler: fn(connection.SseConnection, user_state, user_message) ->
     connection.Next(user_state, user_message),
-  on_close: fn(connection.SseConnection, user_state) -> Nil,
+  on_close: fn(user_state) -> Nil,
 ) -> connection.Outcome {
   let #(state, messages) =
     on_init(connection.Http2Sse(conn), process.new_selector())
@@ -85,18 +85,16 @@ fn loop(session: Session(user_state, user_message)) -> connection.Outcome {
 }
 
 fn halted(session: Session(user_state, user_message)) -> connection.Outcome {
-  let outcome = ended(session, connection.Stopped)
   let _sent = worker.finish_response(session.conn.writer)
-  outcome
+  ended(session, connection.Stopped)
 }
 
 fn ended(
   session: Session(user_state, user_message),
   outcome: connection.Outcome,
 ) -> connection.Outcome {
-  let handle = connection.Http2Sse(session.conn)
   rescue.logged("server-sent events close handler", fn() {
-    session.on_close(handle, session.state)
+    session.on_close(session.state)
   })
 
   outcome

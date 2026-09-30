@@ -90,7 +90,7 @@ fn handle_topic(
       #(state, selector)
     },
     handler: handle_websocket_message,
-    on_close: fn(_conn, state) {
+    on_close: fn(state) {
       logging.log(logging.Info, "WebSocket connection closed")
 
       pubsub.unsubscribe(state.pubsub, topic: state.topic, client: state.client)

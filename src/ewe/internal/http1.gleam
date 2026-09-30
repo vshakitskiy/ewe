@@ -279,8 +279,6 @@ fn send_response(
         |> connection.Http1Sse
         |> sse_handler
 
-      let _sent = encoder.end_stream(transport, socket, framing)
-
       let drained = drain_messages(self)
       let stream_keep_alive = case drained.stream {
         option.Some(http1.StreamFinished(keep_alive:)) -> keep_alive

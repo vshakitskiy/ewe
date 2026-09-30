@@ -66,7 +66,7 @@ pub fn run(
     user_state,
     websocket.Message(user_message),
   ) -> connection.Next(user_state, user_message),
-  on_close: fn(connection.WebsocketConnection, user_state) -> Nil,
+  on_close: fn(user_state) -> Nil,
 ) -> connection.Outcome {
   read(conn)
   websocket.run(transport(conn), conn.context, on_init, handler, on_close)

@@ -155,6 +155,6 @@ fn sse_burst(data: String, count: Int) -> response.Response(ewe.Body) {
         }
       }
     },
-    on_close: fn(_conn, _state) { Nil },
+    on_close: fn(_state) { Nil },
   )
 }

@@ -26,7 +26,7 @@ fn handle_request(
     request:,
     on_init: fn(_conn, messages) { #(Nil, messages) },
     handler: echo_message,
-    on_close: fn(_conn, _state) { Nil },
+    on_close: fn(_state) { Nil },
   )
 }
 
