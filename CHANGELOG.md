@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v9.0.0 - 30.09.2026
 
 - Add `idle_timeout` to `Http2Options`.
 - Support `CONNECT` over HTTP/2.
