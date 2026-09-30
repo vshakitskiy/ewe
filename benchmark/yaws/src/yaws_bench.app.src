@@ -1,0 +1,15 @@
+{application, yaws_bench,
+ [{description, "yaws benchmark server"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {yaws_bench_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.
