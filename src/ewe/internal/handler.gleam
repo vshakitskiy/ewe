@@ -90,7 +90,7 @@ pub fn loop(
     Detecting(..), tup.User(connection.IdleTimeout)
     | Http1(..), tup.User(connection.IdleTimeout)
     -> {
-      logging.log(logging.Debug, "Connection idled for too long, closing.")
+      logging.log(logging.Debug, "Connection idled for too long!")
       tup.stop()
     }
     Detecting(..), tup.User(_message) | Http1(..), tup.User(_message) ->
