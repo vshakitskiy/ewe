@@ -1,0 +1,8 @@
+{"1.2.0",
+[{<<"mochiweb">>,{pkg,<<"mochiweb">>,<<"3.5.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"mochiweb">>, <<"A6DE5BABF2832B5CC8BA3F9E70417F54A99BC4CEC5AC9AFF4B783A643D36D804">>}]},
+{pkg_hash_ext,[
+ {<<"mochiweb">>, <<"C35DF2787FFFD009AB2F2470768AD1CDC993EAB2C68CD7DDF75171C1462265D6">>}]}
+].

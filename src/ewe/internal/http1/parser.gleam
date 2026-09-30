@@ -476,45 +476,26 @@ pub fn parse_headers(
   state: HeaderState,
   options: http1.Options,
 ) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
-  use #(line, remaining) <- try_step(extract_line(
-    buffer,
-    options.max_header_line,
-    HeaderLineTooLong,
-    BadHeader,
-  ))
-
-  case line {
-    <<>> -> StepDone(#(list.reverse(acc), state, remaining))
-    _line if count >= options.max_headers -> ParseError(TooManyHeaders)
-    _line -> {
-      use #(header, state) <- try_step(parse_header_line(line, state))
-      parse_headers(remaining, [header, ..acc], count + 1, state, options)
-    }
-  }
-}
-
-fn parse_header_line(
-  line: BitArray,
-  state: HeaderState,
-) -> Step(#(#(String, String), HeaderState)) {
-  case find_colon(line) {
-    Error(Nil) -> ParseError(BadHeader)
-    Ok(position) ->
-      case line {
-        <<name:bytes-size(position), ":":utf8, value:bits>> -> {
-          let name = lowercase_ascii(name)
-          let value = trim_ows(value)
-          case is_field_name(name) && is_field_value(value) {
-            True -> {
-              let name = unsafe_to_string(name)
-              use state <- try_step(classify(name, value, state))
-              StepDone(#(#(name, unsafe_to_string(value)), state))
+  case
+    extract_line(buffer, options.max_header_line, HeaderLineTooLong, BadHeader)
+  {
+    StepDone(#(<<>>, rest)) -> StepDone(#(list.reverse(acc), state, rest))
+    StepDone(_line) if count >= options.max_headers -> ParseError(TooManyHeaders)
+    StepDone(#(line, rest)) ->
+      case header_field(line) {
+        Field(name:, value:) ->
+          case classify(name, value, state) {
+            StepDone(state) -> {
+              let header = #(name, unsafe_to_string(value))
+              parse_headers(rest, [header, ..acc], count + 1, state, options)
             }
-            False -> ParseError(BadHeader)
+            More -> More
+            ParseError(error) -> ParseError(error)
           }
-        }
-        _bad -> ParseError(BadHeader)
+        InvalidField -> ParseError(BadHeader)
       }
+    More -> More
+    ParseError(error) -> ParseError(error)
   }
 }
 
@@ -602,71 +583,39 @@ fn classify(
   }
 }
 
+type Line {
+  Line(content: BitArray, rest: BitArray)
+  NeedMore
+  LineTooLong
+  BadFraming
+}
+
 pub fn extract_line(
   buffer: BitArray,
   max_len: Int,
   too_long: ParseError,
   malformed: ParseError,
 ) -> Step(#(BitArray, BitArray)) {
-  case find_lf(buffer) {
-    Error(Nil) ->
-      case bit_array.byte_size(buffer) > max_len {
-        True -> ParseError(too_long)
-        False -> More
-      }
-    Ok(0) -> ParseError(malformed)
-    Ok(position) ->
-      case position - 1 > max_len {
-        True -> ParseError(too_long)
-        False ->
-          case buffer {
-            <<line:bytes-size(position - 1), "\r\n":utf8, remaining:bits>> ->
-              StepDone(#(line, remaining))
-            _bad -> ParseError(malformed)
-          }
-      }
+  case split_line(buffer, max_len) {
+    Line(content:, rest:) -> StepDone(#(content, rest))
+    NeedMore -> More
+    LineTooLong -> ParseError(too_long)
+    BadFraming -> ParseError(malformed)
   }
 }
 
-fn trim_ows(bits: BitArray) -> BitArray {
-  bits
-  |> trim_leading_ows
-  |> trim_trailing_ows
-}
-
-pub fn trim_leading_ows(bits: BitArray) -> BitArray {
-  case bits {
-    <<" ", remaining:bits>> -> trim_leading_ows(remaining)
-    <<"\t", remaining:bits>> -> trim_leading_ows(remaining)
-    _bits -> bits
-  }
-}
-
-fn trim_trailing_ows(bits: BitArray) -> BitArray {
-  case bit_array.byte_size(bits) {
-    0 -> bits
-    size ->
-      case bits {
-        <<init:bytes-size(size - 1), " ":utf8>> -> trim_trailing_ows(init)
-        <<init:bytes-size(size - 1), "\t":utf8>> -> trim_trailing_ows(init)
-        _bits -> bits
-      }
-  }
+type Field {
+  Field(name: String, value: BitArray)
+  InvalidField
 }
 
 pub fn tokens(value: BitArray) -> List(BitArray) {
-  split_comma(value) |> list.map(trim_ows)
+  split_comma(value) |> list.map(trim_whitespace)
 }
 
 pub fn has_token(value: BitArray, token: BitArray) -> Bool {
   value == token || list.contains(tokens(value), token)
 }
-
-@external(erlang, "ewe_ffi", "find_lf")
-fn find_lf(bits: BitArray) -> Result(Int, Nil)
-
-@external(erlang, "ewe_ffi", "find_colon")
-fn find_colon(bits: BitArray) -> Result(Int, Nil)
 
 @external(erlang, "ewe_ffi", "find_space")
 fn find_space(bits: BitArray) -> Result(Int, Nil)
@@ -677,11 +626,14 @@ fn find_question(bits: BitArray) -> Result(Int, Nil)
 @external(erlang, "ewe_ffi", "find_authority_end")
 fn find_authority_end(bits: BitArray) -> Result(Int, Nil)
 
-@external(erlang, "ewe_ffi", "is_field_name")
-fn is_field_name(name: BitArray) -> Bool
+@external(erlang, "ewe_ffi", "split_line")
+fn split_line(buffer: BitArray, max_len: Int) -> Line
 
-@external(erlang, "ewe_ffi", "is_field_value")
-fn is_field_value(value: BitArray) -> Bool
+@external(erlang, "ewe_ffi", "header_field")
+fn header_field(line: BitArray) -> Field
+
+@external(erlang, "ewe_ffi", "trim_whitespace")
+pub fn trim_whitespace(bits: BitArray) -> BitArray
 
 @external(erlang, "ewe_ffi", "find_unsafe_header_byte")
 pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)

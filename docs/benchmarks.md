@@ -1,352 +1,231 @@
 # ewe@9 benchmarks
 
-This page evaluates the performance of ewe@9 against ewe@8 and six other 
-BEAM-based web servers. Benchmarks were measured on September 26 2026 across 
-fifteen endpoints using both HTTP/1.1 and cleartext HTTP/2.
+ewe@9 benchmarks against ewe@8 and nine other BEAM web servers over HTTP/1.1 and
+cleartext HTTP/2, measured on September 29 2026. The scripts and the exact
+method are in the repository's 
+[benchmark directory](https://github.com/vshakitskiy/ewe/tree/mistress/benchmark).
 
-On HTTP/1.1 ewe@9 outperformed the other servers in 12 of the 15 tested 
-scenarios and stayed within 4% of ewe@8 on every case. On HTTP/2 it outperformed 
-every server in 13 of 15 scenarios delivering 39% to 144% more throughput than 
-ewe@8 on 14 of them. The `file_big` endpoint on cleartext HTTP/2 represents its 
-weakest comparative performance. See 
-[Known Bottlenecks and Limitations](#known-bottlenecks-and-limitations) section.
-
-All reported figures represent the median of three consecutive runs.
-
-## Content
-- [How to read these numbers](#how-to-read-these-numbers)
-- [How it was run](#how-it-was-run)
-- [Throughput: HTTP/1.1](#throughput-http-1.1)
-- [Throughput: HTTP/2](#throughput-http-2)
-- [Against ewe@8](#against-ewe-8)
-- [Against mist](#against-mist)
-- [Against elli and roadrunner on HTTP/1](#against-elli-and-roadrunner)
-- [Against roadrunner and bandit on HTTP/2](#against-roadrunner-and-bandit-on-http-2)
-- [Latency](#latency)
-- [Known bottlenecks and limitations](#known-bottlenecks-and-limitations)
-
-<h2 id="how-to-read-these-numbers">How to read these numbers</h2>
-
-**No network overhead.** The benchmark was run entirely on localhost. The load 
-generator and server were pinned to six dedicated CPU cores each. Real world 
-network stack and TCP overheads are not represented in these numbers.
-
-**Numbers above 200,000 req/s are approximate.** At rates exceeding 200,000 req/s, 
-h2load's own CPU consumption impacts the results as it competes with the server 
-for system resources. Adjusting h2load's thread count on the `hello` case 
-produced a 14% spread ranging from 228,000 to 261,000 req/s without any changes 
-to the server configuration. Small performance gaps in this high range should 
-therefore be treated as approximate. Comparisons below 200,000 req/s provide 
-more stable and reliable data.
-
-**Cases that has no native API for the implementation are skipped.** Some test 
-cases were omitted for servers lacking native API support. `bandit`, `chatterbox`, 
-`elli` and `httpd` have no SSE API and `elli` and `httpd` cannot read a request 
-body incrementally so the cases are skipped for them.
-
-**Every server runs on default settings.** All servers were tested using default 
-configurations. The single exception is `TCP_NODELAY`. `elli` and `httpd` do 
-not enable it themselves so during the benchmark we turn it on for them since 
-every other server already has it on by default.
-
-**Not every row survived.** 30 of 489 throughput rows and 57 of 282 latency rows
-are missing from these tables because the server stalled, answered incorrectly
-or was driven past its capacity. In each case the number not really described 
-the server's speed.
-
-<h2 id="how-it-was-run">How it was run</h2>
+## Setup
 
 ```
-load        h2load, 4 threads
-            h1         50 connections x 1 stream
-            h2         50 connections x 10 streams
-duration    10s measured, 3s warmup, 3 repeats
-latency     wrk2 http/1, 50 connections, 4 threads, fixed rate ladders
-cpu         server pinned to cores 0-5, load generator to cores 6-11
+machine     AMD Ryzen 7 5700G, 12 vCPUs in a KVM virtual machine, Linux 7.2
+toolchain   Gleam 1.18.0, Erlang/OTP 29, Elixir 1.19.4
+cpu         server pinned to CPUs 0-5, load generator to CPUs 6-11
+throughput  h2load (nghttp2 1.70.0), 4 threads, 50 connections,
+            10 streams per connection on HTTP/2,
+            3 runs of 10s after a 3s warmup, median reported
+latency     zrk 2.5.0, 4 threads, 50 connections,
+            10 streams per connection on HTTP/2,
+            10s per rate after a 3s warmup
 ```
 
-<details>
-<summary>Versions</summary>
+## Servers
 
-| | version |
-| --- | --- |
-| Gleam | 1.18.0 |
-| Erlang/OTP | 29 |
-| Elixir | 1.19.4 |
-| h2load | nghttp2 1.70.0 |
-| wrk2 | `44a94c1` |
-| `ewe@8` | 8.0.0 |
-| `mist` | 6.0.3 |
-| `elli` | 3.3.0 |
-| `bandit` | 1.12.0 |
-| `roadrunner` | 0.8.0 |
-| `chatterbox` | 0.8.0 |
+| server | version | HTTP/1.1 | HTTP/2 |
+| --- | --- | :---: | :---: |
+| `ewe@9` | 9.0.0 | yes | yes |
+| `ewe@8` | 8.0.0 | yes | yes |
+| `mist` | 6.0.3 | yes | no |
+| `elli` | 3.3.0 | yes | no |
+| `bandit` | 1.12.0 | yes | yes |
+| `httpd` | inets 9.7.1 (OTP 29) | yes | no |
+| `roadrunner` | 0.8.0 | yes | yes |
+| `chatterbox` | 0.8.0 | no | yes |
+| `cowboy` | 2.19.0 | yes | yes |
+| `mochiweb` | 3.5.0 | yes | no |
+| `yaws` | 2.3.1 | yes | no |
 
-</details>
+Every server runs a production build with the default settings except:
 
-<h2 id="throughput-http-1.1">Throughput: HTTP/1.1</h2>
+- `cowboy`'s `max_keepalive` and `max_received_frame_rate` are lifted.
+- `elli`, `httpd`, `mochiweb` and `yaws` have Nagle's algorithm disabled.
+- `yaws` has its access and auth logs disabled and serves files without
+  sendfile.
 
-Requests per second, higher is better. Best in each row is bold.
+`bandit`, `chatterbox`, `elli`, `httpd` and `mochiweb` have no native SSE API;
+`elli` and `httpd` cannot read a request body incrementally.
 
-| case | ewe@9 | ewe@8 | mist | elli | roadrunner | bandit | httpd |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `hello` | 275,439 | **282,622** | 201,897 | 267,914 | 254,256 | 149,214 | 102,489 |
-| `hello_headers` | **232,846** | 225,152 | 157,902 | 222,884 | 205,181 | 122,866 | 85,989 |
-| `echo_1kb` | 229,498 | 233,779 | 177,461 | **247,351** | 221,814 | 136,389 | 74,874 |
-| `echo_1kb_headers` | 202,558 | 204,050 | 146,355 | **208,486** | 191,658 | 114,188 | 56,074 |
-| `echo_10kb` | 193,708 | **194,201** | 160,960 | 170,952 | 187,372 | 119,884 | 12,551 |
-| `echo_chunked_10kb` | 193,991 | **195,798** | 158,704 | — | 188,410 | 107,016 | — |
-| `file_tiny` | 68,920 | **69,561** | 38,755 | 40,097 | 38,291 | 49,586 | 32,893 |
-| `file_small` | 59,293 | **60,381** | 36,221 | 36,939 | 35,725 | 47,540 | 28,671 |
-| `file_big` | 3,730 | **3,762** | 3,754 | 3,669 | 3,727 | 3,691 | 1,317 |
-| `stream` | **148,422** | 142,925 | — | — | 34,977 | 86,545 | 102,764 |
-| `stream_small` | **8,374** | 8,207 | — | — | 6,785 | 7,214 | 8,288 |
-| `stream_big` | 8,697 | **8,726** | — | — | 7,691 | 7,343 | 8,510 |
-| `sse` | **18,606** | 18,341 | — | — | 12,796 | — | — |
-| `sse_small` | 6,577 | **6,598** | — | — | 6,264 | — | — |
-| `sse_big` | 6,486 | **6,781** | — | — | 2,444 | — | — |
+## Cases
 
-The difference between ewe@8 and ewe@9 are noice as ewe@9 didn't introduce any 
-downgrading changes to HTTP/1.1. ewe achieved the highest throughput in 12 
-out of 15 scenarios. Two of the cases where it trailed involved small payload 
-echo handling where `elli` maintained an advantage. The third was `file_big` 
-where six of the servers performed within 3% of each other as the 5 MiB payload 
-transfer time became the primary bottleneck.
+| case | request | response |
+| --- | --- | --- |
+| `hello` | `GET /hello` | `Hello, Joe!` |
+| `hello_headers` | `GET /hello` with 7 extra headers | `Hello, Joe!` |
+| `echo_1kb` | `POST /echo`, 1KiB body | the body |
+| `echo_1kb_headers` | `POST /echo`, 1KiB body, 7 extra headers | the body |
+| `echo_10kb` | `POST /echo`, 10KiB body | the body |
+| `echo_chunked_10kb` | `POST /echo/chunked`, 10KiB body | the body, read incrementally |
+| `file_tiny` | `GET /file/tiny` | 1KiB file |
+| `file_small` | `GET /file/small` | 100KiB file |
+| `file_big` | `GET /file/big` | 5MiB file |
+| `stream` | `GET /stream` | 2 chunks, `hello, ` and `Joe!` |
+| `stream_small` | `GET /stream/small` | 100 x 64B chunks |
+| `stream_big` | `GET /stream/big` | 64 x 16KiB chunks |
+| `sse` | `GET /sse` | 32 events |
+| `sse_small` | `GET /sse/small` | 100 events |
+| `sse_big` | `GET /sse/big` | 64 x 16KiB events |
 
-The streaming benchmarks sent multiple frames per request:
+## Throughput
 
-| case | ewe@9 | ewe@8 | roadrunner | bandit | httpd |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `stream` | **296,844** | 285,850 | 69,953 | 173,089 | 205,528 |
-| `stream_small` | **837,410** | 820,670 | 678,450 | 721,400 | 828,840 |
-| `stream_big` | 556,614 | **558,451** | 492,218 | 469,952 | 544,627 |
-| `sse` | **595,376** | 586,896 | 409,475 | — | — |
-| `sse_small` | 657,650 | **659,800** | 626,360 | — | — |
-| `sse_big` | 415,098 | **433,952** | 156,410 | — | — |
+Requests per second, higher is better. Rps above 200_000  are limited by the 
+load generator so small differences in numbers between servers may be not 
+accurate.
 
-<h2 id="throughput-http-2">Throughput: HTTP/2</h2>
+### HTTP/1.1
 
-| case | ewe@9 | ewe@8 | roadrunner | bandit | chatterbox |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `hello` | **363,035** | 163,450 | 216,188 | 80,467 | 8,307 |
-| `hello_headers` | **259,101** | 137,648 | 178,425 | 72,721 | 8,309 |
-| `echo_1kb` | **211,514** | 120,417 | 186,200 | 68,590 | 7,097 |
-| `echo_1kb_headers` | **167,435** | 110,368 | 155,359 | 63,238 | 7,061 |
-| `echo_10kb` | 137,507 | 99,088 | **140,386** | 57,553 | 8,685 |
-| `echo_chunked_10kb` | **141,614** | 93,774 | 136,139 | 54,651 | 8,693 |
-| `file_tiny` | **129,972** | 81,861 | 35,029 | 40,707 | 8,386 |
-| `file_small` | 47,999 | **49,874** | 25,559 | 31,624 | 26,619 |
-| `file_big` | 949 | 493 | **1,074** | 749 | 472 |
-| `stream` | **200,561** | 88,386 | 128,305 | 52,299 | 8,799 |
-| `stream_small` | **12,490** | 5,122 | 6,657 | 4,541 | 10,530 |
-| `stream_big` | **11,938** | 5,441 | 6,945 | 4,937 | — |
-| `sse` | **23,603** | 9,899 | 16,456 | — | — |
-| `sse_small` | **8,512** | 3,579 | 5,809 | — | — |
-| `sse_big` | **4,842** | 3,257 | 2,256 | — | — |
+| case              |       ewe@9 |       ewe@8 |    mist |        elli |  bandit |       httpd | roadrunner |  cowboy | mochiweb |         yaws |
+| ----------------- | ----------: | ----------: | ------: | ----------: | ------: | ----------: | ---------: | ------: | -------: | -----------: |
+| hello             |     266,046 | **283,205** | 199,559 |   276,538 ~ | 152,776 |     103,490 |    246,009 | 116,951 |  180,532 |      165,957 |
+| hello_headers     | **223,539** |     221,090 | 159,693 |     219,366 | 124,005 |      87,236 |    197,914 |  95,855 |  133,774 |      118,936 |
+| echo_1kb          |     230,146 |     241,469 | 173,837 | **242,937** | 139,177 |      76,045 |    213,377 |  82,815 |  158,673 |      143,420 |
+| echo_1kb_headers  |     201,422 |     198,650 | 143,568 | **205,644** | 116,815 |      57,985 |    185,188 |  72,432 |  122,660 |      105,882 |
+| echo_10kb         |     188,255 | **190,263** | 158,321 |     166,777 | 119,510 |      12,513 |    183,832 |  66,638 |  116,616 |      111,922 |
+| echo_chunked_10kb |     188,239 | **191,041** | 155,390 |           - | 109,274 |           - |    183,607 |  63,295 |  117,395 |      113,277 |
+| file_tiny         |      69,500 |      69,346 |  37,838 |      39,857 |  49,345 |      34,046 |     38,771 |  33,116 | 64,847 ~ | **84,558** ~ |
+| file_small        |      58,114 |  **59,962** |  35,100 |      37,018 |  44,618 |      29,559 |     35,878 |  30,641 |   20,220 |       13,480 |
+| file_big          |   **3,695** |       3,622 |   3,599 |       3,657 |   3,610 |     1,303 ~ |      3,586 |   3,648 |      556 |        575 ~ |
+| stream            |     142,687 | **144,423** | stalled |     stalled |  85,869 |     102,903 |   35,489 ~ |  79,342 |  100,729 |      101,332 |
+| stream_small      |       8,165 |     8,092 ~ | stalled |     stalled |   7,147 | **8,466** ~ |      6,759 |   6,787 |    7,340 |        6,219 |
+| stream_big        |       8,359 |     8,420 ~ | stalled |     stalled |   7,131 |   **8,440** |      7,700 |   7,051 |    7,445 |        6,504 |
+| sse               |      17,705 |  **18,178** | stalled |           - |       - |           - |     13,090 |  13,747 |        - |       16,945 |
+| sse_small         |       6,344 |   **6,484** | stalled |           - |       - |           - |      6,270 |   5,017 |        - |        5,900 |
+| sse_big           |   **6,488** |       6,370 | stalled |           - |       - |           - |      2,465 |   2,361 |        - |        6,131 |
 
-ewe@9 led in 13 of 15 cleartext HTTP/2 scenarios. Roadrunner kept the lead on 
-`echo_10kb` by 2% and on `file_big` by 12%. 
-[Known bottlenecks and limitations](#known-bottlenecks-and-limitations) covers 
-where are the flaws of ewe@9 implementation.
+### HTTP/2
 
-The streaming benchmarks over h2c:
+| case              |        ewe@9 |        ewe@8 |   bandit |  roadrunner | chatterbox |  cowboy |
+| ----------------- | -----------: | -----------: | -------: | ----------: | ---------: | ------: |
+| hello             |  **360,596** |      160,289 |   81,403 |     211,119 |      8,267 | 134,163 |
+| hello_headers     |  **259,677** |      136,404 |   73,186 |     172,403 |      8,255 |  77,239 |
+| echo_1kb          |  **199,023** |      118,402 |   68,576 |     183,023 |      7,310 |  90,615 |
+| echo_1kb_headers  |  **162,428** |      107,699 |   62,943 |     152,565 |      7,227 |  60,352 |
+| echo_10kb         |      132,853 |       96,793 |   57,692 | **138,248** |      8,476 |  76,147 |
+| echo_chunked_10kb |      132,779 |       92,030 |   54,870 | **135,459** |      8,487 |  69,822 |
+| file_tiny         |  **128,795** |       81,594 |   39,196 |      34,993 |      8,385 |  30,792 |
+| file_small        |     45,262 ~ | **47,144** ~ | 30,113 ~ |      25,000 |     26,683 |  11,224 |
+| file_big          |        982 ~ |        507 ~ |      750 | **1,066** ~ |      721 ~ |     321 |
+| stream            |  **203,349** |       87,498 |   52,199 |     126,173 |      8,734 |  88,728 |
+| stream_small      |   **13,156** |        4,831 |    4,500 |       6,424 |     10,922 |   5,884 |
+| stream_big        | **11,957** ~ |        5,233 |    4,842 |       6,678 |    stalled |   6,212 |
+| sse               |   **24,448** |        9,825 |        - |      15,974 |          - |  12,448 |
+| sse_small         |    **8,667** |        3,415 |        - |       5,673 |          - |   4,298 |
+| sse_big           |    **5,449** |        3,208 |        - |       2,193 |          - |   2,134 |
 
-| case | ewe@9 | ewe@8 | roadrunner | bandit | chatterbox |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `stream` | **401,122** | 176,771 | 256,610 | 104,597 | 17,597 |
-| `stream_small` | **1,248,960** | 512,160 | 665,650 | 454,070 | 1,053,010 |
-| `stream_big` | **764,038** | 348,243 | 444,461 | 315,974 | — |
-| `sse` | **755,302** | 316,774 | 526,576 | — | — |
-| `sse_small` | **851,180** | 357,910 | 580,920 | — | — |
-| `sse_big` | **309,914** | 208,461 | 144,352 | — | — |
+## Latency
 
-<h2 id="against-ewe-8">Against ewe@8</h2>
+p99 latency at a fixed offered rate with no coordinated omission, lower is 
+better. Every server gets the same rates.
 
-Over HTTP/2:
+### HTTP/1.1
 
-| case | ewe@9 | ewe@8 | gain |
-| --- | ---: | ---: | ---: |
-| `hello` | **363,035** | 163,450 | **+122%** |
-| `hello_headers` | **259,101** | 137,648 | **+88%** |
-| `echo_1kb` | **211,514** | 120,417 | **+76%** |
-| `echo_1kb_headers` | **167,435** | 110,368 | **+52%** |
-| `echo_10kb` | **137,507** | 99,088 | **+39%** |
-| `echo_chunked_10kb` | **141,614** | 93,774 | **+51%** |
-| `file_tiny` | **129,972** | 81,861 | **+59%** |
-| `file_small` | 47,999 | **49,874** | −4% |
-| `file_big` | **949** | 493 | **+92%** |
-| `stream` | **200,561** | 88,386 | **+127%** |
-| `stream_small` | **12,490** | 5,122 | **+144%** |
-| `stream_big` | **11,938** | 5,441 | **+119%** |
-| `sse` | **23,603** | 9,899 | **+138%** |
-| `sse_small` | **8,512** | 3,579 | **+138%** |
-| `sse_big` | **4,842** | 3,257 | **+49%** |
+| case              |   req/s |       ewe@9 |      ewe@8 |       mist |       elli |     bandit |       httpd | roadrunner |     cowboy |   mochiweb |       yaws |
+| ----------------- | ------: | ----------: | ---------: | ---------: | ---------: | ---------: | ----------: | ---------: | ---------: | ---------: | ---------: |
+| hello             |  50,000 |       169us |      162us |     1.71ms |  **132us** |      236us |       490us |      153us |      429us |      148us |      159us |
+| hello             | 100,000 |      1.35ms |     1.26ms |     2.79ms |  **833us** |     3.04ms |     37.78ms |     1.18ms |    14.32ms |     2.49ms |     2.82ms |
+| hello             | 150,000 |      3.19ms |     3.21ms |     3.32ms | **2.90ms** |   355.71ms |  overloaded |     3.15ms | overloaded |     6.25ms |     9.35ms |
+| hello_headers     |  50,000 |       218us |      207us |      231us |  **171us** |      318us |      2.70ms |      198us |      910us |      422us |      437us |
+| hello_headers     | 100,000 |  **1.26ms** |     2.17ms |     3.10ms |     2.12ms |     3.33ms |  overloaded |     2.05ms | overloaded |    16.10ms |     6.70ms |
+| hello_headers     | 150,000 |      3.35ms |     3.67ms |   418.43ms | **2.88ms** | overloaded |  overloaded |     4.28ms | overloaded | overloaded | overloaded |
+| echo_1kb          |  50,000 |       162us |  **159us** |      195us |      162us |      208us |      3.96ms |      167us |     2.77ms |      253us |      220us |
+| echo_1kb          | 100,000 |      1.83ms |     1.68ms |     2.52ms | **1.23ms** |     2.84ms |  overloaded |     2.73ms | overloaded |     3.93ms |     3.63ms |
+| echo_1kb          | 150,000 |      3.65ms |     4.57ms |    11.44ms | **3.15ms** | overloaded |  overloaded |     3.17ms | overloaded |    18.38ms |   243.65ms |
+| echo_1kb_headers  |  40,000 |   **156us** |      176us |      272us |      159us |      295us |      3.39ms |      166us |     1.52ms |      259us |      236us |
+| echo_1kb_headers  |  80,000 |      1.66ms |      832us |     3.07ms |  **561us** |     3.25ms |  overloaded |      680us | overloaded |     3.77ms |     3.81ms |
+| echo_1kb_headers  | 120,000 |      3.61ms |     2.94ms |     8.80ms | **2.87ms** | overloaded |  overloaded |     3.10ms | overloaded | overloaded | overloaded |
+| echo_10kb         |  20,000 |       161us |      157us |      195us |  **154us** |      188us |  overloaded |      169us |      343us |      201us |      199us |
+| echo_10kb         |  60,000 |       469us |      320us |      317us |      554us |     2.51ms |  overloaded |  **253us** |    32.55ms |     3.24ms |     2.87ms |
+| echo_10kb         | 100,000 |  **1.16ms** |     2.26ms |     3.71ms |     3.18ms |     4.21ms |  overloaded |     2.81ms | overloaded |    13.04ms |   106.14ms |
+| echo_chunked_10kb |  40,000 |       177us |  **139us** |      220us |          - |      356us |           - |      160us |     2.89ms |      237us |      305us |
+| echo_chunked_10kb |  70,000 |   **380us** |      408us |     2.31ms |          - |     2.95ms |           - |      455us | overloaded |     3.33ms |     3.31ms |
+| echo_chunked_10kb | 100,000 |      3.29ms | **2.40ms** |     3.24ms |          - |    27.50ms |           - |     3.12ms | overloaded |     6.44ms |    30.41ms |
+| file_tiny         |  20,000 |       707us |      398us |      929us |      442us |     1.76ms |       669us |      529us |      976us |     1.59ms |  **222us** |
+| file_tiny         |  40,000 |      3.94ms |     3.76ms | overloaded |   181.95ms |     6.53ms |  overloaded | overloaded | overloaded |     4.94ms |  **386us** |
+| file_tiny         |  60,000 | **37.87ms** |    54.42ms | overloaded | overloaded | overloaded |  overloaded | overloaded | overloaded |   160.19ms | overloaded |
+| file_small        |  15,000 |       398us |  **343us** |      577us |      508us |      777us |      1.10ms |      571us |     1.25ms |    29.99ms | overloaded |
+| file_small        |  30,000 |      3.35ms | **3.01ms** |     4.09ms |     3.76ms |     3.91ms |  overloaded |     5.10ms | overloaded | overloaded | overloaded |
+| file_small        |  45,000 |  **9.35ms** |     9.60ms | overloaded | overloaded | overloaded |  overloaded | overloaded | overloaded | overloaded | overloaded |
+| file_big          |     500 |      2.07ms |     1.90ms |     1.92ms |     1.90ms |     2.38ms |      2.24ms | **1.86ms** |     2.30ms |    58.06ms |    25.66ms |
+| file_big          |   1,000 |      2.40ms |     2.31ms |     2.45ms |     2.52ms |     2.36ms |      4.68ms |     2.52ms | **2.25ms** | overloaded | overloaded |
+| file_big          |   1,500 |      2.55ms |     2.50ms |     2.65ms |     2.58ms |     2.45ms |      7.49ms |     2.65ms | **2.44ms** | overloaded | overloaded |
+| stream            |  20,000 |       208us |  **199us** |     errors |     errors |      287us |       256us |      715us |      290us |      232us |      253us |
+| stream            |  40,000 |   **243us** |      274us |     errors |     errors |      888us |       439us | overloaded |     1.40ms |      402us |      556us |
+| stream            |  60,000 |   **668us** |      838us |     errors |     errors |     3.56ms |      3.12ms | overloaded |     5.58ms |     3.23ms |     3.51ms |
+| stream_small      |   3,000 |      1.77ms |     1.72ms |     errors |     errors |     2.15ms |  **1.67ms** |     2.13ms |     2.16ms |     2.08ms |     2.52ms |
+| stream_small      |   5,000 |      2.65ms |     2.70ms |     errors |     errors |     5.98ms |  **2.38ms** |     4.76ms |     6.42ms |     5.37ms |    17.22ms |
+| stream_small      |   7,000 |     16.05ms |    11.56ms |     errors |     errors | overloaded | **10.38ms** | overloaded | overloaded | overloaded | overloaded |
+| stream_big        |   3,000 |      1.77ms |     1.76ms |     errors |     errors |     2.06ms |  **1.72ms** |     1.92ms |     1.92ms |     1.97ms |     2.21ms |
+| stream_big        |   5,000 |      2.39ms |     2.29ms |     errors |     errors |     3.62ms |  **2.19ms** |     3.03ms |     4.48ms |     3.55ms |     9.61ms |
+| stream_big        |   7,000 | **12.43ms** |    15.05ms |     errors |     errors |   452.22ms |     19.45ms |    61.58ms |   264.06ms |   103.01ms | overloaded |
+| sse               |   6,000 |  **1.03ms** |     1.04ms |     1.77ms |          - |          - |           - |     1.28ms |     1.33ms |          - |     1.12ms |
+| sse               |  10,000 |      1.80ms | **1.63ms** |    52.66ms |          - |          - |           - |     4.65ms |     4.83ms |          - |     3.04ms |
+| sse               |  14,000 |  **5.30ms** |     5.65ms | overloaded |          - |          - |           - | overloaded |   366.72ms |          - |    16.98ms |
+| sse_small         |   3,000 |      2.42ms |     2.33ms |     3.48ms |          - |          - |           - | **2.29ms** |     3.75ms |          - |     2.62ms |
+| sse_small         |   5,000 |      7.75ms |     8.28ms | overloaded |          - |          - |           - | **7.58ms** | overloaded |          - |    33.74ms |
+| sse_small         |   7,000 |  overloaded | overloaded | overloaded |          - |          - |           - | overloaded | overloaded |          - | overloaded |
+| sse_big           |   3,000 |      2.25ms | **2.21ms** |     2.57ms |          - |          - |           - | overloaded | overloaded |          - |     2.35ms |
+| sse_big           |   5,000 |      9.18ms | **6.50ms** |    20.36ms |          - |          - |           - | overloaded | overloaded |          - |    12.51ms |
+| sse_big           |   7,000 |  overloaded | overloaded | overloaded |          - |          - |           - | overloaded | overloaded |          - | overloaded |
 
-ewe@9 achieved a 39% to 144% throughput increase on 14 of the 15 h2c cases. The 
-exception is `file_small` at 4% below ewe@8.
+### HTTP/2
 
-Under sustained HTTP/1.1 load ewe@9 has slightly higher tail latency than ewe@8 
-on most request cases. At 150,000 req/s on `hello` its p99 was 4.18 ms against 
-ewe@8's 3.61 ms, and at 150,000 req/s on `echo_1kb` 4.32 ms against 3.58 ms. 
-On streaming it holds the heavy rungs better. At 7,000 req/s on `stream_small` 
-ewe@9 recorded 12.46 ms against ewe@8's 24.27 ms and at 5,000 req/s on 
-`sse_small` 12.53 ms against 18.14 ms.
+| case              |   req/s |        ewe@9 |       ewe@8 |     bandit |  roadrunner | chatterbox |     cowboy |
+| ----------------- | ------: | -----------: | ----------: | ---------: | ----------: | ---------: | ---------: |
+| hello             |  50,000 |        242us |   **211us** |     3.30ms |       243us |     errors |      636us |
+| hello             | 100,000 |        603us |   **206us** | overloaded |      2.88ms |     errors |    12.53ms |
+| hello             | 150,000 |   **4.41ms** |     18.79ms | overloaded |      7.41ms |     errors | overloaded |
+| hello_headers     |  50,000 |        370us |   **257us** |     6.03ms |      2.66ms |     errors |     8.24ms |
+| hello_headers     | 100,000 |   **5.93ms** |     26.04ms | overloaded |     20.74ms |     errors | overloaded |
+| hello_headers     | 150,000 | **141.25ms** |  overloaded | overloaded |  overloaded |     errors | overloaded |
+| echo_1kb          |  50,000 |    **240us** |       337us |     4.24ms |       301us |     errors |     errors |
+| echo_1kb          | 100,000 |       4.55ms |      8.62ms | overloaded |  **3.75ms** |     errors |     errors |
+| echo_1kb          | 150,000 |      70.56ms |  overloaded | overloaded | **40.53ms** |     errors |     errors |
+| echo_1kb_headers  |  40,000 |        401us |   **354us** |     3.26ms |       551us |     errors |     6.87ms |
+| echo_1kb_headers  |  80,000 |       9.40ms |     39.89ms | overloaded |  **6.60ms** |     errors |     errors |
+| echo_1kb_headers  | 120,000 |   overloaded |  overloaded | overloaded |  overloaded |     errors |     errors |
+| echo_10kb         |  20,000 |        319us |       283us |      386us |   **211us** |     errors |      634us |
+| echo_10kb         |  60,000 |    **343us** |       578us | overloaded |      1.46ms |     errors |     errors |
+| echo_10kb         | 100,000 |      13.96ms |  overloaded | overloaded |  **4.99ms** |     errors |     errors |
+| echo_chunked_10kb |  40,000 |    **340us** |       343us |     3.62ms |       469us |     errors |     errors |
+| echo_chunked_10kb |  70,000 |    **482us** |       677us | overloaded |      2.61ms |     errors |     errors |
+| echo_chunked_10kb | 100,000 |      19.30ms |  overloaded | overloaded |  **5.69ms** |     errors |     errors |
+| file_tiny         |  20,000 |       1.39ms |  **1.28ms** |     2.45ms |      2.19ms |     errors |     1.98ms |
+| file_tiny         |  40,000 |       4.04ms |  **2.55ms** | overloaded |  overloaded |     errors | overloaded |
+| file_tiny         |  60,000 |   **8.60ms** |     38.86ms | overloaded |  overloaded |     errors | overloaded |
+| file_small        |  15,000 |       1.40ms |   **921us** |     2.60ms |      3.05ms |     errors | overloaded |
+| file_small        |  30,000 |       7.16ms |  **3.47ms** |   462.98ms |  overloaded |     errors | overloaded |
+| file_small        |  45,000 |   overloaded | **93.66ms** | overloaded |  overloaded |     errors | overloaded |
+| file_big          |     500 |       4.09ms |  overloaded | **3.36ms** |      5.64ms |     errors | overloaded |
+| file_big          |   1,000 |      58.96ms |  overloaded | overloaded | **15.00ms** |     errors | overloaded |
+| file_big          |   1,500 |   overloaded |  overloaded | overloaded |  overloaded |     errors | overloaded |
+| stream            |  20,000 |        328us |       341us |      459us |   **244us** |          - |      375us |
+| stream            |  40,000 |        406us |   **360us** |     6.45ms |       572us |          - |      640us |
+| stream            |  60,000 |       1.15ms |   **617us** | overloaded |      3.29ms |          - |     4.95ms |
+| stream_small      |   3,000 |       3.07ms |      2.71ms |     5.19ms |  **2.29ms** |          - |     2.37ms |
+| stream_small      |   5,000 |      25.61ms |    203.97ms | overloaded | **18.98ms** |          - |    54.45ms |
+| stream_small      |   7,000 |  **49.14ms** |  overloaded | overloaded |  overloaded |          - | overloaded |
+| stream_big        |   3,000 |       2.52ms |      2.54ms |     3.33ms |  **2.12ms** |          - |     2.24ms |
+| stream_big        |   5,000 |      16.74ms |     12.80ms |   260.80ms |      7.68ms |          - | **6.16ms** |
+| stream_big        |   7,000 |  **41.97ms** |  overloaded | overloaded |  overloaded |          - | overloaded |
+| sse               |   6,000 |       2.28ms |      2.58ms |          - |  **1.25ms** |          - |     1.78ms |
+| sse               |  10,000 |      15.81ms |    602.37ms |          - |  **2.65ms** |          - |     9.42ms |
+| sse               |  14,000 |  **36.40ms** |  overloaded |          - |     38.22ms |          - | overloaded |
+| sse_small         |   3,000 |      11.04ms |     16.81ms |          - |  **2.73ms** |          - |     4.86ms |
+| sse_small         |   5,000 |      67.42ms |  overloaded |          - | **65.07ms** |          - | overloaded |
+| sse_small         |   7,000 | **116.32ms** |  overloaded |          - |  overloaded |          - | overloaded |
+| sse_big           |   3,000 |       5.97ms |  **4.67ms** |          - |  overloaded |          - | overloaded |
+| sse_big           |   5,000 | **225.09ms** |  overloaded |          - |  overloaded |          - | overloaded |
+| sse_big           |   7,000 |   overloaded |  overloaded |          - |  overloaded |          - | overloaded |
 
-<h2 id="against-mist">Against mist</h2>
+`chatterbox` could not sustain any of the fixed rates, answering a few hundred
+requests per second at most. Its connections crashed whenever a client closed
+the socket first. Under the constant load the memory grew until the kernel
+killed it during the `file_big` case.
 
-| case | ewe@9 | mist | gain |
-| --- | ---: | ---: | ---: |
-| `hello` | **275,439** | 201,897 | **+36%** |
-| `hello_headers` | **232,846** | 157,902 | **+47%** |
-| `echo_1kb` | **229,498** | 177,461 | **+29%** |
-| `echo_1kb_headers` | **202,558** | 146,355 | **+38%** |
-| `echo_10kb` | **193,708** | 160,960 | **+20%** |
-| `echo_chunked_10kb` | **193,991** | 158,704 | **+22%** |
-| `file_tiny` | **68,920** | 38,755 | **+78%** |
-| `file_small` | **59,293** | 36,221 | **+64%** |
+## Legend
 
-ewe@9 showed a 20% to 47% throughput improvement on standard request cases and a 
-64% to 78% advantage on static file serving.
-
-Under load ewe@9 also demonstrated lower latency percentiles. At 150,000 req/s 
-on `hello_headers`, mist's p99 latency was 8.28 ms compared to ewe@9's 4.07 ms. 
-At 100,000 req/s on `echo_chunked_10kb` mist recorded 6.45 ms against ewe@9's 
-4.02 ms, and at 10,000 req/s on `sse` 83.58 ms against 4.00 ms.
-
-<h2 id="against-elli-and-roadrunner">Against elli and roadrunner on HTTP/1</h2>
-
-These two engines represent the primary benchmarks for HTTP/1.1 performance.
-
-`elli` is a mature production-proven Erlang server. ewe@9 maintained competitive 
-performance alongside it:
-
-| case | ewe@9 | elli | difference |
-| --- | ---: | ---: | ---: |
-| `hello` | **275,439** | 267,914 | +3% |
-| `hello_headers` | **232,846** | 222,884 | +4% |
-| `echo_1kb` | 229,498 | **247,351** | −7% |
-| `echo_1kb_headers` | 202,558 | **208,486** | −3% |
-| `echo_10kb` | **193,708** | 170,952 | +13% |
-| `file_tiny` | **68,920** | 40,097 | +72% |
-| `file_small` | **59,293** | 36,939 | +61% |
-| `file_big` | **3,730** | 3,669 | +2% |
-
-There is no SSE API and no incremental body read for elli.
-
-`roadrunner` competes across the whole tests:
-
-| case | ewe@9 | roadrunner | difference |
-| --- | ---: | ---: | ---: |
-| `hello` | **275,439** | 254,256 | +8% |
-| `hello_headers` | **232,846** | 205,181 | +13% |
-| `echo_1kb` | **229,498** | 221,814 | +3% |
-| `echo_1kb_headers` | **202,558** | 191,658 | +6% |
-| `echo_10kb` | **193,708** | 187,372 | +3% |
-| `echo_chunked_10kb` | **193,991** | 188,410 | +3% |
-| `file_tiny` | **68,920** | 38,291 | +80% |
-| `file_small` | **59,293** | 35,725 | +66% |
-| `file_big` | **3,730** | 3,727 | 0% |
-| `stream` | **148,422** | 34,977 | +324% |
-| `stream_small` | **8,374** | 6,785 | +23% |
-| `stream_big` | **8,697** | 7,691 | +13% |
-| `sse` | **18,606** | 12,796 | +45% |
-| `sse_small` | **6,577** | 6,264 | +5% |
-| `sse_big` | **6,486** | 2,444 | +165% |
-
-ewe@9 led in all 15 on HTTP/1.1 with a few percent ahead on the plain request 
-cases and far ahead on files and streaming (this difference happens due to 
-roadrunner not reusing the connection on streams).
-
-<h2 id="against-roadrunner-and-bandit-on-http-2">Against roadrunner and bandit on HTTP/2</h2>
-
-| case | ewe@9 | roadrunner | difference |
-| --- | ---: | ---: | ---: |
-| `hello` | **363,035** | 216,188 | +68% |
-| `hello_headers` | **259,101** | 178,425 | +45% |
-| `echo_1kb` | **211,514** | 186,200 | +14% |
-| `echo_1kb_headers` | **167,435** | 155,359 | +8% |
-| `echo_10kb` | 137,507 | **140,386** | −2% |
-| `echo_chunked_10kb` | **141,614** | 136,139 | +4% |
-| `file_tiny` | **129,972** | 35,029 | +271% |
-| `file_small` | **47,999** | 25,559 | +88% |
-| `file_big` | 949 | **1,074** | −12% |
-| `stream` | **200,561** | 128,305 | +56% |
-| `stream_small` | **12,490** | 6,657 | +88% |
-| `stream_big` | **11,938** | 6,945 | +72% |
-| `sse` | **23,603** | 16,456 | +43% |
-| `sse_small` | **8,512** | 5,809 | +47% |
-| `sse_big` | **4,842** | 2,256 | +115% |
-
-ewe@9 led roadrunner in 13 of 15 h2c cases. The margin is largest on files and 
-streaming, 43% to 271%, and narrows to 4% to 14% on the echo cases where the 
-request body dominates. `echo_10kb` is within 2% and `file_big` trails by 12%.
-
-| case | ewe@9 | bandit | difference |
-| --- | ---: | ---: | ---: |
-| `hello` | **363,035** | 80,467 | +351% |
-| `hello_headers` | **259,101** | 72,721 | +256% |
-| `echo_1kb` | **211,514** | 68,590 | +208% |
-| `echo_1kb_headers` | **167,435** | 63,238 | +165% |
-| `echo_10kb` | **137,507** | 57,553 | +139% |
-| `echo_chunked_10kb` | **141,614** | 54,651 | +159% |
-| `file_tiny` | **129,972** | 40,707 | +219% |
-| `file_small` | **47,999** | 31,624 | +52% |
-| `file_big` | **949** | 749 | +27% |
-| `stream` | **200,561** | 52,299 | +283% |
-| `stream_small` | **12,490** | 4,541 | +175% |
-| `stream_big` | **11,938** | 4,937 | +142% |
-
-ewe@9 led in all 12 of the shared test cases showing a 139% to 351% improvement 
-on request tasks and 27% to 283% on files and streaming.
-
-`wrk2` has no HTTP/2 support so there are no latency numbers for these tables.
-
-<h2 id="latency">Latency</h2>
-
-`wrk2` targets a fixed request rate meaning its latency percentiles account for 
-queuing delays before transmission. If the load generator fails to maintain the 
-target rate the server has exceeded its capacity and the resulting percentiles 
-may no longer accurately reflect performance.
-
-A `—` means the server couldn't hold that rate.
-
-| case | ewe@9 | ewe@8 | mist | elli | roadrunner | bandit | httpd |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `hello` @ 150,000 | 4.18ms | **3.61ms** | 3.82ms | 4.20ms | 3.70ms | 23.66ms | — |
-| `echo_1kb` @ 100,000 | 3.85ms | **3.48ms** | 3.77ms | 3.50ms | 3.61ms | 3.81ms | — |
-| `echo_10kb` @ 100,000 | 3.84ms | **3.53ms** | 3.85ms | 4.04ms | 3.88ms | 5.78ms | — |
-| `echo_chunked_10kb` @ 70,000 | 3.90ms | **3.50ms** | 3.82ms | — | 3.60ms | 8.93ms | — |
-| `file_small` @ 30,000 | **4.43ms** | 4.80ms | 5.34ms | 4.97ms | 5.56ms | 4.82ms | 78.01ms |
-| `file_big` @ 1,500 | 4.82ms | 4.90ms | 4.60ms | **4.59ms** | 4.74ms | 4.69ms | 9.44ms |
-| `stream` @ 60,000 | 3.41ms | **3.17ms** | — | — | — | 3.94ms | 3.64ms |
-| `sse` @ 6,000 | **2.58ms** | 2.59ms | 3.04ms | — | 2.82ms | — | — |
-
-ewe@9 achieved the lowest latency in two of the eight scenarios and remained 
-within 0.57 ms of the top-performing server in the remaining six. ewe@8 was the 
-lowest in five of them.
-
-<h2 id="known-bottlenecks-and-limitations">Known Bottlenecks and Limitations</h2>
-
-**Large Files over HTTP/2:** ewe@9 achieves 949 req/s compared to roadrunner's 
-1,074 req/s. That is nearly double ewe@8's 493 req/s and ahead of bandit's 
-749 req/s but still 12% behind roadrunner.
-
-**Small Payloads on HTTP/1.1:** ewe@9 falls behind elli by up to 7% on specific
-cases like `echo_1kb`.
-
-**HTTP/1.1 Tail Latency:** At the highest rung of five of the six request 
-cases ewe@9's p99 sits 0.3 ms to 0.7 ms above ewe@8's while throughput is level 
-between the two. `echo_chunked_10kb` is the exception.
-
-**`file_small` over HTTP/2.** ewe@9 is the only h2c case where it trails ewe@8 
-by 4%.
-
-<h2 id="reproducing">Reproducing</h2>
-
-To run these benchmarks locally:
-
-```sh
-cd benchmark
-./throughput.sh
-./latency.sh
-```
+- `~` the runs for the median were more than 5% apart.
+- `stalled` none of the connections completed a second request.
+- `overloaded` the server answered less than 98% of the offered rate.
+- `errors` failed requests or non-2xx responses.
+- `-` the server does not support the case. `chatterbox` stopped after `file_big` 
+  in the latency run.

@@ -8,7 +8,7 @@
 
 packages = [
   { name = "alpacki", version = "3.0.1", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "alpacki", source = "hex", outer_checksum = "5BCB617A9606E56018790D4F24AB1E06B6D05BC17ACD6686B99E8D4D18B1F5FD" },
-  { name = "ewe", version = "8.0.0", build_tools = ["gleam"], requirements = ["alpacki", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "logging", "tup", "websocks"], source = "local", path = "../.." },
+  { name = "ewe", version = "9.0.0", build_tools = ["gleam"], requirements = ["alpacki", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "logging", "tup", "websocks"], source = "local", path = "../.." },
   { name = "exception", version = "2.1.1", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "exception", source = "hex", outer_checksum = "6BDEA95248093599391C3B5DF1835C5C6A86C353C2F99CE539B450E3432FE117" },
   { name = "gleam_crypto", version = "1.6.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_crypto", source = "hex", outer_checksum = "2DE9E4EF53CF6FEE049D4F765731F7178F7A11AEFAE00EEE63BF7536B354AD3F" },
   { name = "gleam_erlang", version = "1.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_erlang", source = "hex", outer_checksum = "1124AD3AA21143E5AF0FC5CF3D9529F6DB8CA03E43A55711B60B6B7B3874375C" },

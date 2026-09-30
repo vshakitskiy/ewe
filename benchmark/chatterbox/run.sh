@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-rebar3 compile
-erl -pa _build/default/lib/*/ebin \
-  -eval "application:ensure_all_started(chatterbox_bench)" \
-  -noshell
+rebar3 as prod compile
+exec erl -noshell -pa _build/prod/lib/*/ebin -eval "application:ensure_all_started(chatterbox_bench)"

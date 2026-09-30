@@ -1,123 +1,171 @@
 Compares ewe against other BEAM web servers on the same set of endpoints over
-both HTTP/1.1 and h2c.
-
-Every server implements the same routes so a row of the report is the same work
-done by different web servers. Where a server has no native API for a case its 
-route is absent and the case is skipped.
+both HTTP/1.1 and cleartext HTTP/2.
 
 ## Requirements
 
-To run everything you should have Gleam, Elixir and Erlang installed. For 
-benchmarks the tools are `wrk2` (can be built by `./wrk2-setup.sh`) and 
-`h2load` from `nghttp2`. For printing the reports I have a `report.js` that I run
-with Deno.
+This benchmark script works on Linux on my arch VM but probably won't work on
+macOS. You also need to have these runtimes and tools installed:
+
+- Gleam, Erlang, rebar3 and Elixir to build and run the servers.
+- `h2load` from nghttp2 for throughput.
+- `zrk` for latency. See [Opinion on zrk](#opinion-on-zrk).
+- `jq` to read zrk's reports.
+- `deno` to run `report.js`.
 
 ## Quick start
 
 ```sh
-./throughput.sh # runs full matrix and its like ~80 min
-./latency.sh    # runs full ladder for ~50 min
+./bench.sh throughput
+./bench.sh latency
 
-./throughput.sh --servers ewe@9,roadrunner --cases hello,sse_big
-./latency.sh --cases hello
+# You can also use flags:
+./bench.sh throughput --servers ewe@9,roadrunner --cases hello,sse_big
+./bench.sh latency --cases hello --protocols h2
 ```
 
-Both write a timestamped directory under `results/` and print a report at the
-end. To rerender one later:
+Each execution writes a timestamped directory under `results/` and prints a
+report at the end. To print the reports again:
 
 ```sh
-./report.js results/<stamp>-throughput/throughput.csv
-./report.js results/<stamp>-latency/latency.csv # you can also run both at once
+./report.js results/<stamp>-throughput/throughput.csv results/<stamp>-latency/latency.csv
 ```
+
+## Suites
+
+`throughput` measures the peak request rate with h2load. Every case runs
+`REPEATS` times with `WARMUP` seconds of unmeasured load. The report is showing
+the median values.
+
+`latency` runs a ladder of fixed request rates with zrk and records the
+latency percentiles avoiding coordinated omission. Every server gets the same
+absolute rates. Each case starts with `WARMUP` seconds at the lowest rate.
+
+With four or more CPUs the server is pinned to the first half of the physical
+cores and the load generator to the rest of the cores. In a VM these are vCPUs
+and the host decides which physical cores they run on. High rates (in my case
+above about 200_000 req/s for h2load) are partly limited by the benchmarking
+tools so small differences in the server runs are mostly noise.
+
+If a run is not clean, there is a specific status shown:
+
+| status | meaning |
+| --- | --- |
+| `errors` | failed requests, resets or non-2xx responses. In latency runs timeouts count as `overloaded` instead |
+| `stalled` | none of the connections/streams completed a second request |
+| `overloaded` | the server produced less than 98% of the offered rate |
+| `-` | the server does not support the case, exited earlier in the run, the case was not selected or the load generator failed |
 
 ## Servers
 
-| name |
-| ---  |
-| `ewe@9` |
-| `ewe@8` |
-| `mist` |
-| `elli` |
-| `bandit` |
-| `httpd` | |
-| `roadrunner` |
-| `chatterbox` |
+Every server's `run.sh` builds and starts the server for production usage.
 
-Each is started for its measurements and stopped afterwards. `run.sh` in
-each directory is the start command, the gleam ones use `gleam run`.
+| server | h1 | h2 |
+| --- | --- | --- |
+| `ewe@9` | 3006 | 3006 |
+| `ewe@8` | 3001 | 3001 |
+| `mist` | 3002 | - |
+| `elli` | 3003 | - |
+| `bandit` | 3004 | 3004 |
+| `httpd` | 3005 | - |
+| `roadrunner` | 3007 | 3008 |
+| `chatterbox` | - | 8082 |
+| `cowboy` | 3009 | 3009 |
+| `mochiweb` | 3010 | - |
+| `yaws` | 3011 | - |
 
-There are fifteen cases:
-- `GET /hello`: returns `Hello, Joe!` body
-- `GET /hello` with 7 headers: returns `Hello, Joe!` body
-- `POST /echo` with 1KiB body: echoes the body
-- `POST /echo` with 1KiB body and 7 headers: echoes the body
-- `POST /echo` with 10KiB body: echoes the body
-- `POST /echo/chunked` with 10KiB chunked body: echoes the body
-- `GET /file/tiny`: serves `priv/file_1kb.bin`
-- `GET /file/small`: serves `priv/file_100kb.bin`
-- `GET /file/big`: servers `priv/file_5mb.bin`
-- `GET /stream`: streams two chunks: `hello, ` and `Joe!`
-- `GET /stream/small`: streams 100 x 64B chunks, 6400B in total
-- `GET /stream/big`: streams 64 x 16KiB chunks, 1MiB in total
-- `GET /sse`: streams 32 events, 2688B in total
-- `GET /sse/small`: streams 100 events, 8400B total
-- `GET /sse/big`: streams 64 x 16KiB events, 1MiB total
+`bandit`, `chatterbox`, `elli`, `httpd` and `mochiweb` have no native SSE API
+and `elli` and `httpd` cannot read a request body incrementally.
 
-SSE events are `event: tick` with a various data line framed by each server's 
-own SSE encoder on every request. The header set is seven fields including 
-three cookies.
+Almost all the servers run preferably with their default settings with the
+exceptions:
 
-There is not native SSE API in `bandit`, `chatterbox`, `elli`, `httpd` so 
-comparing with streaming endpoints is enough. And `elli`, `httpd` do not have 
-incremental request body read so we can't measure chunked reading.
+- `cowboy`'s `max_keepalive` and `max_received_frame_rate` are lifted.
+- `mochiweb`, `yaws`, `elli` and `httpd` have Nagle's algorithm disabled.
+- `yaws` has its access and auth logs disabled.
 
-## Scripts
+`yaws` serves files through its read/write path, its Erlang sendfile path
+crashes in version 2.3.1. `yaws` SSE events are sent within the chunked stream 
+with `yaws_sse` formatting them.
 
-**`throughput.sh`**: requests a second, per server, per case and per protocol. 
-Runs both protocols with `h2load`. Accepts `--servers`, `--cases` and `--profiles`.
+## Cases
 
-**`latency.sh`**: response latency under fixed offered HTTP/1 only load. HTTP/1 
-only because wrk2 has no HTTP/2 support. Accepts `--servers` and `--cases`.
+| case | request | response |
+| --- | --- | --- |
+| `hello` | `GET /hello` | `Hello, Joe!` |
+| `hello_headers` | `GET /hello` with 7 extra headers | `Hello, Joe!` |
+| `echo_1kb` | `POST /echo`, 1KiB body | the body |
+| `echo_1kb_headers` | `POST /echo`, 1KiB body, 7 extra headers | the body |
+| `echo_10kb` | `POST /echo`, 10KiB body | the body |
+| `echo_chunked_10kb` | `POST /echo/chunked`, 10KiB body | the body, read incrementally |
+| `file_tiny` | `GET /file/tiny` | `priv/file_1kb.bin` |
+| `file_small` | `GET /file/small` | `priv/file_100kb.bin` |
+| `file_big` | `GET /file/big` | `priv/file_5mb.bin` |
+| `stream` | `GET /stream` | 2 chunks `hello, ` and `Joe!` |
+| `stream_small` | `GET /stream/small` | 100 x 64B chunks |
+| `stream_big` | `GET /stream/big` | 64 x 16KiB chunks |
+| `sse` | `GET /sse` | 32 events |
+| `sse_small` | `GET /sse/small` | 100 events |
+| `sse_big` | `GET /sse/big` | 64 x 16KiB events |
 
-**`report.js`**: renders either CSV as tables.
-**`config.sh`**: settings on what to measure exactly.
-**`lib.sh`**: settings on how to measure things.
-**`wrk2-setup.sh`**: clones and builds wrk2 into `.wrk2/`.
+## Settings
 
-The environment variables are:
+Environment variables with their defaults that you can use:
+
+```sh
+CONNECTIONS=50      # connections per run
+THREADS=4           # load generator threads
+H2_STREAMS=10       # concurrent streams per h2 connection
+DURATION=10         # seconds measured per run
+WARMUP=3            # seconds of unmeasured load before measuring
+REPEATS=3           # throughput runs per case
+STARTUP_TIMEOUT=120 # seconds a server gets to build and open its ports
+```
+
+## Files
 
 ```
-CONNECTIONS=50   THREADS=4   DURATION=10   WARMUP=3   WARMUP_RATE=20000
-REPEATS=3        H2_STREAMS=10             WRK2=<path to wrk2 binary>
-```
+bench.sh   settings, servers, cases and both benchmarks
+report.js  prints the CSVs in tables
 
-Latency uses fixed rate ladders per case (`latency_rates()` in `config.sh`) so
-every server is driven at the same absolute load to make servers really comparable.
-
-If the machine has four or more cores the server gets the first half and the
-load generator the second since the generator is heavy enough to fight the
-server for CPU otherwise. The chosen ranges are printed at the top of each run.
-
-The output of the scripts is something like this:
-
-```
 results/<stamp>-throughput/
-  throughput.csv                            # server,profile,protocol,connections,streams,
-                                            # case,repeat,requests_per_sec,messages,
-                                            # messages_per_sec,mib_per_sec,succeeded,failed,
-                                            # non_2xx,status
-  run.txt                                   # date, load settings, cpu pinning, versions
-  report.txt                                # rendered tables
-  <server>.log                              # server stdout and stderr
-  <server>__<profile>__<case>__<repeat>.txt # raw h2load output
+  throughput.csv  server,protocol,case,repeat,requests_per_sec,status
+  run.txt         date, machine, toolchain, CPU pinning and load
+  report.md       the printed report
+  raw/            h2load output in <server>__<protocol>__<case>__<repeat>.txt
+  logs/           build and server output in <server>.log
 
 results/<stamp>-latency/
-  latency.csv                               # server,case,target_rate,achieved_rate,p50_us,
-                                            # p75_us,p90_us,p99_us,p999_us,p9999_us,
-                                            # p50_raw_us,p99_raw_us,connect_errors,read_errors,
-                                            # write_errors,timeouts,non_2xx,status
-  run.txt
-  report.txt
-  <server>.log
-  <server>__<case>__<rate>.txt              # raw wrk2 output
+  latency.csv     server,protocol,case,rate,achieved_rate,p50_us,p99_us,p999_us,status
+  run.txt         date, machine, toolchain, CPU pinning and load
+  report.md       the printed report
+  raw/            zrk JSON reports and output in <server>__<protocol>__<case>__<rate>.{json,txt}
+  logs/           build and server output in <server>.log
 ```
+
+## Opinion on zrk
+
+I know zrk is pretty young and, most importantly, a wildly vibe coded tool. I was
+really sceptical about even trying it as there are other tools available on the
+internet. However, I still decided to use it for latency measurements. At least
+for now.
+
+Previously I used wrk2 to measure latency without coordinated omission. What I
+noticed was how much the timer affects the corrected values because wrk2
+schedules sends on its millisecond timer and rounds every wait up. This is
+especially noticeable when corrected numbers should equal raw numbers at low
+loads but this is not the case with wrk2. At 10k req/s against a server that
+produces the response in ~70 µs, wrk2's corrected p50 was 880 µs while its raw
+p50 was 68 µs. zrk's corrected p50 was 70 µs. wrk2 also has no HTTP/2 support
+and tools like h2load do have the coordinated omission problem. I looked at other
+HTTP/2 tools but they were not performant enough for the request rates I need.
+
+I am not entirely confident in the legitimacy of the numbers zrk produces but I
+checked its output. I froze the server with `SIGSTOP` for 500 ms during a
+20k req/s run and zrk's p99 and p99.9 (about 412 ms and 494 ms) matched that
+while h2load reported a p99 of 2.3 ms. I also compared zrk with other tools and
+confirmed that it sustains 150k req/s on both HTTP/1.1 and HTTP/2. After these
+checks I concluded that it is usable.
+
+Also when looking at the HTTP/2 latency results keep in mind that zrk advertises
+`HEADER_TABLE_SIZE=0`, which means servers cannot use HPACK's dynamic table for
+responses.

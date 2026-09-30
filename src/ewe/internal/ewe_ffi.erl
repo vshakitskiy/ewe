@@ -30,7 +30,6 @@
     socket_payload/1,
     socket_error_reason/1,
 
-    find_lf/1,
     find_colon/1,
     find_space/1,
     find_question/1,
@@ -43,6 +42,9 @@
 
     is_field_name/1,
     is_field_value/1,
+    split_line/2,
+    header_field/1,
+    trim_whitespace/1,
     has_userinfo/1,
     split_query/1,
     is_shutdown/1,
@@ -54,7 +56,16 @@
 ]).
 
 -define(HIGH_BITS, 16#80808080808080).
+-define(LOW_BITS, 16#01010101010101).
 -define(IS_WHITESPACE(Byte), (Byte =:= $\s orelse Byte =:= $\t)).
+
+-define(HAS_LESS(W, Limit), (((W) - (Limit) * ?LOW_BITS) band (bnot (W)) band ?HIGH_BITS)).
+
+-define(HAS_BYTE(W, Byte), ?HAS_LESS((W) bxor ((Byte) * ?LOW_BITS), 1)).
+
+-define(IS_NAME_BYTE(Byte), (Byte > $\s andalso Byte < 16#7f andalso Byte =/= $:)).
+
+-define(LONG_TEXT, 56).
 
 init() ->
   pattern(lf, <<"\n">>),
@@ -65,14 +76,7 @@ init() ->
   pattern(close_bracket, <<"]">>),
   pattern(authority_end, [<<"/">>, <<"?">>]),
   pattern(at, <<"@">>),
-  pattern(upper, [<<Byte>> || Byte <- lists:seq($A, $Z)]),
   pattern(unsafe_header, [<<"\r">>, <<"\n">>, <<0>>]),
-  pattern(field_value, [<<0>>, <<"\n">>, <<"\r">>]),
-  pattern(
-    field_name,
-    [<<Byte>> || Byte <- lists:seq(16#00, 16#20) ++ lists:seq($A, $Z) ++ [$:]
-                         ++ lists:seq(16#7f, 16#ff)]
-  ),
   pattern(break, [<<"\r\n">>, <<"\r">>, <<"\n">>]),
   ok.
 
@@ -237,7 +241,6 @@ socket_payload({_Tag, _Socket, Data}) ->
 socket_error_reason({_Tag, _Socket, Reason}) ->
   tup_socket_ffi:reason(Reason).
 
-find_lf(Bin) -> find(Bin, lf).
 find_colon(Bin) -> find(Bin, colon).
 find_space(Bin) -> find(Bin, space).
 find_question(Bin) -> find(Bin, question).
@@ -255,10 +258,14 @@ split_comma(Bin) ->
   binary:split(Bin, pattern(comma), [global]).
 
 lowercase_ascii(Bin) ->
-  case binary:match(Bin, pattern(upper)) of
-    nomatch -> Bin;
-    _Match -> << <<(lower(Byte))>> || <<Byte>> <= Bin >>
+  case has_uppercase(Bin) of
+    false -> Bin;
+    true -> << <<(lower(Byte))>> || <<Byte>> <= Bin >>
   end.
+
+has_uppercase(<<Byte, _Rest/binary>>) when Byte >= $A, Byte =< $Z -> true;
+has_uppercase(<<_Byte, Rest/binary>>) -> has_uppercase(Rest);
+has_uppercase(<<>>) -> false.
 
 lower(Byte) when Byte >= $A, Byte =< $Z -> Byte + 32;
 lower(Byte) -> Byte.
@@ -272,17 +279,126 @@ bit_array_to_string(Bin) ->
 is_field_name(<<>>) ->
   false;
 is_field_name(Name) ->
-  binary:match(Name, pattern(field_name)) =:= nomatch.
+  is_lowercase_name(Name).
+
+is_lowercase_name(<<Byte, Rest/binary>>)
+    when ?IS_NAME_BYTE(Byte), (Byte < $A orelse Byte > $Z) ->
+  is_lowercase_name(Rest);
+is_lowercase_name(<<>>) ->
+  true;
+is_lowercase_name(_Name) ->
+  false.
 
 is_field_value(<<>>) ->
   true;
 is_field_value(<<First, _/binary>> = Value) when not ?IS_WHITESPACE(First) ->
   Last = binary:last(Value),
-  not ?IS_WHITESPACE(Last)
-    andalso binary:match(Value, pattern(field_value)) =:= nomatch
-    andalso is_valid_utf8(Value);
+  not ?IS_WHITESPACE(Last) andalso is_valid_value(Value);
 is_field_value(_Value) ->
   false.
+
+split_line(Buffer, MaxLen) ->
+  case find_line_feed(Buffer, min(byte_size(Buffer), MaxLen + 2)) of
+    nomatch when byte_size(Buffer) > MaxLen -> line_too_long;
+    nomatch -> need_more;
+    0 -> bad_framing;
+    Lf ->
+      case binary:at(Buffer, Lf - 1) of
+        $\r ->
+          Rest = binary:part(Buffer, Lf + 1, byte_size(Buffer) - Lf - 1),
+          {line, binary:part(Buffer, 0, Lf - 1), Rest};
+        _Byte ->
+          bad_framing
+      end
+  end.
+
+find_line_feed(Buffer, Limit) ->
+  case scan_line_feed(Buffer, 0, min(Limit, ?LONG_TEXT)) of
+    nomatch when Limit > ?LONG_TEXT ->
+      case binary:match(Buffer, pattern(lf), [{scope, {?LONG_TEXT, Limit - ?LONG_TEXT}}]) of
+        {Pos, _Length} -> Pos;
+        nomatch -> nomatch
+      end;
+    Found ->
+      Found
+  end.
+
+scan_line_feed(<<Word:56, Rest/binary>>, Pos, Limit)
+    when Pos + 7 =< Limit, ?HAS_BYTE(Word, $\n) =:= 0 ->
+  scan_line_feed(Rest, Pos + 7, Limit);
+scan_line_feed(<<$\n, _Rest/binary>>, Pos, Limit) when Pos < Limit ->
+  Pos;
+scan_line_feed(<<_Byte, Rest/binary>>, Pos, Limit) when Pos < Limit ->
+  scan_line_feed(Rest, Pos + 1, Limit);
+scan_line_feed(_Buffer, _Pos, _Limit) ->
+  nomatch.
+
+header_field(Line) ->
+  case name_end(Line, 0) of
+    Colon when is_integer(Colon), Colon > 0 ->
+      Value = trim(Line, Colon + 1, byte_size(Line)),
+      case is_valid_value(Value) of
+        true -> {field, lowercase_ascii(binary:part(Line, 0, Colon)), Value};
+        false -> invalid_field
+      end;
+    _Invalid ->
+      invalid_field
+  end.
+
+name_end(<<$:, _Rest/binary>>, Pos) -> Pos;
+name_end(<<Byte, Rest/binary>>, Pos) when ?IS_NAME_BYTE(Byte) -> name_end(Rest, Pos + 1);
+name_end(_Line, _Pos) -> invalid.
+
+trim_whitespace(Bin) ->
+  trim(Bin, 0, byte_size(Bin)).
+
+trim(Bin, Start, End) ->
+  From = skip_leading_whitespace(Bin, Start, End),
+  To = skip_trailing_whitespace(Bin, From, End),
+  binary:part(Bin, From, To - From).
+
+skip_leading_whitespace(Bin, Pos, End) when Pos < End ->
+  case binary:at(Bin, Pos) of
+    Byte when ?IS_WHITESPACE(Byte) -> skip_leading_whitespace(Bin, Pos + 1, End);
+    _Byte -> Pos
+  end;
+skip_leading_whitespace(_Bin, Pos, _End) ->
+  Pos.
+
+skip_trailing_whitespace(Bin, Start, End) when End > Start ->
+  case binary:at(Bin, End - 1) of
+    Byte when ?IS_WHITESPACE(Byte) -> skip_trailing_whitespace(Bin, Start, End - 1);
+    _Byte -> End
+  end;
+skip_trailing_whitespace(_Bin, _Start, End) ->
+  End.
+
+is_valid_value(Value) ->
+  case value_bytes(Value, ascii) of
+    ascii -> true;
+    unicode -> is_binary(unicode:characters_to_binary(Value));
+    invalid -> false
+  end.
+
+value_bytes(<<A:56, B:56, C:56, D:56, Rest/binary>>, Kind)
+    when ((A - 14 * ?LOW_BITS) bor A bor (B - 14 * ?LOW_BITS) bor B
+          bor (C - 14 * ?LOW_BITS) bor C bor (D - 14 * ?LOW_BITS) bor D) band ?HIGH_BITS =:= 0 ->
+  value_bytes(Rest, Kind);
+value_bytes(<<A:56, B:56, C:56, D:56, Rest/binary>>, Kind)
+    when (?HAS_LESS(A, 14) bor ?HAS_LESS(B, 14) bor ?HAS_LESS(C, 14)
+          bor ?HAS_LESS(D, 14)) =:= 0 ->
+  value_bytes(Rest, text_kind(Kind, (A bor B bor C bor D) band ?HIGH_BITS));
+value_bytes(<<Word:56, Rest/binary>>, Kind) when ?HAS_LESS(Word, 14) =:= 0 ->
+  value_bytes(Rest, text_kind(Kind, Word band ?HIGH_BITS));
+value_bytes(<<Byte, Rest/binary>>, Kind) when Byte =/= 0, Byte =/= $\n, Byte =/= $\r ->
+  value_bytes(Rest, text_kind(Kind, Byte band 16#80));
+value_bytes(<<>>, Kind) ->
+  Kind;
+value_bytes(_Value, _Kind) ->
+  invalid.
+
+text_kind(ascii, 0) -> ascii;
+text_kind(_Kind, _HighBits) -> unicode.
 
 has_userinfo(Authority) ->
   binary:match(Authority, pattern(at)) =/= nomatch.

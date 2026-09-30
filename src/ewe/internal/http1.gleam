@@ -13,6 +13,7 @@ import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/int
+import gleam/list
 import gleam/option
 import gleam/result
 import logging
@@ -389,7 +390,7 @@ pub fn read_body(
 ) -> Result(#(BitArray, List(#(String, String))), BodyError) {
   let http1.Connection(self:, framing:, ..) = conn
 
-  case framing, consume_body(conn, limit, bytes_tree.new()) {
+  case framing, consume_body(conn, limit, []) {
     _framing, Ok(#(body, trailers, leftover)) -> {
       send_body_signal(self, http1.BodyDrained(leftover:))
       Ok(#(body, trailers))
@@ -447,14 +448,21 @@ pub fn read_body_chunk(
 fn consume_body(
   conn: http1.Connection,
   limit: Int,
-  acc: bytes_tree.BytesTree,
+  chunks: List(BitArray),
 ) -> Result(#(BitArray, List(#(String, String)), BitArray), BodyError) {
   case pull_chunk(conn, limit, limit) {
-    Ok(PulledChunk(data, next)) ->
-      consume_body(next, limit, bytes_tree.append(acc, data))
+    Ok(PulledChunk(data, next)) -> consume_body(next, limit, [data, ..chunks])
     Ok(PulledDone(trailers, leftover)) ->
-      Ok(#(bytes_tree.to_bit_array(acc), trailers, leftover))
+      Ok(#(join_chunks(chunks), trailers, leftover))
     Error(error) -> Error(error)
+  }
+}
+
+fn join_chunks(chunks: List(BitArray)) -> BitArray {
+  case chunks {
+    [] -> <<>>
+    [chunk] -> chunk
+    _chunks -> chunks |> list.reverse |> bit_array.concat
   }
 }
 
@@ -695,7 +703,7 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
       parse_hex_digits(remaining, acc * 16 + { byte - 55 }, True)
     <<>> if any -> Ok(acc)
     _extension if any ->
-      case parser.trim_leading_ows(bits) {
+      case parser.trim_whitespace(bits) {
         <<";":utf8, _extension:bits>> -> Ok(acc)
         _bits -> Error(Nil)
       }
