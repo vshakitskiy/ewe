@@ -358,14 +358,14 @@ fn parse_method(value: BitArray) -> Result(http.Method, Malformed) {
   }
 }
 
-@external(erlang, "ewe_ffi", "is_field_name")
-fn is_field_name(name: BitArray) -> Bool
-
-@external(erlang, "ewe_ffi", "is_field_value")
-fn is_field_value(value: BitArray) -> Bool
-
 @external(erlang, "ewe_ffi", "split_query")
 fn split_query(path: String) -> Result(#(String, String), Nil)
 
 @external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_string(bytes: BitArray) -> String
+
+@external(erlang, "ewe_ffi", "is_field_name")
+fn is_field_name(name: BitArray) -> Bool
+
+@external(erlang, "ewe_ffi", "is_field_value")
+fn is_field_value(value: BitArray) -> Bool

@@ -482,17 +482,29 @@ pub fn parse_headers(
     StepDone(#(<<>>, rest)) -> StepDone(#(list.reverse(acc), state, rest))
     StepDone(_line) if count >= options.max_headers -> ParseError(TooManyHeaders)
     StepDone(#(line, rest)) ->
-      case header_field(line) {
-        Field(name:, value:) ->
-          case classify(name, value, state) {
-            StepDone(state) -> {
-              let header = #(name, unsafe_to_string(value))
-              parse_headers(rest, [header, ..acc], count + 1, state, options)
+      case split_field(line) {
+        Ok(#(name, value)) ->
+          case is_field_value(value) {
+            True -> {
+              let name = unsafe_to_string(lowercase_ascii(name))
+              case classify(name, value, state) {
+                StepDone(state) -> {
+                  let header = #(name, unsafe_to_string(value))
+                  parse_headers(
+                    rest,
+                    [header, ..acc],
+                    count + 1,
+                    state,
+                    options,
+                  )
+                }
+                More -> More
+                ParseError(error) -> ParseError(error)
+              }
             }
-            More -> More
-            ParseError(error) -> ParseError(error)
+            False -> ParseError(BadHeader)
           }
-        InvalidField -> ParseError(BadHeader)
+        Error(Nil) -> ParseError(BadHeader)
       }
     More -> More
     ParseError(error) -> ParseError(error)
@@ -604,11 +616,6 @@ pub fn extract_line(
   }
 }
 
-type Field {
-  Field(name: String, value: BitArray)
-  InvalidField
-}
-
 pub fn tokens(value: BitArray) -> List(BitArray) {
   split_comma(value) |> list.map(trim_whitespace)
 }
@@ -629,8 +636,11 @@ fn find_authority_end(bits: BitArray) -> Result(Int, Nil)
 @external(erlang, "ewe_ffi", "split_line")
 fn split_line(buffer: BitArray, max_len: Int) -> Line
 
-@external(erlang, "ewe_ffi", "header_field")
-fn header_field(line: BitArray) -> Field
+@external(erlang, "ewe_ffi", "split_field")
+fn split_field(line: BitArray) -> Result(#(BitArray, BitArray), Nil)
+
+@external(erlang, "ewe_ffi", "is_field_value")
+fn is_field_value(value: BitArray) -> Bool
 
 @external(erlang, "ewe_ffi", "trim_whitespace")
 pub fn trim_whitespace(bits: BitArray) -> BitArray

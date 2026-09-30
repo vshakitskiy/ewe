@@ -1156,9 +1156,7 @@ fn respond(
     _status if status < 200 || status > 599 -> {
       logging.log(
         logging.Error,
-        "A handler answered with status "
-          <> int.to_string(status)
-          <> ", which cannot end an HTTP/2 response",
+        "A handler answered with status " <> int.to_string(status),
       )
       file.release_body(response.body)
       reset(state, stream_id, frame.InternalError)

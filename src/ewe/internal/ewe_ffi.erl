@@ -40,10 +40,10 @@
     lowercase_ascii/1,
     bit_array_to_string/1,
 
+    split_line/2,
+    split_field/1,
     is_field_name/1,
     is_field_value/1,
-    split_line/2,
-    header_field/1,
     trim_whitespace/1,
     has_userinfo/1,
     split_query/1,
@@ -276,6 +276,18 @@ bit_array_to_string(Bin) ->
     false -> {error, nil}
   end.
 
+split_field(Line) ->
+  case name_end(Line, 0) of
+    Colon when is_integer(Colon), Colon > 0 ->
+      {ok, {binary:part(Line, 0, Colon), trim(Line, Colon + 1, byte_size(Line))}};
+    _Invalid ->
+      {error, nil}
+  end.
+
+name_end(<<$:, _Rest/binary>>, Pos) -> Pos;
+name_end(<<Byte, Rest/binary>>, Pos) when ?IS_NAME_BYTE(Byte) -> name_end(Rest, Pos + 1);
+name_end(_Line, _Pos) -> invalid.
+
 is_field_name(<<>>) ->
   false;
 is_field_name(Name) ->
@@ -289,13 +301,12 @@ is_lowercase_name(<<>>) ->
 is_lowercase_name(_Name) ->
   false.
 
-is_field_value(<<>>) ->
+is_field_value(Value) when byte_size(Value) =:= 0 ->
   true;
-is_field_value(<<First, _/binary>> = Value) when not ?IS_WHITESPACE(First) ->
+is_field_value(Value) ->
+  First = binary:first(Value),
   Last = binary:last(Value),
-  not ?IS_WHITESPACE(Last) andalso is_valid_value(Value);
-is_field_value(_Value) ->
-  false.
+  not ?IS_WHITESPACE(First) andalso not ?IS_WHITESPACE(Last) andalso is_valid_value(Value).
 
 split_line(Buffer, MaxLen) ->
   case find_line_feed(Buffer, min(byte_size(Buffer), MaxLen + 2)) of
@@ -332,22 +343,6 @@ scan_line_feed(<<_Byte, Rest/binary>>, Pos, Limit) when Pos < Limit ->
   scan_line_feed(Rest, Pos + 1, Limit);
 scan_line_feed(_Buffer, _Pos, _Limit) ->
   nomatch.
-
-header_field(Line) ->
-  case name_end(Line, 0) of
-    Colon when is_integer(Colon), Colon > 0 ->
-      Value = trim(Line, Colon + 1, byte_size(Line)),
-      case is_valid_value(Value) of
-        true -> {field, lowercase_ascii(binary:part(Line, 0, Colon)), Value};
-        false -> invalid_field
-      end;
-    _Invalid ->
-      invalid_field
-  end.
-
-name_end(<<$:, _Rest/binary>>, Pos) -> Pos;
-name_end(<<Byte, Rest/binary>>, Pos) when ?IS_NAME_BYTE(Byte) -> name_end(Rest, Pos + 1);
-name_end(_Line, _Pos) -> invalid.
 
 trim_whitespace(Bin) ->
   trim(Bin, 0, byte_size(Bin)).
