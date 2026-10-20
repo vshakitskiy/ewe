@@ -1,31 +1,31 @@
 import ewe/internal/handler
 
 pub fn preface_with_trailing_settings_frame_test() {
-  let buffer = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8, 0, 0, 0, 4, 0>>
+  let buffer = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 0, 0, 0, 4, 0>>
   let assert handler.Http2Preface(remaining) = handler.sniff_preface(buffer)
 
   assert remaining == <<0, 0, 0, 4, 0>>
 }
 
 pub fn preface_split_across_reads_test() {
-  let first = <<"PRI * HTTP/2":utf8>>
+  let first = <<"PRI * HTTP/2">>
   assert handler.sniff_preface(first) == handler.NeedMoreData
 
-  let second = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8>>
+  let second = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>
   assert handler.sniff_preface(second) == handler.Http2Preface(<<>>)
 }
 
 pub fn ordinary_http1_request_diverges_immediately_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   assert handler.sniff_preface(buffer) == handler.NotHttp2
 }
 
 pub fn preface_lookalike_diverging_partway_test() {
-  let buffer = <<"PRI / HTTP/1.1\r\n\r\n":utf8>>
+  let buffer = <<"PRI / HTTP/1.1\r\n\r\n">>
   assert handler.sniff_preface(buffer) == handler.NotHttp2
 }
 
 pub fn preface_diverging_after_pri_line_is_invalid_http2_test() {
-  let buffer = <<"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n":utf8>>
+  let buffer = <<"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n">>
   assert handler.sniff_preface(buffer) == handler.InvalidHttp2Preface
 }

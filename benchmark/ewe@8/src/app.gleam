@@ -33,7 +33,8 @@ const big_count = 64
 
 const big_repeats = 256
 
-const small_line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const small_line =
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 type Payload {
   Payload(small: BitArray, big: BitArray, big_line: String)
@@ -67,8 +68,8 @@ fn handle_request(
     http.Post, "/echo/chunked" -> echo_chunked(request, bytes_tree.new())
     http.Get, "/stream" -> {
       use writer <- ewe.stream_response(response.new(200))
-      use writer <- result.try(ewe.send_chunk(writer, <<"hello, ":utf8>>))
-      ewe.finish_chunk(writer, <<"Joe!":utf8>>)
+      use writer <- result.try(ewe.send_chunk(writer, <<"hello, ">>))
+      ewe.finish_chunk(writer, <<"Joe!">>)
     }
     http.Get, "/stream/small" -> stream_burst(payload.small, small_count)
     http.Get, "/stream/big" -> stream_burst(payload.big, big_count)

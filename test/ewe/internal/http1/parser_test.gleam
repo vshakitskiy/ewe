@@ -9,7 +9,7 @@ fn parse(buffer: BitArray) -> Result(parser.Parsed, parser.ParseError) {
 
 pub fn simple_get_test() {
   let buffer = <<
-    "GET /foo?a=1 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n":utf8,
+    "GET /foo?a=1 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(head, metadata, remaining)) = parse(buffer)
@@ -28,7 +28,7 @@ pub fn simple_get_test() {
 }
 
 pub fn host_ipv6_with_port_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
 
   assert head.host == "[::1]"
@@ -36,12 +36,12 @@ pub fn host_ipv6_with_port_test() {
 }
 
 pub fn missing_host_on_http11_rejected_test() {
-  let buffer = <<"GET / HTTP/1.1\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\n\r\n">>
   assert parse(buffer) == Error(parser.MissingHost)
 }
 
 pub fn missing_host_on_http10_allowed_test() {
-  let buffer = <<"GET / HTTP/1.0\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.0\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
 
   assert head.host == ""
@@ -49,29 +49,29 @@ pub fn missing_host_on_http10_allowed_test() {
 }
 
 pub fn duplicate_host_rejected_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n">>
   assert parse(buffer) == Error(parser.DuplicateHost)
 }
 
 pub fn relative_path_rejected_test() {
-  let buffer = <<"GET foo HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"GET foo HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   assert parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn asterisk_form_allowed_for_options_test() {
-  let buffer = <<"OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
 
   assert head.path == "*"
 }
 
 pub fn asterisk_form_rejected_for_get_test() {
-  let buffer = <<"GET * HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"GET * HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   assert parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn connect_authority_form_test() {
-  let buffer = <<"CONNECT example.com:443 HTTP/1.1\r\n\r\n":utf8>>
+  let buffer = <<"CONNECT example.com:443 HTTP/1.1\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
 
   assert head.host == "example.com"
@@ -81,13 +81,13 @@ pub fn connect_authority_form_test() {
 }
 
 pub fn connect_without_port_rejected_test() {
-  let buffer = <<"CONNECT example.com HTTP/1.1\r\n\r\n":utf8>>
+  let buffer = <<"CONNECT example.com HTTP/1.1\r\n\r\n">>
   assert parse(buffer) == Error(parser.BadTarget)
 }
 
 pub fn mixed_case_and_ows_headers_test() {
   let buffer = <<
-    "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length:  13  \r\nConnection: close\r\n\r\nHELLO WORLD!!":utf8,
+    "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length:  13  \r\nConnection: close\r\n\r\nHELLO WORLD!!",
   >>
 
   let assert Ok(parser.Complete(head, metadata, remaining)) = parse(buffer)
@@ -100,12 +100,12 @@ pub fn mixed_case_and_ows_headers_test() {
     ]
   assert metadata.framing == http1.Fixed(13)
   assert metadata.keep_alive == http1.CloseAfterResponse
-  assert remaining == <<"HELLO WORLD!!":utf8>>
+  assert remaining == <<"HELLO WORLD!!">>
 }
 
 pub fn chunked_transfer_encoding_test() {
   let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -115,7 +115,7 @@ pub fn chunked_transfer_encoding_test() {
 
 pub fn transfer_encoding_alongside_another_coding_rejected_test() {
   let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n":utf8,
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
   >>
 
   assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
@@ -124,7 +124,7 @@ pub fn transfer_encoding_alongside_another_coding_rejected_test() {
 
 pub fn transfer_encoding_without_chunked_rejected_test() {
   let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\n\r\nhello":utf8,
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\n\r\nhello",
   >>
 
   assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
@@ -133,7 +133,7 @@ pub fn transfer_encoding_without_chunked_rejected_test() {
 
 pub fn chunked_rejected_on_http_1_0_test() {
   let buffer = <<
-    "PUT /x HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
+    "PUT /x HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
   >>
 
   assert parse(buffer) == Error(parser.AmbiguousFraming)
@@ -142,7 +142,7 @@ pub fn chunked_rejected_on_http_1_0_test() {
 
 pub fn configured_max_headers_is_applied_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-A: 1\r\nX-B: 2\r\n\r\n":utf8,
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-A: 1\r\nX-B: 2\r\n\r\n",
   >>
   let options = http1.Options(..http1.default_options(), max_headers: 2)
 
@@ -153,7 +153,7 @@ pub fn configured_max_headers_is_applied_test() {
 
 pub fn configured_max_request_line_is_applied_test() {
   let buffer = <<
-    "GET /a/fairly/long/path HTTP/1.1\r\nHost: example.com\r\n":utf8,
+    "GET /a/fairly/long/path HTTP/1.1\r\nHost: example.com\r\n",
   >>
   let options = http1.Options(..http1.default_options(), max_request_line: 8)
 
@@ -161,7 +161,7 @@ pub fn configured_max_request_line_is_applied_test() {
 }
 
 pub fn configured_max_header_line_is_applied_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n">>
   let options = http1.Options(..http1.default_options(), max_header_line: 4)
 
   assert parser.parse(buffer, options) == Error(parser.HeaderLineTooLong)
@@ -169,7 +169,7 @@ pub fn configured_max_header_line_is_applied_test() {
 
 pub fn conflicting_content_length_and_chunked_rejected_test() {
   let buffer = <<
-    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello":utf8,
+    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
   >>
 
   assert parse(buffer) == Error(parser.AmbiguousFraming)
@@ -177,7 +177,7 @@ pub fn conflicting_content_length_and_chunked_rejected_test() {
 
 pub fn connection_close_among_multiple_tokens_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, Close\r\n\r\n":utf8,
+    "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, Close\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -186,7 +186,7 @@ pub fn connection_close_among_multiple_tokens_test() {
 }
 
 pub fn http11_defaults_to_keep_alive_test() {
-  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.keep_alive == http1.KeepAlive
@@ -194,7 +194,7 @@ pub fn http11_defaults_to_keep_alive_test() {
 }
 
 pub fn http10_defaults_to_close_test() {
-  let buffer = <<"GET / HTTP/1.0\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.0\r\n\r\n">>
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.keep_alive == http1.CloseAfterResponse
@@ -202,42 +202,42 @@ pub fn http10_defaults_to_close_test() {
 }
 
 pub fn http10_explicit_keep_alive_test() {
-  let buffer = <<"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n">>
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
 
   assert metadata.keep_alive == http1.KeepAlive
 }
 
 pub fn split_across_reads_test() {
-  let first = <<"GET / HTTP/1.1\r\nHo":utf8>>
+  let first = <<"GET / HTTP/1.1\r\nHo">>
   assert parse(first) == Ok(parser.Incomplete)
 
-  let second = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let second = <<"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(second)
 
   assert head.path == "/"
 }
 
 pub fn unsupported_version_test() {
-  let buffer = <<"GET /foo HTTP/9.9\r\n\r\n":utf8>>
+  let buffer = <<"GET /foo HTTP/9.9\r\n\r\n">>
   assert parse(buffer) == Error(parser.UnsupportedVersion)
 }
 
 pub fn malformed_version_test() {
-  let buffer = <<"INVALID CONNECTION PREFACE\r\n\r\n":utf8>>
+  let buffer = <<"INVALID CONNECTION PREFACE\r\n\r\n">>
   assert parse(buffer) == Error(parser.BadVersion)
 }
 
 pub fn duplicate_content_length_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n":utf8,
+    "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
   >>
   assert parse(buffer) == Error(parser.DuplicateContentLength)
 }
 
 pub fn multibyte_utf8_header_value_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: caf\u{00E9}\r\n\r\n":utf8,
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: caf\u{00E9}\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
@@ -247,22 +247,22 @@ pub fn multibyte_utf8_header_value_test() {
 
 pub fn invalid_utf8_header_value_rejected_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: caf":utf8,
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: caf",
     255,
-    "\r\n\r\n":utf8,
+    "\r\n\r\n",
   >>
 
   assert parse(buffer) == Error(parser.BadHeader)
 }
 
 pub fn bare_lf_rejected_test() {
-  let buffer = <<"GET / HTTP/1.1\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"GET / HTTP/1.1\nHost: example.com\r\n\r\n">>
   assert parse(buffer) == Error(parser.BadRequestLine)
 }
 
 pub fn websocket_upgrade_requested_test() {
   let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n":utf8,
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -273,7 +273,7 @@ pub fn websocket_upgrade_requested_test() {
 
 pub fn upgrade_among_multiple_connection_tokens_test() {
   let buffer = <<
-    "GET /h2c HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n":utf8,
+    "GET /h2c HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -283,7 +283,7 @@ pub fn upgrade_among_multiple_connection_tokens_test() {
 
 pub fn upgrade_header_without_connection_token_ignored_test() {
   let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n":utf8,
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -294,7 +294,7 @@ pub fn upgrade_header_without_connection_token_ignored_test() {
 
 pub fn websocket_handshake_fields_collected_test() {
   let buffer = <<
-    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: Permessage-Deflate; client_max_window_bits\r\n\r\n":utf8,
+    "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: Permessage-Deflate; client_max_window_bits\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -309,7 +309,7 @@ pub fn websocket_handshake_fields_collected_test() {
 
 pub fn whitespace_before_header_colon_rejected_test() {
   let buffer = <<
-    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello":utf8,
+    "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length : 5\r\n\r\nhello",
   >>
 
   assert parse(buffer) == Error(parser.BadHeader)
@@ -318,7 +318,7 @@ pub fn whitespace_before_header_colon_rejected_test() {
 
 pub fn bare_cr_in_header_value_rejected_test() {
   let buffer = <<
-    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: a\rb\r\n\r\n":utf8,
+    "GET / HTTP/1.1\r\nHost: example.com\r\nX-Name: a\rb\r\n\r\n",
   >>
 
   assert parse(buffer) == Error(parser.BadHeader)
@@ -326,7 +326,7 @@ pub fn bare_cr_in_header_value_rejected_test() {
 
 pub fn absolute_form_authority_replaces_host_test() {
   let buffer = <<
-    "GET HTTP://api.example.com:8080/users?id=1 HTTP/1.1\r\nHost: other.com\r\n\r\n":utf8,
+    "GET HTTP://api.example.com:8080/users?id=1 HTTP/1.1\r\nHost: other.com\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
@@ -339,7 +339,7 @@ pub fn absolute_form_authority_replaces_host_test() {
 
 pub fn absolute_form_without_path_test() {
   let buffer = <<
-    "GET https://example.com?id=1 HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8,
+    "GET https://example.com?id=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(head, _metadata, _remaining)) = parse(buffer)
@@ -351,12 +351,12 @@ pub fn absolute_form_without_path_test() {
 }
 
 pub fn absolute_form_still_requires_host_on_http11_test() {
-  let buffer = <<"GET http://example.com/ HTTP/1.1\r\n\r\n":utf8>>
+  let buffer = <<"GET http://example.com/ HTTP/1.1\r\n\r\n">>
   assert parse(buffer) == Error(parser.MissingHost)
 }
 
 pub fn empty_line_before_request_line_ignored_test() {
-  let buffer = <<"\r\nGET / HTTP/1.1\r\nHost: example.com\r\n\r\n":utf8>>
+  let buffer = <<"\r\nGET / HTTP/1.1\r\nHost: example.com\r\n\r\n">>
   let assert Ok(parser.Complete(head, _metadata, remaining)) = parse(buffer)
 
   assert head.path == "/"
@@ -365,7 +365,7 @@ pub fn empty_line_before_request_line_ignored_test() {
 
 pub fn chunked_after_another_coding_across_headers_rejected_test() {
   let buffer = <<
-    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n":utf8,
+    "PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
   >>
 
   assert parse(buffer) == Error(parser.UnsupportedTransferEncoding)
@@ -374,7 +374,7 @@ pub fn chunked_after_another_coding_across_headers_rejected_test() {
 
 pub fn expect_continue_with_body_test() {
   let buffer = <<
-    "POST / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\n":utf8,
+    "POST / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)
@@ -384,7 +384,7 @@ pub fn expect_continue_with_body_test() {
 
 pub fn expect_continue_on_http10_ignored_test() {
   let buffer = <<
-    "POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n":utf8,
+    "POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
   >>
 
   let assert Ok(parser.Complete(_head, metadata, _remaining)) = parse(buffer)

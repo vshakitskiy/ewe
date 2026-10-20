@@ -189,7 +189,7 @@ pub fn field_value_rules_test() {
 
 pub fn invalid_utf8_value_is_malformed_test() {
   assert parser.request(
-      list.append(fields(get("/")), [#(<<"x":utf8>>, <<0xff>>)]),
+      list.append(fields(get("/")), [#(<<"x">>, <<0xff>>)]),
       http.Https,
       True,
     )

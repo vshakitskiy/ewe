@@ -188,22 +188,22 @@ fn parse_request_line(
 
 fn skip_empty_line(buffer: BitArray) -> BitArray {
   case buffer {
-    <<"\r\n":utf8, remaining:bits>> -> remaining
+    <<"\r\n", remaining:bits>> -> remaining
     _buffer -> buffer
   }
 }
 
 fn parse_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
   case line {
-    <<"GET ":utf8, remaining:bits>> -> StepDone(#(http.Get, remaining))
-    <<"POST ":utf8, remaining:bits>> -> StepDone(#(http.Post, remaining))
-    <<"PUT ":utf8, remaining:bits>> -> StepDone(#(http.Put, remaining))
-    <<"DELETE ":utf8, remaining:bits>> -> StepDone(#(http.Delete, remaining))
-    <<"HEAD ":utf8, remaining:bits>> -> StepDone(#(http.Head, remaining))
-    <<"OPTIONS ":utf8, remaining:bits>> -> StepDone(#(http.Options, remaining))
-    <<"PATCH ":utf8, remaining:bits>> -> StepDone(#(http.Patch, remaining))
-    <<"TRACE ":utf8, remaining:bits>> -> StepDone(#(http.Trace, remaining))
-    <<"CONNECT ":utf8, remaining:bits>> -> StepDone(#(http.Connect, remaining))
+    <<"GET ", remaining:bits>> -> StepDone(#(http.Get, remaining))
+    <<"POST ", remaining:bits>> -> StepDone(#(http.Post, remaining))
+    <<"PUT ", remaining:bits>> -> StepDone(#(http.Put, remaining))
+    <<"DELETE ", remaining:bits>> -> StepDone(#(http.Delete, remaining))
+    <<"HEAD ", remaining:bits>> -> StepDone(#(http.Head, remaining))
+    <<"OPTIONS ", remaining:bits>> -> StepDone(#(http.Options, remaining))
+    <<"PATCH ", remaining:bits>> -> StepDone(#(http.Patch, remaining))
+    <<"TRACE ", remaining:bits>> -> StepDone(#(http.Trace, remaining))
+    <<"CONNECT ", remaining:bits>> -> StepDone(#(http.Connect, remaining))
     _other -> parse_other_method(line)
   }
 }
@@ -213,7 +213,7 @@ fn parse_other_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
     Error(Nil) -> ParseError(BadRequestLine)
     Ok(position) ->
       case line {
-        <<name:bytes-size(position), " ":utf8, remaining:bits>> ->
+        <<name:bytes-size(position), " ", remaining:bits>> ->
           case bit_array_to_string(name) {
             Error(Nil) -> ParseError(BadMethod)
             Ok(name) ->
@@ -235,17 +235,11 @@ fn parse_target_version(bits: BitArray) -> Step(#(BitArray, Version)) {
     False -> {
       let target_size = size - 9
       case bits {
-        <<target:bytes-size(target_size), " HTTP/1.1":utf8>> ->
+        <<target:bytes-size(target_size), " HTTP/1.1">> ->
           StepDone(#(target, Http11))
-        <<target:bytes-size(target_size), " HTTP/1.0":utf8>> ->
+        <<target:bytes-size(target_size), " HTTP/1.0">> ->
           StepDone(#(target, Http10))
-        <<
-          _target:bytes-size(target_size),
-          " HTTP/":utf8,
-          major,
-          ".":utf8,
-          minor,
-        >>
+        <<_target:bytes-size(target_size), " HTTP/", major, ".", minor>>
           if major >= 48 && major <= 57 && minor >= 48 && minor <= 57
         -> ParseError(UnsupportedVersion)
         _bits -> ParseError(BadVersion)
@@ -266,7 +260,7 @@ fn split_target(target: BitArray) -> Step(#(String, option.Option(String))) {
       case target {
         <<
           path:bytes-size(position),
-          "?":utf8,
+          "?",
           query:bytes-size(size - position - 1),
         >> -> {
           use path <- try_step(decode_component(path, BadTarget))
@@ -325,11 +319,11 @@ fn split_absolute_form(
   target: BitArray,
 ) -> Step(#(option.Option(#(String, option.Option(Int))), BitArray)) {
   case target {
-    <<"/":utf8, _path:bits>> -> StepDone(#(option.None, target))
-    <<scheme:bytes-size(4), "://":utf8, remaining:bits>>
-    | <<scheme:bytes-size(5), "://":utf8, remaining:bits>> ->
+    <<"/", _path:bits>> -> StepDone(#(option.None, target))
+    <<scheme:bytes-size(4), "://", remaining:bits>>
+    | <<scheme:bytes-size(5), "://", remaining:bits>> ->
       case lowercase_ascii(scheme) {
-        <<"http":utf8>> | <<"https":utf8>> -> split_authority(remaining)
+        <<"http">> | <<"https">> -> split_authority(remaining)
         _scheme -> ParseError(BadTarget)
       }
     _target -> StepDone(#(option.None, target))
@@ -357,8 +351,8 @@ fn split_authority(
 
 fn origin_form(origin: BitArray) -> BitArray {
   case origin {
-    <<"/":utf8, _path:bits>> -> origin
-    _query -> <<"/":utf8, origin:bits>>
+    <<"/", _path:bits>> -> origin
+    _query -> <<"/", origin:bits>>
   }
 }
 
@@ -534,7 +528,7 @@ fn classify(
         state.transfer_encoding,
         value |> lowercase_ascii |> tokens
       {
-        NoTransferEncoding, [<<"chunked":utf8>>] -> ChunkedFinal
+        NoTransferEncoding, [<<"chunked">>] -> ChunkedFinal
         _transfer_encoding, _codings -> UnsupportedFinal
       }
       StepDone(HeaderState(..state, transfer_encoding:))
@@ -542,15 +536,15 @@ fn classify(
     "connection" -> {
       let requested = value |> lowercase_ascii |> tokens
       let connection = case
-        list.contains(requested, <<"close":utf8>>),
-        list.contains(requested, <<"keep-alive":utf8>>)
+        list.contains(requested, <<"close">>),
+        list.contains(requested, <<"keep-alive">>)
       {
         True, _keep_alive -> RequestedClose
         False, True -> RequestedKeepAlive
         False, False -> state.connection
       }
       let connection_upgrade =
-        state.connection_upgrade || list.contains(requested, <<"upgrade":utf8>>)
+        state.connection_upgrade || list.contains(requested, <<"upgrade">>)
       StepDone(HeaderState(..state, connection:, connection_upgrade:))
     }
     "upgrade" -> {
@@ -576,7 +570,7 @@ fn classify(
       StepDone(HeaderState(..state, websocket_extensions: option.Some(lowered)))
     }
     "expect" -> {
-      let expect_continue = lowercase_ascii(value) == <<"100-continue":utf8>>
+      let expect_continue = lowercase_ascii(value) == <<"100-continue">>
       StepDone(HeaderState(..state, expect_continue:))
     }
     "host" ->

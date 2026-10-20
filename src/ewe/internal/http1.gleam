@@ -702,7 +702,7 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
     <<>> if any -> Ok(acc)
     _extension if any ->
       case parser.trim_whitespace(bits) {
-        <<";":utf8, _extension:bits>> -> Ok(acc)
+        <<";", _extension:bits>> -> Ok(acc)
         _bits -> Error(Nil)
       }
     _bits -> Error(Nil)
@@ -722,7 +722,7 @@ fn take_chunk_prefix(
   case slice {
     LastSlice ->
       case buffer {
-        <<data:bytes-size(want), "\r\n":utf8, remaining:bits>> ->
+        <<data:bytes-size(want), "\r\n", remaining:bits>> ->
           parser.StepDone(#(data, remaining))
         _buffer ->
           case bit_array.byte_size(buffer) < want + 2 {

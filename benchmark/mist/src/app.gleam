@@ -33,7 +33,8 @@ const big_count = 64
 
 const big_repeats = 256
 
-const small_line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const small_line =
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 type Payload {
   Payload(small: BitArray, big: BitArray, big_line: String)

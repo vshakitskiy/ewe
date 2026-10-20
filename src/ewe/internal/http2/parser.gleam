@@ -122,8 +122,8 @@ fn target_request(
 ) -> Result(request.Request(Nil), Malformed) {
   use scheme <- result.try(required(section.scheme))
   use scheme <- result.try(case scheme {
-    <<"https":utf8>> -> Ok(http.Https)
-    <<"http":utf8>> -> Ok(http.Http)
+    <<"https">> -> Ok(http.Https)
+    <<"http">> -> Ok(http.Http)
     _scheme -> Error(UnsupportedScheme)
   })
   use path <- result.try(required(section.path))
@@ -223,7 +223,7 @@ fn add_field(
   let #(name, value) = field
 
   case name {
-    <<":":utf8, _pseudo:bits>> -> add_pseudo(section, name, value)
+    <<":", _pseudo:bits>> -> add_pseudo(section, name, value)
     _regular -> add_regular(section, name, value)
   }
 }
@@ -235,23 +235,23 @@ fn add_pseudo(
 ) -> Result(Section, Malformed) {
   case section.seen_regular, name {
     True, _name -> Error(PseudoHeaderAfterRegular)
-    False, <<":method":utf8>> -> {
+    False, <<":method">> -> {
       use method <- once(section.method, value, False)
       Ok(Section(..section, method:))
     }
-    False, <<":scheme":utf8>> -> {
+    False, <<":scheme">> -> {
       use scheme <- once(section.scheme, value, False)
       Ok(Section(..section, scheme:))
     }
-    False, <<":authority":utf8>> -> {
+    False, <<":authority">> -> {
       use authority <- once(section.authority, value, True)
       Ok(Section(..section, authority:))
     }
-    False, <<":path":utf8>> -> {
+    False, <<":path">> -> {
       use path <- once(section.path, value, True)
       Ok(Section(..section, path:))
     }
-    False, <<":protocol":utf8>> -> {
+    False, <<":protocol">> -> {
       use protocol <- once(section.protocol, value, True)
       Ok(Section(..section, protocol:))
     }
@@ -320,7 +320,7 @@ pub fn trailers(
   use section <- result.map(
     list.try_fold(fields, empty_section(), fn(section, field) {
       case field {
-        #(<<":":utf8, _pseudo:bits>>, _value) -> Error(UnknownPseudoHeader)
+        #(<<":", _pseudo:bits>>, _value) -> Error(UnknownPseudoHeader)
         #(name, value) -> add_regular(section, name, value)
       }
     }),
@@ -342,15 +342,15 @@ fn validate_field(
 
 fn parse_method(value: BitArray) -> Result(http.Method, Malformed) {
   case value {
-    <<"GET":utf8>> -> Ok(http.Get)
-    <<"POST":utf8>> -> Ok(http.Post)
-    <<"PUT":utf8>> -> Ok(http.Put)
-    <<"DELETE":utf8>> -> Ok(http.Delete)
-    <<"HEAD":utf8>> -> Ok(http.Head)
-    <<"OPTIONS":utf8>> -> Ok(http.Options)
-    <<"PATCH":utf8>> -> Ok(http.Patch)
-    <<"CONNECT":utf8>> -> Ok(http.Connect)
-    <<"TRACE":utf8>> -> Ok(http.Trace)
+    <<"GET">> -> Ok(http.Get)
+    <<"POST">> -> Ok(http.Post)
+    <<"PUT">> -> Ok(http.Put)
+    <<"DELETE">> -> Ok(http.Delete)
+    <<"HEAD">> -> Ok(http.Head)
+    <<"OPTIONS">> -> Ok(http.Options)
+    <<"PATCH">> -> Ok(http.Patch)
+    <<"CONNECT">> -> Ok(http.Connect)
+    <<"TRACE">> -> Ok(http.Trace)
     _method ->
       unsafe_to_string(value)
       |> http.parse_method

@@ -46,25 +46,25 @@ fn app(req: request.Request(ewe.Connection)) -> response.Response(ewe.Body) {
     ["no-content"] -> text(204, "never sent")
     ["streamed-no-content"] -> {
       use writer <- ewe.stream_response(response.new(204))
-      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+      ewe.finish_chunk(writer, <<"never sent">>)
     }
     ["informational"] -> text(103, "")
     ["streamed-out-of-range"] -> {
       use writer <- ewe.stream_response(response.new(600))
-      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+      ewe.finish_chunk(writer, <<"never sent">>)
     }
     ["unsafe"] -> text(200, "") |> response.set_header("x-a", "a\r\nb")
     ["unsafe-stream"] -> {
       use writer <- ewe.stream_response(
         response.new(200) |> response.set_header("x-a", "a\r\nb"),
       )
-      ewe.finish_chunk(writer, <<"never sent":utf8>>)
+      ewe.finish_chunk(writer, <<"never sent">>)
     }
     ["stream"] -> {
       use writer <- ewe.stream_response(response.new(200))
-      use writer <- result.try(ewe.send_chunk(writer, <<"a":utf8>>))
-      use writer <- result.try(ewe.send_chunk(writer, <<"b":utf8>>))
-      ewe.finish_chunk(writer, <<"c":utf8>>)
+      use writer <- result.try(ewe.send_chunk(writer, <<"a">>))
+      use writer <- result.try(ewe.send_chunk(writer, <<"b">>))
+      ewe.finish_chunk(writer, <<"c">>)
     }
     ["hang"] -> {
       process.sleep_forever()
@@ -89,7 +89,7 @@ fn text(status: Int, body: String) -> response.Response(ewe.Body) {
 }
 
 fn filler(size: Int) -> BitArray {
-  bit_array.concat(list.repeat(<<"x":utf8>>, size))
+  bit_array.concat(list.repeat(<<"x">>, size))
 }
 
 fn ready() -> client.Client {
@@ -155,7 +155,7 @@ pub fn simple_request_test() {
     |> client.get(1, "/hello")
     |> client.response(1)
 
-  let assert Response(status: 200, headers:, body: <<"hello":utf8>>) = received
+  let assert Response(status: 200, headers:, body: <<"hello">>) = received
   assert list.key_find(headers, "content-length") == Ok("5")
   assert result.is_ok(list.key_find(headers, "date"))
 }
@@ -298,7 +298,7 @@ pub fn resets_after_the_handler_returned_are_not_counted_test() {
 
   let #(received, _client) =
     client
-    |> client.send(frame.Ping(ack: False, data: <<"no-reset":utf8>>))
+    |> client.send(frame.Ping(ack: False, data: <<"no-reset">>))
     |> client.skip_until(fn(received) {
       case received {
         frame.Ping(ack: True, ..) | frame.Goaway(..) -> True
@@ -382,10 +382,10 @@ pub fn streaming_writer_learns_of_reset_test() {
   let parent = process.new_subject()
   let handler = fn(_req: request.Request(ewe.Connection)) {
     use writer <- ewe.stream_response(response.new(200))
-    use writer <- result.try(ewe.send_chunk(writer, <<"a":utf8>>))
+    use writer <- result.try(ewe.send_chunk(writer, <<"a">>))
     process.send(parent, Ok(Nil))
     process.sleep(100)
-    let sent = ewe.send_chunk(writer, <<"b":utf8>>)
+    let sent = ewe.send_chunk(writer, <<"b">>)
     process.send(parent, result.replace(sent, Nil))
     Ok(Nil)
   }
@@ -565,7 +565,7 @@ pub fn early_response_asks_the_client_to_stop_sending_test() {
 
   let client = expect_reset(client, 1, frame.NoError)
   assert client
-    |> client.data(1, <<"late":utf8>>, True)
+    |> client.data(1, <<"late">>, True)
     |> client.is_quiet
 }
 
@@ -573,11 +573,11 @@ pub fn trailers_reach_the_handler_test() {
   let #(received, _client) =
     ready()
     |> client.headers(1, client.request_fields("POST", "/trailer"), False)
-    |> client.data(1, <<"body":utf8>>, False)
+    |> client.data(1, <<"body">>, False)
     |> client.headers(1, [#("x-trailer", "present")], True)
     |> client.response(1)
 
-  let assert Response(status: 200, body: <<"present":utf8>>, ..) = received
+  let assert Response(status: 200, body: <<"present">>, ..) = received
 }
 
 pub fn informational_final_status_is_internal_error_test() {
@@ -645,7 +645,7 @@ pub fn streamed_response_test() {
     |> client.get(1, "/stream")
     |> client.response(1)
 
-  let assert Response(status: 200, headers:, body: <<"abc":utf8>>) = received
+  let assert Response(status: 200, headers:, body: <<"abc">>) = received
   assert list.key_find(headers, "content-length") == Error(Nil)
 }
 
@@ -714,11 +714,8 @@ pub fn connect_reaches_the_handler_test() {
     )
     |> client.response(1)
 
-  let assert Response(
-    status: 200,
-    headers:,
-    body: <<"tunnel to example.com":utf8>>,
-  ) = received
+  let assert Response(status: 200, headers:, body: <<"tunnel to example.com">>) =
+    received
   assert list.key_find(headers, "content-length") == Error(Nil)
 }
 
@@ -809,8 +806,8 @@ pub fn handler_reads_the_request_after_responding_test() {
   let #(received, client) = client.response(client, 1)
   let assert Response(status: 200, ..) = received
 
-  let _client = client.data(client, 1, <<"late body":utf8>>, True)
-  assert process.receive(parent, 1000) == Ok(Ok(<<"late body":utf8>>))
+  let _client = client.data(client, 1, <<"late body">>, True)
+  assert process.receive(parent, 1000) == Ok(Ok(<<"late body">>))
 }
 
 fn websocket_request() -> List(#(String, String)) {
@@ -852,9 +849,9 @@ pub fn websocket_over_extended_connect_test() {
 
   let #(echoed, client) =
     client
-    |> client.data(1, <<0x81, 0x82, 0:32, "hi":utf8>>, False)
+    |> client.data(1, <<0x81, 0x82, 0:32, "hi">>, False)
     |> client.receive
-  assert echoed == frame.Data(1, False, <<0x81, 0x02, "hi":utf8>>, 4)
+  assert echoed == frame.Data(1, False, <<0x81, 0x02, "hi">>, 4)
 
   let #(closed, _client) =
     client
@@ -873,7 +870,7 @@ pub fn write_after_the_response_ended_fails_at_once_test() {
   let handler = fn(_req: request.Request(ewe.Connection)) {
     use writer <- ewe.stream_response(response.new(200))
     let assert Ok(Nil) = ewe.finish_response(writer)
-    process.send(parent, ewe.send_chunk(writer, <<"late":utf8>>))
+    process.send(parent, ewe.send_chunk(writer, <<"late">>))
     Ok(Nil)
   }
 
@@ -904,7 +901,7 @@ pub fn reading_the_body_again_after_the_stream_ended_returns_at_once_test() {
     client.serve(handler)
     |> client.handshake([])
     |> client.headers(1, client.request_fields("POST", "/"), False)
-    |> client.data(1, <<"body":utf8>>, True)
+    |> client.data(1, <<"body">>, True)
   assert process.receive(parent, 1000) == Ok(Ok(<<>>))
 }
 
@@ -931,7 +928,7 @@ pub fn websocket_on_close_runs_after_stream_ends_test() {
 
   let #(ended, _client) =
     client
-    |> client.data(1, <<0x81, 0x82, 0:32, "hi":utf8>>, False)
+    |> client.data(1, <<0x81, 0x82, 0:32, "hi">>, False)
     |> client.receive
   assert ended == frame.Data(1, True, <<>>, 0)
 

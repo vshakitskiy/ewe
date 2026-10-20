@@ -33,7 +33,7 @@ pub fn encode(event: Event) -> bytes_tree.BytesTree {
   |> bytes_tree.append(newline)
 }
 
-const newline = <<"\n":utf8>>
+const newline = <<"\n">>
 
 fn append_field(
   tree: bytes_tree.BytesTree,

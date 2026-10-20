@@ -150,7 +150,7 @@ const transmit_quantum = 1_048_576
 
 const cork_limit = 262_144
 
-const shutdown_ping = <<"shutdown":utf8>>
+const shutdown_ping = <<"shutdown">>
 
 pub fn start(
   connection: tup.Connection,
@@ -1657,7 +1657,7 @@ pub fn response_fields(
 
   [
     response_field(":status", int.to_string(status)),
-    alpacki.HeaderField(<<"date":utf8>>, date, alpacki.WithIndexing),
+    alpacki.HeaderField(<<"date">>, date, alpacki.WithIndexing),
     ..fields
   ]
 }

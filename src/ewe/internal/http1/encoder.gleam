@@ -120,7 +120,7 @@ fn switching_protocols(
 ) -> Encoded {
   let head =
     append_date(state.tree)
-    |> bytes_tree.append(<<"\r\n":utf8>>)
+    |> bytes_tree.append(<<"\r\n">>)
     |> bytes_tree.prepend(status_line(status))
 
   Encoded(
@@ -186,9 +186,9 @@ fn sized(
   remainder: Remainder,
 ) -> Encoded {
   let framing = <<
-    "content-length: ":utf8,
+    "content-length: ",
     int.to_string(length):utf8,
-    "\r\n":utf8,
+    "\r\n",
   >>
 
   Encoded(build_head(state, status, keep_alive, framing), keep_alive, remainder)
@@ -205,7 +205,7 @@ fn encode_stream(
     parser.Http11 ->
       Encoded(
         build_head(state, status, keep_alive, <<
-          "transfer-encoding: chunked\r\n":utf8,
+          "transfer-encoding: chunked\r\n",
         >>),
         keep_alive,
         RemainderStream(handler:, framing: http1.ChunkedStream),
@@ -230,7 +230,7 @@ fn encode_sse(
     parser.Http11 ->
       Encoded(
         build_head(state, status, keep_alive, <<
-          "content-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n":utf8,
+          "content-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n",
         >>),
         keep_alive,
         RemainderSse(handler:, framing: http1.ChunkedStream),
@@ -238,7 +238,7 @@ fn encode_sse(
     parser.Http10 ->
       Encoded(
         build_head(state, status, http1.CloseAfterResponse, <<
-          "content-type: text/event-stream\r\ncache-control: no-cache\r\n":utf8,
+          "content-type: text/event-stream\r\ncache-control: no-cache\r\n",
         >>),
         http1.CloseAfterResponse,
         RemainderSse(handler:, framing: http1.CloseDelimitedStream),
@@ -267,16 +267,16 @@ fn build_head(
   append_date(state.tree)
   |> append_connection(keep_alive)
   |> bytes_tree.append(framing)
-  |> bytes_tree.append(<<"\r\n":utf8>>)
+  |> bytes_tree.append(<<"\r\n">>)
   |> bytes_tree.prepend(status_line(status))
 }
 
 pub type ResponseWriter =
   http1.ResponseWriter
 
-const last_chunk = <<"0\r\n\r\n":utf8>>
+const last_chunk = <<"0\r\n\r\n">>
 
-pub const continue = <<"HTTP/1.1 100 Continue\r\n\r\n":utf8>>
+pub const continue = <<"HTTP/1.1 100 Continue\r\n\r\n">>
 
 pub fn frame(
   chunk: bytes_tree.BytesTree,
@@ -287,9 +287,9 @@ pub fn frame(
     http1.ChunkedStream, size ->
       bytes_tree.new()
       |> bytes_tree.append_string(int.to_base16(size))
-      |> bytes_tree.append(<<"\r\n":utf8>>)
+      |> bytes_tree.append(<<"\r\n">>)
       |> bytes_tree.append_tree(chunk)
-      |> bytes_tree.append(<<"\r\n":utf8>>)
+      |> bytes_tree.append(<<"\r\n">>)
   }
 }
 
@@ -398,7 +398,7 @@ fn encode_headers(
       case parser.find_unsafe_header_byte(value) {
         Error(Nil) -> {
           let lowered = value |> bit_array.from_string |> parser.lowercase_ascii
-          let keep_alive = case parser.has_token(lowered, <<"close":utf8>>) {
+          let keep_alive = case parser.has_token(lowered, <<"close">>) {
             True -> http1.CloseAfterResponse
             False -> state.keep_alive
           }
@@ -422,7 +422,7 @@ fn append_header(
     Error(Nil), Error(Nil) -> {
       let tree =
         bytes_tree.append_string(state.tree, name)
-        |> bytes_tree.append(<<": ":utf8, value:utf8, "\r\n":utf8>>)
+        |> bytes_tree.append(<<": ", value:utf8, "\r\n">>)
 
       Ok(EncodeState(..state, tree:))
     }
@@ -431,7 +431,7 @@ fn append_header(
 }
 
 fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
-  bytes_tree.append(tree, <<"date: ":utf8, date():bits, "\r\n":utf8>>)
+  bytes_tree.append(tree, <<"date: ", date():bits, "\r\n">>)
 }
 
 fn append_connection(
@@ -439,85 +439,85 @@ fn append_connection(
   keep_alive: http1.KeepAlive,
 ) -> bytes_tree.BytesTree {
   let value = case keep_alive {
-    http1.KeepAlive -> <<"keep-alive":utf8>>
-    http1.CloseAfterResponse -> <<"close":utf8>>
+    http1.KeepAlive -> <<"keep-alive">>
+    http1.CloseAfterResponse -> <<"close">>
   }
 
-  bytes_tree.append(tree, <<"connection: ":utf8, value:bits, "\r\n":utf8>>)
+  bytes_tree.append(tree, <<"connection: ", value:bits, "\r\n">>)
 }
 
 fn status_line(status: Int) -> BitArray {
   case status {
-    100 -> <<"HTTP/1.1 100 Continue\r\n":utf8>>
-    101 -> <<"HTTP/1.1 101 Switching Protocols\r\n":utf8>>
-    102 -> <<"HTTP/1.1 102 Processing\r\n":utf8>>
-    103 -> <<"HTTP/1.1 103 Early Hints\r\n":utf8>>
-    200 -> <<"HTTP/1.1 200 OK\r\n":utf8>>
-    201 -> <<"HTTP/1.1 201 Created\r\n":utf8>>
-    202 -> <<"HTTP/1.1 202 Accepted\r\n":utf8>>
-    203 -> <<"HTTP/1.1 203 Non-Authoritative Information\r\n":utf8>>
-    204 -> <<"HTTP/1.1 204 No Content\r\n":utf8>>
-    205 -> <<"HTTP/1.1 205 Reset Content\r\n":utf8>>
-    206 -> <<"HTTP/1.1 206 Partial Content\r\n":utf8>>
-    207 -> <<"HTTP/1.1 207 Multi-Status\r\n":utf8>>
-    208 -> <<"HTTP/1.1 208 Already Reported\r\n":utf8>>
-    226 -> <<"HTTP/1.1 226 IM Used\r\n":utf8>>
-    300 -> <<"HTTP/1.1 300 Multiple Choices\r\n":utf8>>
-    301 -> <<"HTTP/1.1 301 Moved Permanently\r\n":utf8>>
-    302 -> <<"HTTP/1.1 302 Found\r\n":utf8>>
-    303 -> <<"HTTP/1.1 303 See Other\r\n":utf8>>
-    304 -> <<"HTTP/1.1 304 Not Modified\r\n":utf8>>
-    305 -> <<"HTTP/1.1 305 Use Proxy\r\n":utf8>>
-    307 -> <<"HTTP/1.1 307 Temporary Redirect\r\n":utf8>>
-    308 -> <<"HTTP/1.1 308 Permanent Redirect\r\n":utf8>>
-    400 -> <<"HTTP/1.1 400 Bad Request\r\n":utf8>>
-    401 -> <<"HTTP/1.1 401 Unauthorized\r\n":utf8>>
-    402 -> <<"HTTP/1.1 402 Payment Required\r\n":utf8>>
-    403 -> <<"HTTP/1.1 403 Forbidden\r\n":utf8>>
-    404 -> <<"HTTP/1.1 404 Not Found\r\n":utf8>>
-    405 -> <<"HTTP/1.1 405 Method Not Allowed\r\n":utf8>>
-    406 -> <<"HTTP/1.1 406 Not Acceptable\r\n":utf8>>
-    407 -> <<"HTTP/1.1 407 Proxy Authentication Required\r\n":utf8>>
-    408 -> <<"HTTP/1.1 408 Request Timeout\r\n":utf8>>
-    409 -> <<"HTTP/1.1 409 Conflict\r\n":utf8>>
-    410 -> <<"HTTP/1.1 410 Gone\r\n":utf8>>
-    411 -> <<"HTTP/1.1 411 Length Required\r\n":utf8>>
-    412 -> <<"HTTP/1.1 412 Precondition Failed\r\n":utf8>>
-    413 -> <<"HTTP/1.1 413 Content Too Large\r\n":utf8>>
-    414 -> <<"HTTP/1.1 414 URI Too Long\r\n":utf8>>
-    415 -> <<"HTTP/1.1 415 Unsupported Media Type\r\n":utf8>>
-    416 -> <<"HTTP/1.1 416 Range Not Satisfiable\r\n":utf8>>
-    417 -> <<"HTTP/1.1 417 Expectation Failed\r\n":utf8>>
-    418 -> <<"HTTP/1.1 418 I'm a Teapot\r\n":utf8>>
-    421 -> <<"HTTP/1.1 421 Misdirected Request\r\n":utf8>>
-    422 -> <<"HTTP/1.1 422 Unprocessable Content\r\n":utf8>>
-    423 -> <<"HTTP/1.1 423 Locked\r\n":utf8>>
-    424 -> <<"HTTP/1.1 424 Failed Dependency\r\n":utf8>>
-    425 -> <<"HTTP/1.1 425 Too Early\r\n":utf8>>
-    426 -> <<"HTTP/1.1 426 Upgrade Required\r\n":utf8>>
-    428 -> <<"HTTP/1.1 428 Precondition Required\r\n":utf8>>
-    429 -> <<"HTTP/1.1 429 Too Many Requests\r\n":utf8>>
-    431 -> <<"HTTP/1.1 431 Request Header Fields Too Large\r\n":utf8>>
-    451 -> <<"HTTP/1.1 451 Unavailable For Legal Reasons\r\n":utf8>>
-    500 -> <<"HTTP/1.1 500 Internal Server Error\r\n":utf8>>
-    501 -> <<"HTTP/1.1 501 Not Implemented\r\n":utf8>>
-    502 -> <<"HTTP/1.1 502 Bad Gateway\r\n":utf8>>
-    503 -> <<"HTTP/1.1 503 Service Unavailable\r\n":utf8>>
-    504 -> <<"HTTP/1.1 504 Gateway Timeout\r\n":utf8>>
-    505 -> <<"HTTP/1.1 505 HTTP Version Not Supported\r\n":utf8>>
-    506 -> <<"HTTP/1.1 506 Variant Also Negotiates\r\n":utf8>>
-    507 -> <<"HTTP/1.1 507 Insufficient Storage\r\n":utf8>>
-    508 -> <<"HTTP/1.1 508 Loop Detected\r\n":utf8>>
-    510 -> <<"HTTP/1.1 510 Not Extended\r\n":utf8>>
-    511 -> <<"HTTP/1.1 511 Network Authentication Required\r\n":utf8>>
-    _other -> <<"HTTP/1.1 ":utf8, int.to_string(status):utf8, " \r\n":utf8>>
+    100 -> <<"HTTP/1.1 100 Continue\r\n">>
+    101 -> <<"HTTP/1.1 101 Switching Protocols\r\n">>
+    102 -> <<"HTTP/1.1 102 Processing\r\n">>
+    103 -> <<"HTTP/1.1 103 Early Hints\r\n">>
+    200 -> <<"HTTP/1.1 200 OK\r\n">>
+    201 -> <<"HTTP/1.1 201 Created\r\n">>
+    202 -> <<"HTTP/1.1 202 Accepted\r\n">>
+    203 -> <<"HTTP/1.1 203 Non-Authoritative Information\r\n">>
+    204 -> <<"HTTP/1.1 204 No Content\r\n">>
+    205 -> <<"HTTP/1.1 205 Reset Content\r\n">>
+    206 -> <<"HTTP/1.1 206 Partial Content\r\n">>
+    207 -> <<"HTTP/1.1 207 Multi-Status\r\n">>
+    208 -> <<"HTTP/1.1 208 Already Reported\r\n">>
+    226 -> <<"HTTP/1.1 226 IM Used\r\n">>
+    300 -> <<"HTTP/1.1 300 Multiple Choices\r\n">>
+    301 -> <<"HTTP/1.1 301 Moved Permanently\r\n">>
+    302 -> <<"HTTP/1.1 302 Found\r\n">>
+    303 -> <<"HTTP/1.1 303 See Other\r\n">>
+    304 -> <<"HTTP/1.1 304 Not Modified\r\n">>
+    305 -> <<"HTTP/1.1 305 Use Proxy\r\n">>
+    307 -> <<"HTTP/1.1 307 Temporary Redirect\r\n">>
+    308 -> <<"HTTP/1.1 308 Permanent Redirect\r\n">>
+    400 -> <<"HTTP/1.1 400 Bad Request\r\n">>
+    401 -> <<"HTTP/1.1 401 Unauthorized\r\n">>
+    402 -> <<"HTTP/1.1 402 Payment Required\r\n">>
+    403 -> <<"HTTP/1.1 403 Forbidden\r\n">>
+    404 -> <<"HTTP/1.1 404 Not Found\r\n">>
+    405 -> <<"HTTP/1.1 405 Method Not Allowed\r\n">>
+    406 -> <<"HTTP/1.1 406 Not Acceptable\r\n">>
+    407 -> <<"HTTP/1.1 407 Proxy Authentication Required\r\n">>
+    408 -> <<"HTTP/1.1 408 Request Timeout\r\n">>
+    409 -> <<"HTTP/1.1 409 Conflict\r\n">>
+    410 -> <<"HTTP/1.1 410 Gone\r\n">>
+    411 -> <<"HTTP/1.1 411 Length Required\r\n">>
+    412 -> <<"HTTP/1.1 412 Precondition Failed\r\n">>
+    413 -> <<"HTTP/1.1 413 Content Too Large\r\n">>
+    414 -> <<"HTTP/1.1 414 URI Too Long\r\n">>
+    415 -> <<"HTTP/1.1 415 Unsupported Media Type\r\n">>
+    416 -> <<"HTTP/1.1 416 Range Not Satisfiable\r\n">>
+    417 -> <<"HTTP/1.1 417 Expectation Failed\r\n">>
+    418 -> <<"HTTP/1.1 418 I'm a Teapot\r\n">>
+    421 -> <<"HTTP/1.1 421 Misdirected Request\r\n">>
+    422 -> <<"HTTP/1.1 422 Unprocessable Content\r\n">>
+    423 -> <<"HTTP/1.1 423 Locked\r\n">>
+    424 -> <<"HTTP/1.1 424 Failed Dependency\r\n">>
+    425 -> <<"HTTP/1.1 425 Too Early\r\n">>
+    426 -> <<"HTTP/1.1 426 Upgrade Required\r\n">>
+    428 -> <<"HTTP/1.1 428 Precondition Required\r\n">>
+    429 -> <<"HTTP/1.1 429 Too Many Requests\r\n">>
+    431 -> <<"HTTP/1.1 431 Request Header Fields Too Large\r\n">>
+    451 -> <<"HTTP/1.1 451 Unavailable For Legal Reasons\r\n">>
+    500 -> <<"HTTP/1.1 500 Internal Server Error\r\n">>
+    501 -> <<"HTTP/1.1 501 Not Implemented\r\n">>
+    502 -> <<"HTTP/1.1 502 Bad Gateway\r\n">>
+    503 -> <<"HTTP/1.1 503 Service Unavailable\r\n">>
+    504 -> <<"HTTP/1.1 504 Gateway Timeout\r\n">>
+    505 -> <<"HTTP/1.1 505 HTTP Version Not Supported\r\n">>
+    506 -> <<"HTTP/1.1 506 Variant Also Negotiates\r\n">>
+    507 -> <<"HTTP/1.1 507 Insufficient Storage\r\n">>
+    508 -> <<"HTTP/1.1 508 Loop Detected\r\n">>
+    510 -> <<"HTTP/1.1 510 Not Extended\r\n">>
+    511 -> <<"HTTP/1.1 511 Network Authentication Required\r\n">>
+    _other -> <<"HTTP/1.1 ", int.to_string(status):utf8, " \r\n">>
   }
 }
 
 pub fn error_response(status: Int) -> bytes_tree.BytesTree {
   EncodeState(bytes_tree.new(), http1.CloseAfterResponse)
   |> build_head(status, http1.CloseAfterResponse, <<
-    "content-length: 0\r\n":utf8,
+    "content-length: 0\r\n",
   >>)
 }
 

@@ -91,7 +91,7 @@ fn frame(chunk: BitArray) -> BitArray {
 }
 
 pub fn chunk_is_framed_with_its_size_test() {
-  assert frame(<<"hello world!":utf8>>) == <<"C\r\nhello world!\r\n":utf8>>
+  assert frame(<<"hello world!">>) == <<"C\r\nhello world!\r\n">>
 }
 
 pub fn empty_chunk_is_not_framed_test() {

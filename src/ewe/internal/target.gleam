@@ -6,7 +6,7 @@ pub fn split_host_port(
   value: BitArray,
 ) -> Result(#(BitArray, option.Option(Int)), Nil) {
   case value {
-    <<"[":utf8, _remaining:bits>> -> split_bracketed_host(value)
+    <<"[", _remaining:bits>> -> split_bracketed_host(value)
     _value ->
       case find_colon(value) {
         Error(Nil) -> Ok(#(value, None))
@@ -14,7 +14,7 @@ pub fn split_host_port(
           let size = bit_array.byte_size(value)
           let assert <<
             host:bytes-size(position),
-            ":":utf8,
+            ":",
             port:bytes-size(size - position - 1),
           >> = value
 
@@ -50,7 +50,7 @@ fn split_bracketed_host(
 
       case remaining {
         <<>> -> Ok(#(host, None))
-        <<":":utf8, port:bits>> ->
+        <<":", port:bits>> ->
           case parse_port(port) {
             Ok(port) -> Ok(#(host, Some(port)))
             Error(Nil) -> Error(Nil)

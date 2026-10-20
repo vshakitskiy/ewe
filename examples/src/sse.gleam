@@ -87,9 +87,7 @@ fn handle_request(
           }
         },
         // Clean up when the client disconnects.
-        on_close: fn(client) {
-          pubsub.unsubscribe(pubsub, topic:, client:)
-        },
+        on_close: fn(client) { pubsub.unsubscribe(pubsub, topic:, client:) },
       )
 
     // Accept messages via POST and broadcast them to all SSE clients.

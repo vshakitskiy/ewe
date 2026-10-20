@@ -56,7 +56,7 @@ pub fn on_init(
     let #(transport, socket) = tup.socket(connection)
 
     let state = case transport, socket.negotiated_protocol(transport, socket) {
-      socket.Ssl, Ok(<<"h2":utf8>>) -> detecting(OnlyHttp2)
+      socket.Ssl, Ok(<<"h2">>) -> detecting(OnlyHttp2)
       socket.Ssl, _protocol ->
         Http1(http1.State(
           handler:,
@@ -192,16 +192,16 @@ pub type Sniff {
   NotHttp2
 }
 
-const preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8>>
+const preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>
 
 pub fn sniff_preface(buffer: BitArray) -> Sniff {
   case buffer {
-    <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8, remaining:bits>> ->
+    <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", remaining:bits>> ->
       Http2Preface(remaining:)
     _buffer ->
       case bit_array.starts_with(preface, buffer), buffer {
         True, _buffer -> NeedMoreData
-        False, <<"PRI * HTTP/2.0\r\n":utf8, _rest:bits>> -> InvalidHttp2Preface
+        False, <<"PRI * HTTP/2.0\r\n", _rest:bits>> -> InvalidHttp2Preface
         False, _buffer -> NotHttp2
       }
   }

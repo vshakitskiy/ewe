@@ -28,12 +28,12 @@ pub fn partial_header_is_incomplete_test() {
 }
 
 pub fn partial_payload_is_incomplete_test() {
-  assert decode(<<5:24, 0x0:8, 0:8, 0:1, 1:31, "hi":utf8>>) == NeedMoreData
+  assert decode(<<5:24, 0x0:8, 0:8, 0:1, 1:31, "hi">>) == NeedMoreData
 }
 
 pub fn bytes_after_a_frame_are_left_test() {
-  assert decode(<<raw(0x0, 0x0, 3, <<"hello":utf8>>):bits, "extra":utf8>>)
-    == Decoded(frame.Data(3, False, <<"hello":utf8>>, 5), <<"extra":utf8>>)
+  assert decode(<<raw(0x0, 0x0, 3, <<"hello">>):bits, "extra">>)
+    == Decoded(frame.Data(3, False, <<"hello">>, 5), <<"extra">>)
 }
 
 pub fn reserved_bit_is_ignored_test() {
@@ -52,12 +52,12 @@ pub fn frame_over_max_frame_size_is_frame_size_error_test() {
 }
 
 pub fn padded_data_counts_padding_in_size_test() {
-  assert decode(raw(0x0, 0x8, 1, <<2, "hi":utf8, 0, 0>>))
-    == Decoded(frame.Data(1, False, <<"hi":utf8>>, 5), <<>>)
+  assert decode(raw(0x0, 0x8, 1, <<2, "hi", 0, 0>>))
+    == Decoded(frame.Data(1, False, <<"hi">>, 5), <<>>)
 }
 
 pub fn padding_as_long_as_the_payload_is_protocol_error_test() {
-  assert decode(raw(0x0, 0x8, 1, <<5, "hi":utf8, 0, 0>>))
+  assert decode(raw(0x0, 0x8, 1, <<5, "hi", 0, 0>>))
     == ConnectionError(frame.ProtocolError)
 }
 
@@ -76,8 +76,8 @@ pub fn headers_too_short_for_priority_is_frame_size_error_test() {
 }
 
 pub fn priority_of_wrong_length_is_a_stream_error_test() {
-  assert decode(<<raw(0x2, 0x0, 3, <<0:32>>):bits, "rest":utf8>>)
-    == frame.StreamError(3, frame.FrameSizeError, <<"rest":utf8>>)
+  assert decode(<<raw(0x2, 0x0, 3, <<0:32>>):bits, "rest">>)
+    == frame.StreamError(3, frame.FrameSizeError, <<"rest">>)
 }
 
 pub fn settings_ack_with_payload_is_frame_size_error_test() {
@@ -103,7 +103,7 @@ fn round_trip(sent: frame.Frame) -> Nil {
 }
 
 pub fn encoded_frames_decode_to_themselves_test() {
-  round_trip(frame.Data(1, True, <<"hi":utf8>>, 2))
+  round_trip(frame.Data(1, True, <<"hi">>, 2))
   round_trip(frame.Headers(1, False, True, None, <<0x82>>))
   round_trip(frame.Headers(3, True, False, Some(1), <<0x82>>))
   round_trip(frame.Priority(3, 1))
@@ -121,15 +121,15 @@ pub fn encoded_frames_decode_to_themselves_test() {
   )
   round_trip(frame.Settings(ack: True, settings: []))
   round_trip(frame.PushPromise(1, 2, <<0x82>>))
-  round_trip(frame.Ping(ack: False, data: <<"12345678":utf8>>))
-  round_trip(frame.Goaway(5, frame.EnhanceYourCalm, <<"calm":utf8>>))
+  round_trip(frame.Ping(ack: False, data: <<"12345678">>))
+  round_trip(frame.Goaway(5, frame.EnhanceYourCalm, <<"calm">>))
   round_trip(frame.WindowUpdate(0, 1))
   round_trip(frame.Continuation(1, True, <<0x82>>))
 }
 
 pub fn data_header_declares_a_payload_sent_separately_test() {
-  assert <<frame.data_header(1, True, 2):bits, "hi":utf8>>
-    == frame.encode(frame.Data(1, True, <<"hi":utf8>>, 2))
+  assert <<frame.data_header(1, True, 2):bits, "hi">>
+    == frame.encode(frame.Data(1, True, <<"hi">>, 2))
 }
 
 pub fn stream_frames_on_stream_zero_are_protocol_errors_test() {

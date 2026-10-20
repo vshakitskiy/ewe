@@ -14,31 +14,31 @@ fn take(
 pub fn small_pieces_are_joined_into_one_frame_test() {
   let box =
     outbox.new()
-    |> outbox.push(outbox.bytes(<<"ab":utf8>>))
-    |> outbox.push(outbox.bytes(<<"cd":utf8>>))
-    |> outbox.push(outbox.bytes(<<"ef":utf8>>))
+    |> outbox.push(outbox.bytes(<<"ab">>))
+    |> outbox.push(outbox.bytes(<<"cd">>))
+    |> outbox.push(outbox.bytes(<<"ef">>))
 
   let #(bytes, size, last, rest) = take(box, 5)
-  assert bytes == <<"abcde":utf8>>
+  assert bytes == <<"abcde">>
   assert size == 5
   assert !last
   assert outbox.size(rest) == 1
 
   let #(bytes, _size, _last, rest) = take(rest, 5)
-  assert bytes == <<"f":utf8>>
+  assert bytes == <<"f">>
   assert outbox.size(rest) == 0
 }
 
 pub fn the_last_piece_of_a_finished_body_ends_it_test() {
   let box =
     outbox.new()
-    |> outbox.push(outbox.bytes(<<"abcdef":utf8>>))
+    |> outbox.push(outbox.bytes(<<"abcdef">>))
     |> outbox.finish
 
   let #(_bytes, _size, last, rest) = take(box, 4)
   assert !last
   let #(bytes, _size, last, _rest) = take(rest, 4)
-  assert bytes == <<"ef":utf8>>
+  assert bytes == <<"ef">>
   assert last
 }
 

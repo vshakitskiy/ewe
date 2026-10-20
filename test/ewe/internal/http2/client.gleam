@@ -61,7 +61,7 @@ pub fn connect(port: Int) -> Client {
       decoder: alpacki.new_dynamic(4096),
       encoder: alpacki.new_dynamic(4096),
     )
-  send_bits(client, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n":utf8>>)
+  send_bits(client, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>)
 }
 
 pub fn handshake(port: Int, settings: List(frame.Setting)) -> Client {

@@ -20,7 +20,7 @@ pub fn response_fields_test() {
         #("x-ok", "v"),
       ],
       http2.Length(5),
-      <<"now":utf8>>,
+      <<"now">>,
     )
 
   assert list.map(fields, fn(field) {
@@ -40,35 +40,35 @@ pub fn response_fields_test() {
 pub fn unknown_length_keeps_the_handlers_test() {
   let assert Ok(fields) =
     http2.response_fields(200, [#("content-length", "10")], http2.Unknown, <<
-      "now":utf8,
+      "now",
     >>)
   assert list.any(fields, fn(field) {
-    field.name == <<"content-length":utf8>> && field.value == <<"10":utf8>>
+    field.name == <<"content-length">> && field.value == <<"10">>
   })
 }
 
 pub fn omitted_length_drops_the_handlers_test() {
   let assert Ok(fields) =
     http2.response_fields(204, [#("content-length", "10")], http2.Omitted, <<
-      "now":utf8,
+      "now",
     >>)
-  assert !list.any(fields, fn(field) { field.name == <<"content-length":utf8>> })
+  assert !list.any(fields, fn(field) { field.name == <<"content-length">> })
 }
 
 pub fn set_cookie_is_never_indexed_test() {
   let assert Ok(fields) =
     http2.response_fields(200, [#("set-cookie", "secret")], http2.Length(1), <<
-      "now":utf8,
+      "now",
     >>)
 
   let assert Ok(field) =
-    list.find(fields, fn(field) { field.name == <<"set-cookie":utf8>> })
+    list.find(fields, fn(field) { field.name == <<"set-cookie">> })
   assert field.indexing == alpacki.NeverIndexed
 }
 
 pub fn unsafe_header_is_refused_test() {
   let refused = fn(name, value) {
-    http2.response_fields(200, [#(name, value)], http2.Length(0), <<"now":utf8>>)
+    http2.response_fields(200, [#(name, value)], http2.Length(0), <<"now">>)
     == Error(http2.UnsafeHeader(name))
   }
   assert refused("x-a", "a\r\nb")
