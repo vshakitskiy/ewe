@@ -20,13 +20,23 @@ fn encode(
 ) -> #(String, encoder.Remainder) {
   let response = response.Response(status:, headers:, body:)
   let assert Ok(encoded) =
-    encoder.encode_response(response, http.Get, parser.Http11, http1.KeepAlive)
+    encoder.encode_response(
+      response,
+      http.Get,
+      parser.Http11,
+      http1.KeepAlive,
+      current_date_line(),
+    )
 
   let assert Ok(text) =
     bytes_tree.to_bit_array(encoded.head)
     |> bit_array.to_string
 
   #(text, encoded.remainder)
+}
+
+fn current_date_line() -> BitArray {
+  encoder.date_line(encoder.no_date_line).1
 }
 
 fn occurrences(haystack: String, needle: String) -> Int {
@@ -55,6 +65,21 @@ pub fn date_is_the_current_time_test() {
   assert age >= 0 && age <= 2
 }
 
+pub fn date_line_is_kept_within_its_second_test() {
+  let fresh = encoder.date_line(encoder.no_date_line)
+  let cached = #(fresh.0, <<"date: cached\r\n">>)
+  let kept = encoder.date_line(cached)
+
+  assert kept == cached || kept.0 != fresh.0
+    as "the line is rebuilt only when gnomon's clock moves to another second"
+}
+
+pub fn date_line_from_another_second_is_rebuilt_test() {
+  let stale = #(0, <<"date: stale\r\n">>)
+
+  assert encoder.date_line(stale).1 != stale.1
+}
+
 pub fn no_content_carries_no_framing_or_body_test() {
   let #(out, remainder) = encode(204, [], connection.Text("hi"))
 
@@ -72,7 +97,12 @@ pub fn not_modified_carries_no_body_test() {
 
 fn encode_status(status: Int) -> Result(encoder.Encoded, encoder.EncodeError) {
   response.Response(status:, headers: [], body: connection.Empty)
-  |> encoder.encode_response(http.Get, parser.Http11, http1.KeepAlive)
+  |> encoder.encode_response(
+    http.Get,
+    parser.Http11,
+    http1.KeepAlive,
+    current_date_line(),
+  )
 }
 
 pub fn informational_status_refused_test() {

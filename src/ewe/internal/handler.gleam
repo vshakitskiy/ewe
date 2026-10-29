@@ -1,6 +1,7 @@
 import ewe/internal/connection
 import ewe/internal/http1
 import ewe/internal/http1/connection as http1_connection
+import ewe/internal/http1/encoder
 import ewe/internal/http2
 import ewe/internal/http2/connection as http2_connection
 import gleam/bit_array
@@ -64,6 +65,7 @@ pub fn on_init(
           buffer: <<>>,
           idle_timer:,
           options: http1_options,
+          date_line: encoder.no_date_line,
         ))
       socket.Tcp, _protocol -> detecting(Http1OrHttp2)
     }
@@ -126,6 +128,7 @@ fn detect(
         buffer:,
         idle_timer: detection.idle_timer,
         options: detection.http1_options,
+        date_line: encoder.no_date_line,
       )
       |> http1.handle_message(connection)
       |> from_http1

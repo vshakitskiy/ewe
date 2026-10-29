@@ -33,6 +33,11 @@ type EncodeState {
   EncodeState(tree: bytes_tree.BytesTree, keep_alive: http1.KeepAlive)
 }
 
+pub type DateLine =
+  #(Int, BitArray)
+
+pub const no_date_line: DateLine = #(-1, <<>>)
+
 pub type Remainder {
   NoRemainder
   RemainderInline(bytes_tree.BytesTree)
@@ -64,12 +69,15 @@ pub fn encode_response(
   method: http.Method,
   version: parser.Version,
   keep_alive: http1.KeepAlive,
+  date_line: BitArray,
 ) -> Result(Encoded, EncodeError) {
   use Nil <- result.try(validate_status(response.status, response.body))
   use state <- result.try(encode_headers(
     response.headers,
     reserved(response.body),
   ))
+  let state =
+    EncodeState(..state, tree: bytes_tree.append(state.tree, date_line))
   let keep_alive = http1.and_keep_alive(keep_alive, state.keep_alive)
   let status = response.status
 
@@ -119,8 +127,7 @@ fn switching_protocols(
   handler: fn(connection.WebsocketConnection) -> connection.Outcome,
 ) -> Encoded {
   let head =
-    append_date(state.tree)
-    |> bytes_tree.append(<<"\r\n">>)
+    bytes_tree.append(state.tree, <<"\r\n">>)
     |> bytes_tree.prepend(status_line(status))
 
   Encoded(
@@ -264,8 +271,7 @@ fn build_head(
   keep_alive: http1.KeepAlive,
   framing: BitArray,
 ) -> bytes_tree.BytesTree {
-  append_date(state.tree)
-  |> append_connection(keep_alive)
+  append_connection(state.tree, keep_alive)
   |> bytes_tree.append(framing)
   |> bytes_tree.append(<<"\r\n">>)
   |> bytes_tree.prepend(status_line(status))
@@ -430,10 +436,6 @@ fn append_header(
   }
 }
 
-fn append_date(tree: bytes_tree.BytesTree) -> bytes_tree.BytesTree {
-  bytes_tree.append(tree, <<"date: ", date():bits, "\r\n">>)
-}
-
 fn append_connection(
   tree: bytes_tree.BytesTree,
   keep_alive: http1.KeepAlive,
@@ -515,7 +517,9 @@ fn status_line(status: Int) -> BitArray {
 }
 
 pub fn error_response(status: Int) -> bytes_tree.BytesTree {
-  EncodeState(bytes_tree.new(), http1.CloseAfterResponse)
+  let #(_stamp, line) = date_line(no_date_line)
+
+  EncodeState(bytes_tree.from_bit_array(line), http1.CloseAfterResponse)
   |> build_head(status, http1.CloseAfterResponse, <<
     "content-length: 0\r\n",
   >>)
@@ -525,5 +529,5 @@ pub fn internal_server_error() -> bytes_tree.BytesTree {
   error_response(500)
 }
 
-@external(erlang, "gnomon", "date")
-fn date() -> BitArray
+@external(erlang, "ewe_ffi", "date_line")
+pub fn date_line(cached: DateLine) -> DateLine

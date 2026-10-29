@@ -27,6 +27,7 @@ pub type State {
     buffer: BitArray,
     idle_timer: option.Option(process.Timer),
     options: http1.Options,
+    date_line: encoder.DateLine,
   )
 }
 
@@ -102,6 +103,7 @@ fn handle_request(
         "Caught a crash in the request handler: " <> details,
       )
 
+      let date_line = encoder.date_line(state.date_line)
       let _sent =
         respond(
           connection,
@@ -109,6 +111,7 @@ fn handle_request(
           head,
           http1.CloseAfterResponse,
           self,
+          date_line.1,
         )
       Close
     }
@@ -118,9 +121,11 @@ fn handle_request(
         resolve_body(body_connection, drained.body, state.options)
       let keep_alive =
         http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
+      let date_line = encoder.date_line(state.date_line)
 
-      case respond(connection, response, head, keep_alive, self) {
-        Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
+      case respond(connection, response, head, keep_alive, self, date_line.1) {
+        Ok(SentKeepAlive) ->
+          await_next_request(State(..state, date_line:), buffer, connection)
         Ok(SentClose) | Error(_reason) -> Close
         Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
       }
@@ -134,9 +139,16 @@ fn respond(
   head: parser.Head,
   keep_alive: http1.KeepAlive,
   self: process.Subject(http1.Signal),
+  date_line: BitArray,
 ) -> Result(Sent, socket.SocketError) {
   case
-    encoder.encode_response(response, head.method, head.version, keep_alive)
+    encoder.encode_response(
+      response,
+      head.method,
+      head.version,
+      keep_alive,
+      date_line,
+    )
   {
     Ok(encoded) -> {
       let #(transport, socket) = tup.socket(connection)
