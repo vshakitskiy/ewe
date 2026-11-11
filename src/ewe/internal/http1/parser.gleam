@@ -629,12 +629,19 @@ fn resolve_upgrade(state: HeaderState) -> option.Option(http1.Upgrade) {
 /// positions are absolute byte offsets into that buffer, so completed fields
 /// can be sliced directly from it.
 ///
-/// ```txt
-///   host: example.com\r\nx-mode: fast\r\n\r\n
-///                        ^     ^ position = 25
-///                        line_start = 19
+/// For example, at the colon in the second header, the input is split as shown
+/// below. Spans count actual buffer bytes, with an exclusive end.
 ///
-///   remaining = : fast\r\n\r\n
+/// ```txt
+///   buffer = "host: example.com\r\nx-mode: fast\r\n\r\n"
+///
+///   Byte span   Content                Scanner position
+///   [0, 19)     host: example.com\r\n
+///   [19, 25)    x-mode                 line_start = 19
+///   [25, 35)    : fast\r\n\r\n         position = 25
+///
+///   remaining = buffer from position onwards = ": fast\r\n\r\n"
+///   name = buffer slice starting at 19, length 25 - 19 = "x-mode"
 /// ```
 ///
 /// This separates byte matching from field extraction as the BEAM can advance
