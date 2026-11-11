@@ -1,4 +1,5 @@
 import ewe/internal/connection
+import ewe/internal/field
 import ewe/internal/file
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/encoder
@@ -591,11 +592,11 @@ fn pull_chunked_chunk(
               options.body_read_timeout,
             )
             parser.parse_headers(
-              buffer,
-              [],
-              0,
-              parser.initial_header_state(),
-              options,
+              buffer:,
+              headers: [],
+              count: 0,
+              state: parser.initial_header_state(),
+              options:,
             )
           })
 
@@ -675,10 +676,10 @@ fn parse_chunk_line(
   options: http1.Options,
 ) -> parser.Step(#(Int, BitArray)) {
   use #(line, remaining) <- parser.try_step(parser.extract_line(
-    buffer,
-    options.max_chunk_size_line,
-    parser.ChunkSizeLineTooLong,
-    parser.BadChunkSize,
+    buffer:,
+    max_len: options.max_chunk_size_line,
+    too_long: parser.ChunkSizeLineTooLong,
+    malformed: parser.BadChunkSize,
   ))
   use size <- parser.try_step(parse_chunk_size(line))
   parser.StepDone(#(size, remaining))
@@ -701,7 +702,7 @@ fn parse_hex_digits(bits: BitArray, acc: Int, any: Bool) -> Result(Int, Nil) {
       parse_hex_digits(remaining, acc * 16 + { byte - 55 }, True)
     <<>> if any -> Ok(acc)
     _extension if any ->
-      case parser.trim_whitespace(bits) {
+      case field.trim_whitespace(bits) {
         <<";", _extension:bits>> -> Ok(acc)
         _bits -> Error(Nil)
       }

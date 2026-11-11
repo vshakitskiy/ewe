@@ -1,10 +1,30 @@
+import ewe/internal/field
 import ewe/internal/http1/connection as http1
 import ewe/internal/target
 import gleam/bit_array
 import gleam/http
+import gleam/int
 import gleam/list
 import gleam/option
 import gleam/result
+
+// The version suffix occupies nine bytes after the request target: a space
+// followed by HTTP/1.x. The target occupies at least one byte before it.
+//
+// ```txt
+//   /hello HTTP/1.1\r\n
+//        |--------|
+//          9 bytes
+// ```
+const http_version_suffix_size = 9
+
+const question_mark = 63
+
+const slash = 47
+
+const digit_zero = 48
+
+const digit_nine = 57
 
 pub type Version {
   Http10
@@ -113,44 +133,175 @@ pub type Parsed {
   Incomplete
 }
 
+type HeadContext {
+  HeadContext(
+    method: http.Method,
+    version: Version,
+    headers: List(#(String, String)),
+    state: HeaderState,
+    remaining: BitArray,
+  )
+}
+
 pub fn parse(
   buffer: BitArray,
   options: http1.Options,
 ) -> Result(Parsed, ParseError) {
-  let step = {
-    use #(method, target, version, remaining) <- try_step(parse_request_line(
-      buffer,
-      options,
-    ))
-
-    use #(headers, state, remaining) <- try_step(parse_headers(
-      remaining,
-      [],
-      0,
-      initial_header_state(),
-      options,
-    ))
-
-    use #(host, port, path, query) <- try_step(resolve_target(
-      method,
-      target,
-      version,
-      state.host,
-    ))
-
-    use metadata <- try_step(resolve_metadata(state, version))
-
-    StepDone(Complete(
-      Head(method:, host:, port:, path:, query:, version:, headers:),
-      metadata,
-      remaining,
-    ))
-  }
-
-  case step {
-    StepDone(parsed) -> Ok(parsed)
+  case parse_request_line(buffer, options) {
     More -> Ok(Incomplete)
     ParseError(error) -> Error(error)
+    StepDone(#(method, target, version, remaining)) -> {
+      let parsed_headers =
+        parse_headers(
+          buffer: remaining,
+          headers: [],
+          count: 0,
+          state: initial_header_state(),
+          options:,
+        )
+
+      case parsed_headers {
+        More -> Ok(Incomplete)
+        ParseError(error) -> Error(error)
+        StepDone(#(headers, state, remaining)) -> {
+          let context =
+            HeadContext(method:, version:, headers:, state:, remaining:)
+
+          finish_target(target, context)
+        }
+      }
+    }
+  }
+}
+
+fn finish_target(
+  target: BitArray,
+  context: HeadContext,
+) -> Result(Parsed, ParseError) {
+  case context.method, target {
+    http.Connect, _target ->
+      case target.split_host_port(target) {
+        Ok(#(host, option.Some(_port) as port)) ->
+          case bit_array.to_string(host) {
+            Ok(host) ->
+              finish_head(host:, port:, path: "", query: option.None, context:)
+            Error(Nil) -> Error(BadTarget)
+          }
+        Ok(#(_host, option.None)) | Error(Nil) -> Error(BadTarget)
+      }
+    _method, <<"/", _path:bits>> -> finish_origin(target, option.None, context)
+    _method, _target ->
+      case split_absolute_form(target) {
+        StepDone(#(authority, origin)) ->
+          finish_origin(origin, authority, context)
+        More -> Ok(Incomplete)
+        ParseError(error) -> Error(error)
+      }
+  }
+}
+
+fn finish_origin(
+  origin: BitArray,
+  authority: option.Option(#(String, option.Option(Int))),
+  context: HeadContext,
+) -> Result(Parsed, ParseError) {
+  case find_byte(origin, question_mark, 0) {
+    Error(Nil) ->
+      finish_path(path: origin, query: option.None, authority:, context:)
+    Ok(position) -> {
+      let path = binary_part(origin, 0, position)
+      let query_start = position + 1
+      let query_size = bit_array.byte_size(origin) - query_start
+      let query = binary_part(origin, query_start, query_size)
+
+      case bit_array.is_utf8(query) {
+        True ->
+          finish_path(
+            path:,
+            query: option.Some(unsafe_to_string(query)),
+            authority:,
+            context:,
+          )
+        False -> Error(BadTarget)
+      }
+    }
+  }
+}
+
+fn finish_path(
+  path path: BitArray,
+  query query: option.Option(String),
+  authority authority: option.Option(#(String, option.Option(Int))),
+  context context: HeadContext,
+) -> Result(Parsed, ParseError) {
+  case bit_array.is_utf8(path) {
+    False -> Error(BadTarget)
+    True -> {
+      let path = unsafe_to_string(path)
+
+      case target.is_valid_path(context.method, path) {
+        False -> Error(BadTarget)
+        True ->
+          case context.state.host, context.version {
+            option.None, Http11 -> Error(MissingHost)
+            option.None, Http10 ->
+              finish_authority(
+                authority:,
+                header_host: #("", option.None),
+                path:,
+                query:,
+                context:,
+              )
+            option.Some(host), _version ->
+              finish_authority(
+                authority:,
+                header_host: host,
+                path:,
+                query:,
+                context:,
+              )
+          }
+      }
+    }
+  }
+}
+
+fn finish_authority(
+  authority authority: option.Option(#(String, option.Option(Int))),
+  header_host header_host: #(String, option.Option(Int)),
+  path path: String,
+  query query: option.Option(String),
+  context context: HeadContext,
+) -> Result(Parsed, ParseError) {
+  let #(host, port) = option.unwrap(authority, header_host)
+
+  finish_head(host:, port:, path:, query:, context:)
+}
+
+fn finish_head(
+  host host: String,
+  port port: option.Option(Int),
+  path path: String,
+  query query: option.Option(String),
+  context context: HeadContext,
+) -> Result(Parsed, ParseError) {
+  case resolve_metadata(context.state, context.version) {
+    More -> Ok(Incomplete)
+    ParseError(error) -> Error(error)
+    StepDone(metadata) -> {
+      let head =
+        Head(
+          method: context.method,
+          host:,
+          port:,
+          path:,
+          query:,
+          version: context.version,
+          headers: context.headers,
+        )
+
+      Ok(Complete(head, metadata, context.remaining))
+    }
   }
 }
 
@@ -172,18 +323,121 @@ fn parse_request_line(
   buffer: BitArray,
   options: http1.Options,
 ) -> Step(#(http.Method, BitArray, Version, BitArray)) {
-  use #(line, remaining) <- try_step(extract_line(
-    skip_empty_line(buffer),
-    options.max_request_line,
-    RequestLineTooLong,
-    BadRequestLine,
-  ))
+  let buffer = skip_empty_line(buffer)
+  let buffer_size = bit_array.byte_size(buffer)
+  let limit =
+    int.min(buffer_size, options.max_request_line + field.line_ending_size)
 
-  use #(method, target_and_version) <- try_step(parse_method(line))
+  case find_line_feed(buffer, 0, limit) {
+    Error(Nil) if buffer_size > options.max_request_line ->
+      ParseError(RequestLineTooLong)
+    Error(Nil) -> More
+    Ok(0) -> ParseError(BadRequestLine)
+    Ok(line_feed_position) ->
+      case byte_at(buffer, line_feed_position - 1) {
+        byte if byte == field.carriage_return ->
+          parse_request_method(buffer, line_feed_position - 1)
+        _byte -> ParseError(BadRequestLine)
+      }
+  }
+}
 
-  use #(target, version) <- try_step(parse_target_version(target_and_version))
+fn parse_request_method(
+  buffer: BitArray,
+  line_size: Int,
+) -> Step(#(http.Method, BitArray, Version, BitArray)) {
+  case buffer {
+    <<"GET ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Get,
+        line_size - bit_array.byte_size(<<"GET ">>),
+      )
+    <<"POST ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Post,
+        line_size - bit_array.byte_size(<<"POST ">>),
+      )
+    <<"PUT ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Put,
+        line_size - bit_array.byte_size(<<"PUT ">>),
+      )
+    <<"DELETE ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Delete,
+        line_size - bit_array.byte_size(<<"DELETE ">>),
+      )
+    <<"HEAD ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Head,
+        line_size - bit_array.byte_size(<<"HEAD ">>),
+      )
+    <<"OPTIONS ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Options,
+        line_size - bit_array.byte_size(<<"OPTIONS ">>),
+      )
+    <<"PATCH ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Patch,
+        line_size - bit_array.byte_size(<<"PATCH ">>),
+      )
+    <<"TRACE ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Trace,
+        line_size - bit_array.byte_size(<<"TRACE ">>),
+      )
+    <<"CONNECT ", rest:bits>> ->
+      parse_request_version(
+        rest,
+        http.Connect,
+        line_size - bit_array.byte_size(<<"CONNECT ">>),
+      )
+    _method -> parse_other_request_method(buffer, line_size)
+  }
+}
 
-  StepDone(#(method, target, version, remaining))
+fn parse_request_version(
+  bits: BitArray,
+  method: http.Method,
+  size: Int,
+) -> Step(#(http.Method, BitArray, Version, BitArray)) {
+  case size <= http_version_suffix_size {
+    True -> ParseError(BadRequestLine)
+    False -> {
+      let target_size = size - http_version_suffix_size
+
+      case bits {
+        <<target:bytes-size(target_size), " HTTP/1.1\r\n", remaining:bits>> ->
+          StepDone(#(method, target, Http11, remaining))
+        <<target:bytes-size(target_size), " HTTP/1.0\r\n", remaining:bits>> ->
+          StepDone(#(method, target, Http10, remaining))
+        <<
+          _target:bytes-size(target_size),
+          " HTTP/",
+          major,
+          ".",
+          minor,
+          "\r\n",
+          _rest:bits,
+        >>
+          if major >= digit_zero
+          && major <= digit_nine
+          && minor >= digit_zero
+          && minor <= digit_nine
+        -> ParseError(UnsupportedVersion)
+        _bits -> ParseError(BadVersion)
+      }
+    }
+  }
 }
 
 fn skip_empty_line(buffer: BitArray) -> BitArray {
@@ -193,125 +447,41 @@ fn skip_empty_line(buffer: BitArray) -> BitArray {
   }
 }
 
-fn parse_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
-  case line {
-    <<"GET ", remaining:bits>> -> StepDone(#(http.Get, remaining))
-    <<"POST ", remaining:bits>> -> StepDone(#(http.Post, remaining))
-    <<"PUT ", remaining:bits>> -> StepDone(#(http.Put, remaining))
-    <<"DELETE ", remaining:bits>> -> StepDone(#(http.Delete, remaining))
-    <<"HEAD ", remaining:bits>> -> StepDone(#(http.Head, remaining))
-    <<"OPTIONS ", remaining:bits>> -> StepDone(#(http.Options, remaining))
-    <<"PATCH ", remaining:bits>> -> StepDone(#(http.Patch, remaining))
-    <<"TRACE ", remaining:bits>> -> StepDone(#(http.Trace, remaining))
-    <<"CONNECT ", remaining:bits>> -> StepDone(#(http.Connect, remaining))
-    _other -> parse_other_method(line)
-  }
-}
+fn parse_other_request_method(
+  buffer: BitArray,
+  line_size: Int,
+) -> Step(#(http.Method, BitArray, Version, BitArray)) {
+  let line = binary_part(buffer, 0, line_size)
 
-fn parse_other_method(line: BitArray) -> Step(#(http.Method, BitArray)) {
-  case find_space(line) {
-    Error(Nil) -> ParseError(BadRequestLine)
-    Ok(position) ->
-      case line {
-        <<name:bytes-size(position), " ", remaining:bits>> ->
-          case bit_array_to_string(name) {
+  case find_byte(line, field.space, 0) {
+    Ok(position) if position < line_size -> {
+      let name = binary_part(buffer, 0, position)
+
+      case bit_array.to_string(name) {
+        Error(Nil) -> ParseError(BadMethod)
+        Ok(name) ->
+          case http.parse_method(name) {
             Error(Nil) -> ParseError(BadMethod)
-            Ok(name) ->
-              case http.parse_method(name) {
-                Ok(method) -> StepDone(#(method, remaining))
-                Error(Nil) -> ParseError(BadMethod)
-              }
+            Ok(method) -> {
+              let remaining_start = position + 1
+              let remaining_size = bit_array.byte_size(buffer) - remaining_start
+              let remaining =
+                binary_part(buffer, remaining_start, remaining_size)
+              let target_and_version_size = line_size - remaining_start
+
+              parse_request_version(remaining, method, target_and_version_size)
+            }
           }
-        _line -> ParseError(BadRequestLine)
-      }
-  }
-}
-
-fn parse_target_version(bits: BitArray) -> Step(#(BitArray, Version)) {
-  let size = bit_array.byte_size(bits)
-
-  case size < 10 {
-    True -> ParseError(BadRequestLine)
-    False -> {
-      let target_size = size - 9
-      case bits {
-        <<target:bytes-size(target_size), " HTTP/1.1">> ->
-          StepDone(#(target, Http11))
-        <<target:bytes-size(target_size), " HTTP/1.0">> ->
-          StepDone(#(target, Http10))
-        <<_target:bytes-size(target_size), " HTTP/", major, ".", minor>>
-          if major >= 48 && major <= 57 && minor >= 48 && minor <= 57
-        -> ParseError(UnsupportedVersion)
-        _bits -> ParseError(BadVersion)
       }
     }
-  }
-}
-
-fn split_target(target: BitArray) -> Step(#(String, option.Option(String))) {
-  case find_question(target) {
-    Error(Nil) -> {
-      use path <- try_step(decode_component(target, BadTarget))
-      StepDone(#(path, option.None))
-    }
-    Ok(position) -> {
-      let size = bit_array.byte_size(target)
-
-      case target {
-        <<
-          path:bytes-size(position),
-          "?",
-          query:bytes-size(size - position - 1),
-        >> -> {
-          use path <- try_step(decode_component(path, BadTarget))
-          use query <- try_step(decode_component(query, BadTarget))
-          StepDone(#(path, option.Some(query)))
-        }
-        _target -> ParseError(BadTarget)
-      }
-    }
+    Ok(_position) | Error(Nil) -> ParseError(BadRequestLine)
   }
 }
 
 fn decode_component(bits: BitArray, on_error: ParseError) -> Step(String) {
-  case bit_array_to_string(bits) {
+  case bit_array.to_string(bits) {
     Ok(value) -> StepDone(value)
     Error(Nil) -> ParseError(on_error)
-  }
-}
-
-fn validate_path(method: http.Method, path: String) -> Step(String) {
-  case target.is_valid_path(method, path) {
-    True -> StepDone(path)
-    False -> ParseError(BadTarget)
-  }
-}
-
-fn resolve_target(
-  method: http.Method,
-  target: BitArray,
-  version: Version,
-  header_host: option.Option(#(String, option.Option(Int))),
-) -> Step(#(String, option.Option(Int), String, option.Option(String))) {
-  case method {
-    http.Connect ->
-      case target.split_host_port(target) {
-        Ok(#(host, option.Some(_port) as port)) ->
-          case bit_array_to_string(host) {
-            Ok(host) -> StepDone(#(host, port, "", option.None))
-            Error(Nil) -> ParseError(BadTarget)
-          }
-        Ok(#(_host, option.None)) -> ParseError(BadTarget)
-        Error(Nil) -> ParseError(BadTarget)
-      }
-    _method -> {
-      use #(authority, origin) <- try_step(split_absolute_form(target))
-      use #(path, query) <- try_step(split_target(origin))
-      use path <- try_step(validate_path(method, path))
-      use header_host <- try_step(resolve_host(version, header_host))
-      let #(host, port) = option.unwrap(authority, header_host)
-      StepDone(#(host, port, path, query))
-    }
   }
 }
 
@@ -322,7 +492,7 @@ fn split_absolute_form(
     <<"/", _path:bits>> -> StepDone(#(option.None, target))
     <<scheme:bytes-size(4), "://", remaining:bits>>
     | <<scheme:bytes-size(5), "://", remaining:bits>> ->
-      case lowercase_ascii(scheme) {
+      case field.lowercase_ascii(scheme) {
         <<"http">> | <<"https">> -> split_authority(remaining)
         _scheme -> ParseError(BadTarget)
       }
@@ -353,17 +523,6 @@ fn origin_form(origin: BitArray) -> BitArray {
   case origin {
     <<"/", _path:bits>> -> origin
     _query -> <<"/", origin:bits>>
-  }
-}
-
-fn resolve_host(
-  version: Version,
-  header_host: option.Option(#(String, option.Option(Int))),
-) -> Step(#(String, option.Option(Int))) {
-  case header_host, version {
-    option.Some(host_port), _version -> StepDone(host_port)
-    option.None, Http10 -> StepDone(#("", option.None))
-    option.None, Http11 -> ParseError(MissingHost)
   }
 }
 
@@ -463,45 +622,342 @@ fn resolve_upgrade(state: HeaderState) -> option.Option(http1.Upgrade) {
   }
 }
 
+/// Parses header lines, returning their fields, metadata state, and unconsumed
+/// input. Returns `More` if a complete head has not arrived yet.
+///
+/// The scanner keeps `buffer` fixed and advances a separate matching tail. All
+/// positions are absolute byte offsets into that buffer, so completed fields
+/// can be sliced directly from it.
+///
+/// ```txt
+///   host: example.com\r\nx-mode: fast\r\n\r\n
+///                        ^     ^ position = 25
+///                        line_start = 19
+///
+///   remaining = : fast\r\n\r\n
+/// ```
+///
+/// This separates byte matching from field extraction as the BEAM can advance
+/// the tail's match context while field slices use the original buffer.
+///
 pub fn parse_headers(
-  buffer: BitArray,
-  acc: List(#(String, String)),
-  count: Int,
-  state: HeaderState,
-  options: http1.Options,
+  buffer buffer: BitArray,
+  headers headers: List(#(String, String)),
+  count count: Int,
+  state state: HeaderState,
+  options options: http1.Options,
 ) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
-  case
-    extract_line(buffer, options.max_header_line, HeaderLineTooLong, BadHeader)
-  {
-    StepDone(#(<<>>, rest)) -> StepDone(#(list.reverse(acc), state, rest))
-    StepDone(_line) if count >= options.max_headers -> ParseError(TooManyHeaders)
-    StepDone(#(line, rest)) ->
-      case split_field(line) {
-        Ok(#(name, value)) ->
-          case is_field_value(value) {
-            True -> {
-              let name = unsafe_to_string(lowercase_ascii(name))
-              case classify(name, value, state) {
-                StepDone(state) -> {
-                  let header = #(name, unsafe_to_string(value))
-                  parse_headers(
-                    rest,
-                    [header, ..acc],
-                    count + 1,
-                    state,
-                    options,
+  scan_name(
+    remaining: buffer,
+    buffer:,
+    line_start: 0,
+    position: 0,
+    is_lowercase: True,
+    is_invalid: False,
+    headers:,
+    count:,
+    state:,
+    options:,
+  )
+}
+
+/// Scans a field name up to its colon, tracking its case and validity.
+///
+/// Each step advances `remaining` and its absolute `position` in the source
+/// buffer. `line_start` stays at the beginning of the name. `is_lowercase` is
+/// true until an uppercase ASCII byte is seen; `is_invalid` stays true after
+/// the first space, control, or non-ASCII byte.
+///
+fn scan_name(
+  remaining remaining: BitArray,
+  buffer buffer: BitArray,
+  line_start line_start: Int,
+  position position: Int,
+  is_lowercase is_lowercase: Bool,
+  is_invalid is_invalid: Bool,
+  headers headers: List(#(String, String)),
+  count count: Int,
+  state state: HeaderState,
+  options options: http1.Options,
+) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
+  case remaining {
+    <<"\r\n", rest:bits>> if position - line_start <= options.max_header_line -> {
+      case position == line_start {
+        True -> StepDone(#(list.reverse(headers), state, rest))
+        False if count >= options.max_headers -> ParseError(TooManyHeaders)
+        False -> ParseError(BadHeader)
+      }
+    }
+    <<"\n", _rest:bits>>
+      if position - line_start < options.max_header_line + field.line_ending_size
+    -> ParseError(BadHeader)
+    <<":", rest:bits>>
+      if position - line_start < options.max_header_line + field.line_ending_size
+    ->
+      scan_value(
+        remaining: rest,
+        buffer:,
+        line_start:,
+        position: position + 1,
+        colon: position,
+        is_lowercase:,
+        has_unicode: False,
+        is_invalid: is_invalid || position == line_start,
+        headers:,
+        count:,
+        state:,
+        options:,
+      )
+    <<byte, rest:bits>>
+      if position - line_start < options.max_header_line + field.line_ending_size
+    ->
+      scan_name(
+        remaining: rest,
+        buffer:,
+        line_start:,
+        position: position + 1,
+        is_lowercase: is_lowercase
+          && { byte < field.uppercase_a || byte > field.uppercase_z },
+        is_invalid: is_invalid || byte <= field.space || byte >= field.delete,
+        headers:,
+        count:,
+        state:,
+        options:,
+      )
+    _remaining ->
+      case bit_array.byte_size(buffer) - line_start > options.max_header_line {
+        True -> ParseError(HeaderLineTooLong)
+        False -> More
+      }
+  }
+}
+
+/// Advances over ASCII values in blocks of 28 bytes when possible.
+///
+/// Each successful block check advances `position` by 28. A block containing
+/// bytes outside 14..127 goes to the byte scanner, which handles the rest of
+/// the line, including its ending and any UTF-8 validation. Short tails take
+/// the same byte-scanning path.
+///
+fn scan_value(
+  remaining remaining: BitArray,
+  buffer buffer: BitArray,
+  line_start line_start: Int,
+  position position: Int,
+  colon colon: Int,
+  is_lowercase is_lowercase: Bool,
+  has_unicode has_unicode: Bool,
+  is_invalid is_invalid: Bool,
+  headers headers: List(#(String, String)),
+  count count: Int,
+  state state: HeaderState,
+  options options: http1.Options,
+) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
+  let word_bits = field.ascii_word_bits
+
+  case remaining {
+    <<
+      first:size(word_bits),
+      second:size(word_bits),
+      third:size(word_bits),
+      fourth:size(word_bits),
+      rest:bits,
+    >>
+      if position - line_start + field.ascii_chunk_size
+      <= options.max_header_line + field.line_ending_size
+    -> {
+      // Keep the range check local to avoid a cross-module call for each block.
+      // See `field.is_ascii_chunk` for the arithmetic behind the check.
+      let first_pair =
+        int.bitwise_or(
+          int.bitwise_or(
+            first - field.first_chunk_byte * field.byte_low_bits,
+            first,
+          ),
+          int.bitwise_or(
+            second - field.first_chunk_byte * field.byte_low_bits,
+            second,
+          ),
+        )
+      let second_pair =
+        int.bitwise_or(
+          int.bitwise_or(
+            third - field.first_chunk_byte * field.byte_low_bits,
+            third,
+          ),
+          int.bitwise_or(
+            fourth - field.first_chunk_byte * field.byte_low_bits,
+            fourth,
+          ),
+        )
+
+      let can_skip_byte_scan =
+        int.bitwise_and(
+          int.bitwise_or(first_pair, second_pair),
+          field.byte_high_bits,
+        )
+        == 0
+
+      case can_skip_byte_scan {
+        True ->
+          scan_value(
+            remaining: rest,
+            buffer:,
+            line_start:,
+            position: position + field.ascii_chunk_size,
+            colon:,
+            is_lowercase:,
+            has_unicode:,
+            is_invalid:,
+            headers:,
+            count:,
+            state:,
+            options:,
+          )
+        False ->
+          scan_value_bytes(
+            remaining:,
+            buffer:,
+            line_start:,
+            position:,
+            colon:,
+            is_lowercase:,
+            has_unicode:,
+            is_invalid:,
+            headers:,
+            count:,
+            state:,
+            options:,
+          )
+      }
+    }
+    _remaining ->
+      scan_value_bytes(
+        remaining:,
+        buffer:,
+        line_start:,
+        position:,
+        colon:,
+        is_lowercase:,
+        has_unicode:,
+        is_invalid:,
+        headers:,
+        count:,
+        state:,
+        options:,
+      )
+  }
+}
+
+fn scan_value_bytes(
+  remaining remaining: BitArray,
+  buffer buffer: BitArray,
+  line_start line_start: Int,
+  position position: Int,
+  colon colon: Int,
+  is_lowercase is_lowercase: Bool,
+  has_unicode has_unicode: Bool,
+  is_invalid is_invalid: Bool,
+  headers headers: List(#(String, String)),
+  count count: Int,
+  state state: HeaderState,
+  options options: http1.Options,
+) -> Step(#(List(#(String, String)), HeaderState, BitArray)) {
+  case remaining {
+    <<"\r\n", rest:bits>> if position - line_start <= options.max_header_line -> {
+      case count >= options.max_headers {
+        True -> ParseError(TooManyHeaders)
+        False if is_invalid -> ParseError(BadHeader)
+        False -> {
+          let from = field.skip_leading_whitespace(buffer, colon + 1, position)
+          let to = field.skip_trailing_whitespace(buffer, from, position)
+          let value = binary_part(buffer, from, to - from)
+
+          case has_unicode && !bit_array.is_utf8(value) {
+            True -> ParseError(BadHeader)
+            False -> {
+              let name = binary_part(buffer, line_start, colon - line_start)
+              let name = case is_lowercase {
+                True -> unsafe_to_string(name)
+                False -> unsafe_to_string(field.lowercase_ascii(name))
+              }
+              let headers = [#(name, unsafe_to_string(value)), ..headers]
+              let next_line_start = position + field.line_ending_size
+
+              case name {
+                "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+                | "expect"
+                | "host" ->
+                  case classify(name, value, state) {
+                    StepDone(state) ->
+                      scan_name(
+                        remaining: rest,
+                        buffer:,
+                        line_start: next_line_start,
+                        position: next_line_start,
+                        is_lowercase: True,
+                        is_invalid: False,
+                        headers:,
+                        count: count + 1,
+                        state:,
+                        options:,
+                      )
+                    More -> More
+                    ParseError(error) -> ParseError(error)
+                  }
+                _name ->
+                  scan_name(
+                    remaining: rest,
+                    buffer:,
+                    line_start: next_line_start,
+                    position: next_line_start,
+                    is_lowercase: True,
+                    is_invalid: False,
+                    headers:,
+                    count: count + 1,
+                    state:,
+                    options:,
                   )
-                }
-                More -> More
-                ParseError(error) -> ParseError(error)
               }
             }
-            False -> ParseError(BadHeader)
           }
-        Error(Nil) -> ParseError(BadHeader)
+        }
       }
-    More -> More
-    ParseError(error) -> ParseError(error)
+    }
+    <<"\n", _rest:bits>>
+      if position - line_start < options.max_header_line + field.line_ending_size
+    -> ParseError(BadHeader)
+    <<byte, rest:bits>>
+      if position - line_start < options.max_header_line + field.line_ending_size
+    -> {
+      scan_value_bytes(
+        remaining: rest,
+        buffer:,
+        line_start:,
+        position: position + 1,
+        colon:,
+        is_lowercase:,
+        has_unicode: has_unicode || byte >= field.non_ascii_start,
+        is_invalid: is_invalid
+          || byte == field.null_byte
+          || byte == field.carriage_return,
+        headers:,
+        count:,
+        state:,
+        options:,
+      )
+    }
+    _remaining ->
+      case bit_array.byte_size(buffer) - line_start > options.max_header_line {
+        True -> ParseError(HeaderLineTooLong)
+        False -> More
+      }
   }
 }
 
@@ -524,21 +980,18 @@ fn classify(
           }
       }
     "transfer-encoding" -> {
-      let transfer_encoding = case
-        state.transfer_encoding,
-        value |> lowercase_ascii |> tokens
-      {
+      let codings = value |> field.lowercase_ascii |> tokens
+      let transfer_encoding = case state.transfer_encoding, codings {
         NoTransferEncoding, [<<"chunked">>] -> ChunkedFinal
         _transfer_encoding, _codings -> UnsupportedFinal
       }
       StepDone(HeaderState(..state, transfer_encoding:))
     }
     "connection" -> {
-      let requested = value |> lowercase_ascii |> tokens
-      let connection = case
-        list.contains(requested, <<"close">>),
-        list.contains(requested, <<"keep-alive">>)
-      {
+      let requested = value |> field.lowercase_ascii |> tokens
+      let requests_close = list.contains(requested, <<"close">>)
+      let requests_keep_alive = list.contains(requested, <<"keep-alive">>)
+      let connection = case requests_close, requests_keep_alive {
         True, _keep_alive -> RequestedClose
         False, True -> RequestedKeepAlive
         False, False -> state.connection
@@ -548,7 +1001,7 @@ fn classify(
       StepDone(HeaderState(..state, connection:, connection_upgrade:))
     }
     "upgrade" -> {
-      let lowered = value |> lowercase_ascii |> unsafe_to_string
+      let lowered = value |> field.lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, upgrade: option.Some(lowered)))
     }
     "sec-websocket-key" ->
@@ -566,11 +1019,11 @@ fn classify(
         ),
       )
     "sec-websocket-extensions" -> {
-      let lowered = value |> lowercase_ascii |> unsafe_to_string
+      let lowered = value |> field.lowercase_ascii |> unsafe_to_string
       StepDone(HeaderState(..state, websocket_extensions: option.Some(lowered)))
     }
     "expect" -> {
-      let expect_continue = lowercase_ascii(value) == <<"100-continue">>
+      let expect_continue = field.lowercase_ascii(value) == <<"100-continue">>
       StepDone(HeaderState(..state, expect_continue:))
     }
     "host" ->
@@ -597,10 +1050,10 @@ type Line {
 }
 
 pub fn extract_line(
-  buffer: BitArray,
-  max_len: Int,
-  too_long: ParseError,
-  malformed: ParseError,
+  buffer buffer: BitArray,
+  max_len max_len: Int,
+  too_long too_long: ParseError,
+  malformed malformed: ParseError,
 ) -> Step(#(BitArray, BitArray)) {
   case split_line(buffer, max_len) {
     Line(content:, rest:) -> StepDone(#(content, rest))
@@ -611,45 +1064,106 @@ pub fn extract_line(
 }
 
 pub fn tokens(value: BitArray) -> List(BitArray) {
-  split_comma(value) |> list.map(trim_whitespace)
+  split_comma(value) |> list.map(field.trim_whitespace)
 }
 
 pub fn has_token(value: BitArray, token: BitArray) -> Bool {
   value == token || list.contains(tokens(value), token)
 }
 
-@external(erlang, "ewe_ffi", "find_space")
-fn find_space(bits: BitArray) -> Result(Int, Nil)
+fn find_byte(bits: BitArray, needle: Int, position: Int) -> Result(Int, Nil) {
+  case bits {
+    <<byte, _rest:bits>> if byte == needle -> Ok(position)
+    <<_byte, rest:bits>> -> find_byte(rest, needle, position + 1)
+    _bits -> Error(Nil)
+  }
+}
 
-@external(erlang, "ewe_ffi", "find_question")
-fn find_question(bits: BitArray) -> Result(Int, Nil)
+fn find_authority_end(bits: BitArray) -> Result(Int, Nil) {
+  find_authority_byte(bits, 0)
+}
 
-@external(erlang, "ewe_ffi", "find_authority_end")
-fn find_authority_end(bits: BitArray) -> Result(Int, Nil)
+fn find_authority_byte(bits: BitArray, position: Int) -> Result(Int, Nil) {
+  case bits {
+    <<byte, _rest:bits>> if byte == slash || byte == question_mark ->
+      Ok(position)
+    <<_byte, rest:bits>> -> find_authority_byte(rest, position + 1)
+    _bits -> Error(Nil)
+  }
+}
 
-@external(erlang, "ewe_ffi", "split_line")
-fn split_line(buffer: BitArray, max_len: Int) -> Line
+fn split_line(buffer: BitArray, max_len: Int) -> Line {
+  let size = bit_array.byte_size(buffer)
+  let limit = int.min(size, max_len + field.line_ending_size)
 
-@external(erlang, "ewe_ffi", "split_field")
-fn split_field(line: BitArray) -> Result(#(BitArray, BitArray), Nil)
+  case find_line_feed(buffer, 0, limit) {
+    Error(Nil) if size > max_len -> LineTooLong
+    Error(Nil) -> NeedMore
+    Ok(0) -> BadFraming
+    Ok(line_feed_position) ->
+      case byte_at(buffer, line_feed_position - 1) {
+        byte if byte == field.carriage_return -> {
+          let content_size = line_feed_position - 1
+          let rest_start = line_feed_position + 1
+          let rest_size = size - rest_start
+          let content = binary_part(buffer, 0, content_size)
+          let rest = binary_part(buffer, rest_start, rest_size)
 
-@external(erlang, "ewe_ffi", "is_field_value")
-fn is_field_value(value: BitArray) -> Bool
+          Line(content:, rest:)
+        }
+        _byte -> BadFraming
+      }
+  }
+}
 
-@external(erlang, "ewe_ffi", "trim_whitespace")
-pub fn trim_whitespace(bits: BitArray) -> BitArray
+fn find_line_feed(
+  bits: BitArray,
+  position: Int,
+  limit: Int,
+) -> Result(Int, Nil) {
+  case bits {
+    <<"\n", _rest:bits>> if position < limit -> Ok(position)
+    <<_byte, rest:bits>> if position < limit ->
+      find_line_feed(rest, position + 1, limit)
+    _bits -> Error(Nil)
+  }
+}
 
-@external(erlang, "ewe_ffi", "find_unsafe_header_byte")
-pub fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
+fn split_comma(bits: BitArray) -> List(BitArray) {
+  do_split_comma(original: bits, remaining: bits, position: 0, pieces: [])
+}
 
-@external(erlang, "ewe_ffi", "split_comma")
-fn split_comma(bits: BitArray) -> List(BitArray)
+fn do_split_comma(
+  original original: BitArray,
+  remaining remaining: BitArray,
+  position position: Int,
+  pieces pieces: List(BitArray),
+) -> List(BitArray) {
+  case remaining {
+    <<",", rest:bits>> -> {
+      let piece = binary_part(original, 0, position)
 
-@external(erlang, "ewe_ffi", "lowercase_ascii")
-pub fn lowercase_ascii(bits: BitArray) -> BitArray
-
-@external(erlang, "ewe_ffi", "bit_array_to_string")
-fn bit_array_to_string(bits: BitArray) -> Result(String, Nil)
+      do_split_comma(original: rest, remaining: rest, position: 0, pieces: [
+        piece,
+        ..pieces
+      ])
+    }
+    <<_byte, rest:bits>> ->
+      do_split_comma(
+        original:,
+        remaining: rest,
+        position: position + 1,
+        pieces:,
+      )
+    _remaining -> list.reverse([original, ..pieces])
+  }
+}
 
 @external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_string(bits: BitArray) -> String
+
+@external(erlang, "binary", "at")
+fn byte_at(bits: BitArray, position: Int) -> Int
+
+@external(erlang, "binary", "part")
+fn binary_part(bits: BitArray, position: Int, size: Int) -> BitArray

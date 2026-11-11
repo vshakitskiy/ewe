@@ -1,3 +1,4 @@
+import ewe/internal/field
 import ewe/internal/target
 import gleam/http
 import gleam/http/request.{Request}
@@ -127,7 +128,7 @@ fn target_request(
     _scheme -> Error(UnsupportedScheme)
   })
   use path <- result.try(required(section.path))
-  let #(path, query) = case split_query(unsafe_to_string(path)) {
+  let #(path, query) = case target.split_query(unsafe_to_string(path)) {
     Ok(#(path, query)) -> #(path, Some(query))
     Error(Nil) -> #(unsafe_to_string(path), None)
   }
@@ -269,7 +270,7 @@ fn once(
     Some(_current), _value -> Error(DuplicatePseudoHeader)
     None, <<>> -> Error(MissingPseudoHeader)
     None, _value ->
-      case !validate || is_field_value(value) {
+      case !validate || field.is_value(value) {
         True -> set(Some(value))
         False -> Error(InvalidFieldValue)
       }
@@ -333,7 +334,7 @@ fn validate_field(
   name: BitArray,
   value: BitArray,
 ) -> Result(#(String, String), Malformed) {
-  case is_field_name(name), is_field_value(value) {
+  case field.is_name(name), field.is_value(value) {
     True, True -> Ok(#(unsafe_to_string(name), unsafe_to_string(value)))
     False, _value -> Error(InvalidFieldName)
     True, False -> Error(InvalidFieldValue)
@@ -358,14 +359,5 @@ fn parse_method(value: BitArray) -> Result(http.Method, Malformed) {
   }
 }
 
-@external(erlang, "ewe_ffi", "split_query")
-fn split_query(path: String) -> Result(#(String, String), Nil)
-
 @external(erlang, "ewe_ffi", "identity")
 fn unsafe_to_string(bytes: BitArray) -> String
-
-@external(erlang, "ewe_ffi", "is_field_name")
-fn is_field_name(name: BitArray) -> Bool
-
-@external(erlang, "ewe_ffi", "is_field_value")
-fn is_field_value(value: BitArray) -> Bool

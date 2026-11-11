@@ -1,4 +1,5 @@
 import ewe/internal/connection
+import ewe/internal/field
 import ewe/internal/file
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
@@ -395,9 +396,9 @@ fn encode_headers(
     "content-length", _reserved | "transfer-encoding", _reserved -> Ok(state)
     "content-type", FramingAndSse | "cache-control", FramingAndSse -> Ok(state)
     "connection", _reserved ->
-      case parser.find_unsafe_header_byte(value) {
+      case field.find_unsafe_byte(value) {
         Error(Nil) -> {
-          let lowered = value |> bit_array.from_string |> parser.lowercase_ascii
+          let lowered = value |> bit_array.from_string |> field.lowercase_ascii
           let keep_alive = case parser.has_token(lowered, <<"close">>) {
             True -> http1.CloseAfterResponse
             False -> state.keep_alive
@@ -415,10 +416,7 @@ fn append_header(
   name: String,
   value: String,
 ) -> Result(EncodeState, EncodeError) {
-  case
-    parser.find_unsafe_header_byte(name),
-    parser.find_unsafe_header_byte(value)
-  {
+  case field.find_unsafe_byte(name), field.find_unsafe_byte(value) {
     Error(Nil), Error(Nil) -> {
       let tree =
         bytes_tree.append_string(state.tree, name)

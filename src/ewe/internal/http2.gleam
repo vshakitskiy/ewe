@@ -1,5 +1,6 @@
 import alpacki
 import ewe/internal/connection
+import ewe/internal/field
 import ewe/internal/file
 import ewe/internal/http2/connection as http2
 import ewe/internal/http2/frame
@@ -1633,10 +1634,7 @@ pub fn response_fields(
         | "content-length", Omitted
         -> Ok(fields)
         name, _length ->
-          case
-            find_unsafe_header_byte(name),
-            find_unsafe_header_byte(header.1)
-          {
+          case field.find_unsafe_byte(name), field.find_unsafe_byte(header.1) {
             Error(Nil), Error(Nil) ->
               Ok([response_field(name, header.1), ..fields])
             _name, _value -> Error(UnsafeHeader(name))
@@ -1698,9 +1696,6 @@ fn response_field(name: String, value: String) -> alpacki.HeaderField {
 
   alpacki.HeaderField(<<name:utf8>>, <<value:utf8>>, indexing)
 }
-
-@external(erlang, "ewe_ffi", "find_unsafe_header_byte")
-fn find_unsafe_header_byte(value: String) -> Result(Int, Nil)
 
 fn emit_headers(
   state: State,

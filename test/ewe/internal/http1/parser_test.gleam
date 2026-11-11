@@ -1,7 +1,11 @@
 import ewe/internal/http1/connection as http1
 import ewe/internal/http1/parser
+import gleam/bit_array
 import gleam/http
+import gleam/int
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 
 fn parse(buffer: BitArray) -> Result(parser.Parsed, parser.ParseError) {
   parser.parse(buffer, http1.default_options())
@@ -391,4 +395,175 @@ pub fn expect_continue_on_http10_ignored_test() {
 
   assert !metadata.expect_continue
     as "RFC 9110 §10.1.1 requires ignoring the expectation in HTTP/1.0"
+}
+
+pub fn request_methods_share_version_and_target_validation_test() -> Nil {
+  list.each(
+    [
+      #("GET", http.Get, "/"),
+      #("POST", http.Post, "/"),
+      #("PUT", http.Put, "/"),
+      #("DELETE", http.Delete, "/"),
+      #("HEAD", http.Head, "/"),
+      #("OPTIONS", http.Options, "*"),
+      #("PATCH", http.Patch, "/"),
+      #("TRACE", http.Trace, "/"),
+      #("CONNECT", http.Connect, "example.com:443"),
+      #("PROPFIND", http.Other("PROPFIND"), "/"),
+    ],
+    fn(entry) {
+      let #(name, method, target) = entry
+      let line = name <> " " <> target
+      let suffix = "\r\nHost: example.com\r\n\r\n"
+
+      let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+        parse(<<line:utf8, " HTTP/1.1", suffix:utf8>>)
+
+      assert head.method == method
+      assert parse(<<line:utf8, " HTTP/2.0", suffix:utf8>>)
+        == Error(parser.UnsupportedVersion)
+      assert parse(<<line:utf8, " NOPE/1.1", suffix:utf8>>)
+        == Error(parser.BadVersion)
+      assert parse(<<name:utf8, " HTTP/1.1", suffix:utf8>>)
+        == Error(parser.BadRequestLine)
+    },
+  )
+}
+
+pub fn request_line_limit_includes_target_and_version_test() -> Nil {
+  list.each(["GET", "POST", "PROPFIND"], fn(method) {
+    let line = method <> " /hello HTTP/1.1"
+    let buffer = <<line:utf8, "\r\nHost: example.com\r\n\r\n">>
+    let size = bit_array.byte_size(<<line:utf8>>)
+    let options =
+      http1.Options(..http1.default_options(), max_request_line: size)
+
+    let assert Ok(parser.Complete(_head, _metadata, _remaining)) =
+      parser.parse(buffer, options)
+
+    assert parser.parse(
+        buffer,
+        http1.Options(..options, max_request_line: size - 1),
+      )
+      == Error(parser.RequestLineTooLong)
+  })
+}
+
+pub fn header_chunk_boundaries_preserve_fields_and_remainder_test() -> Nil {
+  list.each([0, 1, 26, 27, 28, 29, 55, 56, 57, 83, 84, 85], fn(size) {
+    let value = string.repeat("a", size)
+    let buffer = <<
+      "POST / HTTP/1.1\r\nHost: example.com\r\nX-First:  ",
+      value:utf8,
+      " \t\r\nx-second: last\r\nContent-Length: 4\r\n\r\nBODY",
+    >>
+
+    let assert Ok(parser.Complete(head, metadata, remaining)) = parse(buffer)
+
+    assert head.headers
+      == [
+        #("host", "example.com"),
+        #("x-first", value),
+        #("x-second", "last"),
+        #("content-length", "4"),
+      ]
+    assert metadata.framing == http1.Fixed(4)
+    assert remaining == <<"BODY">>
+  })
+}
+
+pub fn header_controls_are_checked_after_every_ascii_chunk_test() -> Nil {
+  list.each([0, 27, 28, 29, 55, 56, 57, 84], fn(position) {
+    let prefix = string.repeat("a", position)
+
+    list.each([0, 13], fn(byte) {
+      assert parse(<<
+          "GET / HTTP/1.1\r\nHost: a\r\nx-test: ",
+          prefix:utf8,
+          byte,
+          "tail\r\n\r\n",
+        >>)
+        == Error(parser.BadHeader)
+    })
+
+    assert parse(<<
+        "GET / HTTP/1.1\r\nHost: a\r\nx-test: ",
+        prefix:utf8,
+        "\ntail\r\n\r\n",
+      >>)
+      == Error(parser.BadHeader)
+  })
+}
+
+pub fn multibyte_values_cross_ascii_chunk_boundaries_test() -> Nil {
+  list.each([26, 27, 28, 55, 56, 57], fn(position) {
+    let prefix = string.repeat("a", position)
+    let value = prefix <> "é" <> string.repeat("b", 30)
+
+    let assert Ok(parser.Complete(head, _metadata, _remaining)) =
+      parse(<<"GET / HTTP/1.1\r\nHost: a\r\nx-test: ", value:utf8, "\r\n\r\n">>)
+
+    assert head.headers == [#("host", "a"), #("x-test", value)]
+    assert parse(<<
+        "GET / HTTP/1.1\r\nHost: a\r\nx-test: ",
+        prefix:utf8,
+        195,
+        "x\r\n\r\n",
+      >>)
+      == Error(parser.BadHeader)
+  })
+}
+
+pub fn header_limits_take_precedence_at_chunk_boundaries_test() -> Nil {
+  list.each([27, 28, 29, 55, 56, 57], fn(size) {
+    let value = string.repeat("a", size)
+    let line = <<"x-test: ", value:utf8>>
+    let buffer = <<"GET / HTTP/1.0\r\n", line:bits, "\r\n\r\n">>
+    let limit = bit_array.byte_size(line)
+    let options =
+      http1.Options(..http1.default_options(), max_header_line: limit)
+
+    let assert Ok(parser.Complete(_head, _metadata, _remaining)) =
+      parser.parse(buffer, options)
+
+    assert parser.parse(
+        buffer,
+        http1.Options(..options, max_header_line: limit - 1),
+      )
+      == Error(parser.HeaderLineTooLong)
+  })
+}
+
+pub fn invalid_partial_headers_wait_for_framing_test() -> Nil {
+  let prefix = <<"GET / HTTP/1.1\r\nHost: a\r\nbad name: value">>
+
+  assert parse(prefix) == Ok(parser.Incomplete)
+  assert parse(<<prefix:bits, "\r">>) == Ok(parser.Incomplete)
+  assert parse(<<prefix:bits, "\r\n\r\n">>) == Error(parser.BadHeader)
+
+  let options = http1.Options(..http1.default_options(), max_headers: 1)
+
+  assert parser.parse(<<prefix:bits, "\r\n\r\n">>, options)
+    == Error(parser.TooManyHeaders)
+  assert parser.parse(<<prefix:bits, "\n\r\n">>, options)
+    == Error(parser.BadHeader)
+}
+
+pub fn every_valid_head_prefix_is_incomplete_test() -> Nil {
+  let buffer = <<
+    "GET /hello?x=1 HTTP/1.1\r\nHost: example.com\r\nX-Name: ",
+    "a value that crosses the ASCII chunk boundary é",
+    "\r\nConnection: keep-alive\r\n\r\n",
+  >>
+
+  int.range(
+    from: 0,
+    to: bit_array.byte_size(buffer),
+    with: Nil,
+    run: fn(_state, size) {
+      let assert Ok(prefix) = bit_array.slice(buffer, 0, size)
+
+      assert parse(prefix) == Ok(parser.Incomplete)
+    },
+  )
 }

@@ -2,6 +2,12 @@ import gleam/bit_array
 import gleam/http
 import gleam/option.{None, Some}
 
+const colon = 58
+
+const closing_bracket = 93
+
+const question_mark = 63
+
 pub fn split_host_port(
   value: BitArray,
 ) -> Result(#(BitArray, option.Option(Int)), Nil) {
@@ -93,11 +99,43 @@ pub fn is_valid_path(method: http.Method, path: String) -> Bool {
   }
 }
 
-@external(erlang, "ewe_ffi", "find_colon")
-fn find_colon(bits: BitArray) -> Result(Int, Nil)
+fn find_colon(bits: BitArray) -> Result(Int, Nil) {
+  find_byte(bits, colon, 0)
+}
 
-@external(erlang, "ewe_ffi", "has_userinfo")
-fn has_userinfo(authority: BitArray) -> Bool
+fn find_close_bracket(bits: BitArray) -> Result(Int, Nil) {
+  find_byte(bits, closing_bracket, 0)
+}
 
-@external(erlang, "ewe_ffi", "find_close_bracket")
-fn find_close_bracket(bits: BitArray) -> Result(Int, Nil)
+fn find_byte(bits: BitArray, needle: Int, position: Int) -> Result(Int, Nil) {
+  case bits {
+    <<byte, _rest:bits>> if byte == needle -> Ok(position)
+    <<_byte, rest:bits>> -> find_byte(rest, needle, position + 1)
+    _bits -> Error(Nil)
+  }
+}
+
+fn has_userinfo(bits: BitArray) -> Bool {
+  case bits {
+    <<"@", _rest:bits>> -> True
+    <<_byte, rest:bits>> -> has_userinfo(rest)
+    _bits -> False
+  }
+}
+
+pub fn split_query(path: String) -> Result(#(String, String), Nil) {
+  let bits = <<path:utf8>>
+
+  case find_byte(bits, question_mark, 0) {
+    Error(Nil) -> Error(Nil)
+    Ok(position) ->
+      case bits {
+        <<before:bytes-size(position), "?", after:bits>> ->
+          Ok(#(unsafe_to_string(before), unsafe_to_string(after)))
+        _bits -> Error(Nil)
+      }
+  }
+}
+
+@external(erlang, "ewe_ffi", "identity")
+fn unsafe_to_string(bits: BitArray) -> String
