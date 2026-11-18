@@ -3,17 +3,18 @@
 ## Unreleased
 
 - Replace the `date` header clock with `gnomon`.
+- Optimize the timer.
 
 ## v9.0.0 - 30.09.2026
 
 - Add `idle_timeout` to `Http2Options`.
 - Support `CONNECT` over HTTP/2.
 - Accept `Host` in place of `:authority` over HTTP/2.
-- Change HTTP/2 defaults. `max_concurrent_streams` to 100,
-  `initial_window_size` and `recv_window_high_water_mark` to 256 KiB,
-  `recv_window_low_water_mark` to 64 KiB.
-- Apply `send_buffer_limit` to all streamed HTTP/2 bodies. Writes over the 
-  limit now wait and not reset the stream.
+- Change HTTP/2 defaults. `max_concurrent_streams` to 100, `initial_window_size`
+  and `recv_window_high_water_mark` to 256 KiB, `recv_window_low_water_mark` to
+  64 KiB.
+- Apply `send_buffer_limit` to all streamed HTTP/2 bodies. Writes over the limit
+  now wait and not reset the stream.
 - `send_text_frame` and `send_binary_frame` now return errors over HTTP/2.
 - Keep repeated HTTP/2 request headers as separate entries except `cookie`.
 - Batch HTTP/2 frames into fewer socket writes.
@@ -38,8 +39,8 @@
 - Fix streamed HTTP/2 1xx, 204 and 304 responses sending a body.
 - Fix silent truncation when a file shrinks while sent over TLS.
 - Fix writes to a closed HTTP/2 stream hanging the handler.
-- `on_close` of `sse` and `websocket` now receives only the state and runs
-  after the stream has ended.
+- `on_close` of `sse` and `websocket` now receives only the state and runs after
+  the stream has ended.
 - Fix HTTP/2 SSE and WebSockets not ending after a reset or disconnect when the
   handler ignores a failed write.
 - Accept absolute form HTTP/1 request targets.
@@ -81,8 +82,8 @@
 - Fix ssl application not starting up.
 - Bring back `on_crash` which sets the response sent when the handler crashes.
 - Support WebSocket over HTTP/2 through the extended `CONNECT` of RFC 8441.
-- Add `websocket` to `Http2Options`. It is `False` by default. `True` advertises 
-  `SETTINGS_ENABLE_CONNECT_PROTOCOL` so browsers and clients open WebSockets 
+- Add `websocket` to `Http2Options`. It is `False` by default. `True` advertises
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL` so browsers and clients open WebSockets
   over HTTP/2.
 - Add `send_buffer_limit` to `Http2Options`, the bytes a WebSocket stream may
   leave queued for a client that is not reading before the stream is reset.
@@ -90,7 +91,7 @@
 
 ## v6.0.0 - 25.08.2026
 
-- `sse`'s `on_init` function now receives the stream connection and a 
+- `sse`'s `on_init` function now receives the stream connection and a
   `process.Selector` and returns the starting state along with that selector.
 - Replace `SseNext` and `WebsocketNext` with a single `Next` and their eight
   constructors with `continue`, `continue_with_selector`, `stop` and
@@ -118,8 +119,8 @@
   exhaustion.
 - Remove `with_name`.
 - Remove `on_crash`. A crashing handler now always answers 500.
-- Pass the listener to `get_server_info` as a `process.Subject(listener.Message)`
-  instead of a `process.Name`.
+- Pass the listener to `get_server_info` as a
+  `process.Subject(listener.Message)` instead of a `process.Name`.
 - Rename the `interface` label of `bind` to `to`, and the `port` label of
   `listening` to `on`.
 - Drop the argument labels of `ip_address_to_string`, `get_client_info` and
@@ -145,7 +146,7 @@
   their refill marks, frame and header list sizes, the HPACK table size, the
   CONTINUATION and header block caps, the Rapid Reset window and threshold, the
   handshake, drain and body read timeouts, and the file read threshold. A value
-  outside the range a field accepts is replaced with the default and logged as a 
+  outside the range a field accepts is replaced with the default and logged as a
   warning when the server starts.
 
 ### Requests and responses
@@ -208,8 +209,12 @@
 ## v3.0.6 - 30.03.2026
 
 - Sanitize CRLF sequences in outgoing HTTP response headers.
-- Eliminate `string.lowercase` in a codebase: validate and lowercase header field names in a single pass, validate and lowercase important protocol header values (like `transfer-encoding`, `connection`, `upgrade` and more) at parse time.
-- Include validation of trailer header field names and values during chunked body parsing.
+- Eliminate `string.lowercase` in a codebase: validate and lowercase header
+  field names in a single pass, validate and lowercase important protocol header
+  values (like `transfer-encoding`, `connection`, `upgrade` and more) at parse
+  time.
+- Include validation of trailer header field names and values during chunked
+  body parsing.
 - Remove redundant UTF-8 validation on WebSocket `Text` frame payloads.
 
 # v3.0.5 - 15.03.2026
@@ -226,11 +231,14 @@
 # v3.0.3 - 13.03.2026
 
 - Update glisten to next major release.
-- Default `on_start` handler now uses `io.println` in addition to logging, so the startup message is visible even without a logger configured.
+- Default `on_start` handler now uses `io.println` in addition to logging, so
+  the startup message is visible even without a logger configured.
 
 # v3.0.2 - 23.02.2026
 
-- Gracefully handle HTTP/2 connections: h2c upgrade requests are served as HTTP/1.1, and direct HTTP/2 connections receive a GOAWAY with HTTP_1_1_REQUIRED instead of being silently dropped.
+- Gracefully handle HTTP/2 connections: h2c upgrade requests are served as
+  HTTP/1.1, and direct HTTP/2 connections receive a GOAWAY with
+  HTTP_1_1_REQUIRED instead of being silently dropped.
 - Fixed HTTP/2 prior-knowledge detection in ffi
 - Refactored internal buffer module and moved to `http1`
 
@@ -271,22 +279,25 @@
 - Replace `gramps` with `websocks` package
 - Remove alias names for internal stream modules
 - Improve script that change documentation
-- Move `gleam_crypto` package as dev dependency 
+- Move `gleam_crypto` package as dev dependency
 
 # v2.0.2
 
 - Refactor internal handler code
-- Support multiple directives in the `connection` header during upgrade to WebSocket
+- Support multiple directives in the `connection` header during upgrade to
+  WebSocket
 
 # v2.0.1
 
-- Update the websocket implementation to set active mode to `Count` to receive N messages, rather than setting `Once` every message
+- Update the websocket implementation to set active mode to `Count` to receive N
+  messages, rather than setting `Once` every message
 
 # v2.0.0
 
 - Change API of chunked response to match other streaming APIs
 - Handler's process is not waiting until streaming actors are done
-- All new actors that are spawned by streaming APIs are now being supervised with factory supervisor
+- All new actors that are spawned by streaming APIs are now being supervised
+  with factory supervisor
 
 # v1.0.1
 
@@ -297,7 +308,8 @@
 - Improve internal comments
 - Add logging
 - Remove deprecated `result.unwrap_both`
-- Support for automatic `gzip` content encoding for HTTP responses except file sending. 
+- Support for automatic `gzip` content encoding for HTTP responses except file
+  sending.
 
 # v1.0.0-rc2
 
@@ -308,7 +320,8 @@
 
 # v1.0.0-rc1
 
-- Adjust types & functions to follow responsibilities of a web server, completely excluding potential framework-like features.
+- Adjust types & functions to follow responsibilities of a web server,
+  completely excluding potential framework-like features.
 - Improve validation of `upgrade` header when upgrading to WebSocket connection.
 - Remove internal `information` actor for retrieving server information.
 - Improve documentation.
@@ -317,28 +330,36 @@
 # v0.10.0
 
 ### HTTP
+
 - Add `date` header to responses.
 - Add `Request` and `Response` aliases.
-- Add new response body: `File` and `ChunkedData`. They can be set with `ewe.file` and `ewe.chunked`.
+- Add new response body: `File` and `ChunkedData`. They can be set with
+  `ewe.file` and `ewe.chunked`.
 - Fix server still listening on a socket after `connection: close`.
-- Keep-alive connection closes after 10_000 milliseconds of idling. Can be adjusted in builder using `ewe.idle_timeout`.
+- Keep-alive connection closes after 10_000 milliseconds of idling. Can be
+  adjusted in builder using `ewe.idle_timeout`.
 
 ### WebSocket
-- Add WebSocket connection failures for control frames with payloads up to 125 octets.
-- Fix control frames matching to properly extract rest frames from a list of aggregated frames.
+
+- Add WebSocket connection failures for control frames with payloads up to 125
+  octets.
+- Fix control frames matching to properly extract rest frames from a list of
+  aggregated frames.
 - Store incomplete frames in WebSocket state until they are fully received.
 - Ensure unexpected continuation frames correctly cause an abnormal stop.
 - Add handling for control frames interleaved with fragmented data frames.
 - Overall match implementation to pass Autobahn TestSuite.
 
-
 # v0.9.0
 
-- Add `ewe.continue_with_selector` to continue processing WebSocket messages, including selector for custom messages.
+- Add `ewe.continue_with_selector` to continue processing WebSocket messages,
+  including selector for custom messages.
 - Add proper conditions for `connection: close`.
 - Expand request's host header parsing.
-- Send response with proper status code on HTTP parser failure before closing connection.
-- HTTP parser now handles host header duplication, invalid content-length format, and headers with invalid control characters.
+- Send response with proper status code on HTTP parser failure before closing
+  connection.
+- HTTP parser now handles host header duplication, invalid content-length
+  format, and headers with invalid control characters.
 
 # v0.8.1
 
@@ -346,7 +367,8 @@
 
 # v0.8.0
 
-- Add `ewe.stream_body` for streaming the request body (including chunked encoding).
+- Add `ewe.stream_body` for streaming the request body (including chunked
+  encoding).
 - Simplified `Builder` type.
 - Add internal `Buffer` type.
 - Add `ewe.quiet` for setting empty `on_start` function.
@@ -356,43 +378,66 @@
 
 # v0.7.0
 
-- Add support for custom user messages in WebSocket handlers. The `on_init` function now receives a `process.Selector` that can be used to listen for custom messages sent from other parts of the application.
-- Custom messages are delivered to WebSocket handlers as `ewe.User(message)` type.
-- Add permessage-deflate compression support for WebSocket connections. When enabled, messages are automatically compressed using defalte algorithm, reducing bandwidth usage for text-heavy applications.
+- Add support for custom user messages in WebSocket handlers. The `on_init`
+  function now receives a `process.Selector` that can be used to listen for
+  custom messages sent from other parts of the application.
+- Custom messages are delivered to WebSocket handlers as `ewe.User(message)`
+  type.
+- Add permessage-deflate compression support for WebSocket connections. When
+  enabled, messages are automatically compressed using defalte algorithm,
+  reducing bandwidth usage for text-heavy applications.
 
 # v0.6.0
 
 - HTTP parser now handles trailers when working with chunked encoding.
-- Remove `ewe.with_read_body`, leaving `ewe.read_body` as the only option to read the body.
-- Improve documentation page by adding headers for each logical section (see [smol](https://gitlab.com/arkandos/smol/-/blob/main/src/smol.gleam?ref_type=heads)).
-- Improve WebSockets. Users can now specify state with `on_init` function. WebSocket handler accepts connection, user's state and message. `ewe.continue` requires user to specify new state.
-- Add `ewe.send_binary_frame` and `ewe.send_text_frame`, allowing to send messages back to the client.
+- Remove `ewe.with_read_body`, leaving `ewe.read_body` as the only option to
+  read the body.
+- Improve documentation page by adding headers for each logical section (see
+  [smol](https://gitlab.com/arkandos/smol/-/blob/main/src/smol.gleam?ref_type=heads)).
+- Improve WebSockets. Users can now specify state with `on_init` function.
+  WebSocket handler accepts connection, user's state and message. `ewe.continue`
+  requires user to specify new state.
+- Add `ewe.send_binary_frame` and `ewe.send_text_frame`, allowing to send
+  messages back to the client.
 
 # v0.5.0
 
-- Response body must now be of type `ResponseBody`. To set the response body, use the following functions: `ewe.text`, `ewe.bytes`, `ewe.bits`, `ewe.string_tree`, `ewe.empty`, `ewe.json`.
+- Response body must now be of type `ResponseBody`. To set the response body,
+  use the following functions: `ewe.text`, `ewe.bytes`, `ewe.bits`,
+  `ewe.string_tree`, `ewe.empty`, `ewe.json`.
 - HTTP parser now handles `Expect: 100-continue`.
-- Optimize formatting of popular HTTP fields without wasting time on transforming from `BitArray` to `String`.
+- Optimize formatting of popular HTTP fields without wasting time on
+  transforming from `BitArray` to `String`.
 - Duplicate request headers are now being combined (except `set-cookie`).
 
 # v0.4.0
 
-- Implement WebSocket protocol; request can be upgraded in handler using `ewe.upgrade_websocket`.
+- Implement WebSocket protocol; request can be upgraded in handler using
+  `ewe.upgrade_websocket`.
 - Every message received in WebSocket handler is of `WebsocketMessage` type.
-- Handler must return a `Next` type, which can be created using `ewe.continue`, `ewe.stop` and `ewe.stop_abnormal`.
+- Handler must return a `Next` type, which can be created using `ewe.continue`,
+  `ewe.stop` and `ewe.stop_abnormal`.
 - Add `ewe.bits` for setting response body from `BitArray` type.
 - Add experimental `ewe.use_expression`.
-- Rename internal file from `response.gleam` to `encoder.gleam`, matching `decoder.gleam` file.
+- Rename internal file from `response.gleam` to `encoder.gleam`, matching
+  `decoder.gleam` file.
 
 # v0.3.0
 
 - Remove atom values from ffi's `decode_packet`.
-- Request handler is now rescued during crashes, thanks to ffi's `rescue` function.
-- Add new `on_crash` option that sends a custom response when the handler is rescued. Use `ewe.on_crash` to configure this option.
-- Glisten server is now part of a supervision tree along with an information actor for managing server state. Server information can be extracted using `ewe.get_server_info`.
-- Add new `info_worker_name` option for naming the information worker's subject. Use `ewe.with_name` to configure this option.
-- `ewe.client_stats` is now named `ewe.get_client_info` for consistency with the server getter pattern.
+- Request handler is now rescued during crashes, thanks to ffi's `rescue`
+  function.
+- Add new `on_crash` option that sends a custom response when the handler is
+  rescued. Use `ewe.on_crash` to configure this option.
+- Glisten server is now part of a supervision tree along with an information
+  actor for managing server state. Server information can be extracted using
+  `ewe.get_server_info`.
+- Add new `info_worker_name` option for naming the information worker's subject.
+  Use `ewe.with_name` to configure this option.
+- `ewe.client_stats` is now named `ewe.get_client_info` for consistency with the
+  server getter pattern.
 - Add `ewe.with_random_port` that sets `port` to `0`.
-- Add `ewe.with_read_body` that allows reading the body before passing the request to the handler.
+- Add `ewe.with_read_body` that allows reading the body before passing the
+  request to the handler.
 - Add `ewe.json`, `ewe.text`, `ewe.bytes` for different response body.
 - Fill documentation

@@ -25,7 +25,8 @@ pub type State {
     handler: connection.Handler,
     self: process.Subject(connection.Message),
     buffer: BitArray,
-    idle_timer: option.Option(process.Timer),
+    idle_timer: process.Timer,
+    idle_deadline: Int,
     options: http1.Options,
   )
 }
@@ -44,10 +45,8 @@ type Sent {
 
 pub fn handle_message(state: State, connection: tup.Connection) -> Next {
   case parser.parse(state.buffer, state.options) {
-    Ok(parser.Complete(head, metadata, remaining)) -> {
-      connection.cancel_timer(state.idle_timer)
+    Ok(parser.Complete(head, metadata, remaining)) ->
       handle_request(state, connection, head, metadata, remaining)
-    }
     Ok(parser.Incomplete) -> Continue(state)
     Error(error) -> {
       logging.log(
@@ -65,6 +64,17 @@ pub fn handle_message(state: State, connection: tup.Connection) -> Next {
 
       Close
     }
+  }
+}
+
+pub fn rearm_idle_timer(state: State) -> Result(State, Nil) {
+  let remaining = state.idle_deadline - connection.monotonic_ms()
+  case remaining > 0 {
+    True -> {
+      let idle_timer = connection.start_idle_timer(state.self, remaining)
+      Ok(State(..state, idle_timer:))
+    }
+    False -> Error(Nil)
   }
 }
 
@@ -104,6 +114,7 @@ fn handle_request(
 
       let _sent =
         respond(
+          state,
           connection,
           state.handler.on_crash,
           head,
@@ -119,7 +130,7 @@ fn handle_request(
       let keep_alive =
         http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
-      case respond(connection, response, head, keep_alive, self) {
+      case respond(state, connection, response, head, keep_alive, self) {
         Ok(SentKeepAlive) -> await_next_request(state, buffer, connection)
         Ok(SentClose) | Error(_reason) -> Close
         Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
@@ -129,6 +140,7 @@ fn handle_request(
 }
 
 fn respond(
+  state: State,
   connection: tup.Connection,
   response: response.Response(connection.Body),
   head: parser.Head,
@@ -140,7 +152,7 @@ fn respond(
   {
     Ok(encoded) -> {
       let #(transport, socket) = tup.socket(connection)
-      send_response(encoded, transport, socket, self)
+      send_response(encoded, transport, socket, self, state)
     }
     Error(error) -> {
       logging.log(logging.Error, encoder.error_to_string(error))
@@ -164,9 +176,8 @@ fn await_next_request(
   buffer: BitArray,
   connection: tup.Connection,
 ) -> Next {
-  let idle_timer =
-    connection.start_idle_timer(state.self, state.options.idle_timeout)
-  let state = State(..state, buffer:, idle_timer:)
+  let idle_deadline = connection.monotonic_ms() + state.options.idle_timeout
+  let state = State(..state, buffer:, idle_deadline:)
 
   case buffer {
     <<>> -> Continue(state)
@@ -201,6 +212,7 @@ fn send_response(
   transport: socket.Transport,
   socket: socket.Socket,
   self: process.Subject(http1.Signal),
+  state: State,
 ) -> Result(Sent, socket.SocketError) {
   let encoder.Encoded(head:, keep_alive:, remainder:) = encoded
 
@@ -259,6 +271,8 @@ fn send_response(
       }
     }
     encoder.RemainderWebsocket(context:, handler: websocket_handler) -> {
+      let _cancelled = process.cancel_timer(state.idle_timer)
+      let _timeout = process.receive(state.self, 0)
       use Nil <- result.try(socket.send(transport, socket, head))
 
       let outcome =
