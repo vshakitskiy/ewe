@@ -5,7 +5,6 @@ import ewe/internal/http2
 import ewe/internal/http2/connection as http2_connection
 import gleam/bit_array
 import gleam/erlang/process
-import gleam/option
 import logging
 import tup
 import tup/socket
@@ -20,7 +19,8 @@ pub type Detection {
   Detection(
     expected: Expected,
     buffer: BitArray,
-    idle_timer: option.Option(process.Timer),
+    idle_timer: process.Timer,
+    idle_deadline: Int,
     self: process.Subject(connection.Message),
     handler: connection.Handler,
     http1_options: http1_connection.Options,
@@ -40,6 +40,7 @@ pub fn on_init(
 ) {
   fn(connection: tup.Connection, selector: process.Selector(connection.Message)) {
     let self = process.new_subject()
+    let idle_deadline = connection.monotonic_ms() + http1_options.idle_timeout
     let idle_timer =
       connection.start_idle_timer(self, http1_options.idle_timeout)
     let detecting = fn(expected) {
@@ -47,6 +48,7 @@ pub fn on_init(
         expected:,
         buffer: <<>>,
         idle_timer:,
+        idle_deadline:,
         self:,
         handler:,
         http1_options:,
@@ -63,6 +65,7 @@ pub fn on_init(
           self:,
           buffer: <<>>,
           idle_timer:,
+          idle_deadline:,
           options: http1_options,
         ))
       socket.Tcp, _protocol -> detecting(Http1OrHttp2)
@@ -87,15 +90,20 @@ pub fn loop(
     Http2(state), message ->
       http2.handle_message(state, message, connection)
       |> from_http2
-    Detecting(..), tup.User(connection.IdleTimeout)
-    | Http1(..), tup.User(connection.IdleTimeout)
-    -> {
-      logging.log(logging.Debug, "Connection idled for too long!")
-      tup.stop()
-    }
+    Detecting(..), tup.User(connection.IdleTimeout) -> stop_idle()
+    Http1(state), tup.User(connection.IdleTimeout) ->
+      case http1.rearm_idle_timer(state) {
+        Ok(state) -> tup.continue(Http1(state))
+        Error(Nil) -> stop_idle()
+      }
     Detecting(..), tup.User(_message) | Http1(..), tup.User(_message) ->
       tup.continue(state)
   }
+}
+
+fn stop_idle() -> tup.Next(State, connection.Message) {
+  logging.log(logging.Debug, "Connection idled for too long!")
+  tup.stop()
 }
 
 pub fn on_close(state: State) -> Nil {
@@ -114,7 +122,7 @@ fn detect(
 
   case detection.expected, sniff_preface(buffer) {
     _expected, Http2Preface(remaining:) -> {
-      connection.cancel_timer(detection.idle_timer)
+      let _cancelled = process.cancel_timer(detection.idle_timer)
       start_http2(connection, detection, remaining)
     }
     _expected, NeedMoreData ->
@@ -125,6 +133,7 @@ fn detect(
         self: detection.self,
         buffer:,
         idle_timer: detection.idle_timer,
+        idle_deadline: detection.idle_deadline,
         options: detection.http1_options,
       )
       |> http1.handle_message(connection)

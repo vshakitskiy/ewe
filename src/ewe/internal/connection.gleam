@@ -136,17 +136,9 @@ pub fn append_buffer(buffer: BitArray, data: BitArray) -> BitArray {
 pub fn start_idle_timer(
   self: process.Subject(Message),
   timeout: Int,
-) -> option.Option(process.Timer) {
+) -> process.Timer {
   process.send_after(self, timeout, IdleTimeout)
-  |> option.Some
 }
 
-pub fn cancel_timer(timer: option.Option(process.Timer)) -> Nil {
-  case timer {
-    option.Some(timer) -> {
-      let _cancelled = process.cancel_timer(timer)
-      Nil
-    }
-    option.None -> Nil
-  }
-}
+@external(erlang, "ewe_ffi", "monotonic_ms")
+pub fn monotonic_ms() -> Int
