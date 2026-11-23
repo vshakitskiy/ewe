@@ -28,7 +28,7 @@ pub type State {
     idle_timer: process.Timer,
     idle_deadline: Int,
     options: http1.Options,
-    date_line: encoder.DateLine,
+    date_cache: option.Option(encoder.CachedDate),
   )
 }
 
@@ -39,7 +39,7 @@ pub type Next {
 }
 
 type Sent {
-  SentKeepAlive
+  SentKeepAlive(date_cache: option.Option(encoder.CachedDate))
   SentClose
   SentAbnormal(reason: String)
 }
@@ -113,7 +113,6 @@ fn handle_request(
         "Caught a crash in the request handler: " <> details,
       )
 
-      let date_line = encoder.date_line(state.date_line)
       let _sent =
         respond(
           state,
@@ -122,7 +121,7 @@ fn handle_request(
           head,
           http1.CloseAfterResponse,
           self,
-          date_line.1,
+          state.date_cache,
         )
       Close
     }
@@ -132,11 +131,20 @@ fn handle_request(
         resolve_body(body_connection, drained.body, state.options)
       let keep_alive =
         http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
-      let date_line = encoder.date_line(state.date_line)
 
-      case respond(state, connection, response, head, keep_alive, self, date_line.1) {
-        Ok(SentKeepAlive) ->
-          await_next_request(State(..state, date_line:), buffer, connection)
+      let response =
+        respond(
+          state,
+          connection,
+          response,
+          head,
+          keep_alive,
+          self,
+          state.date_cache,
+        )
+      case response {
+        Ok(SentKeepAlive(date_cache)) ->
+          await_next_request(State(..state, date_cache:), buffer, connection)
         Ok(SentClose) | Error(_reason) -> Close
         Ok(SentAbnormal(reason)) -> CloseAbnormal(reason)
       }
@@ -151,7 +159,7 @@ fn respond(
   head: parser.Head,
   keep_alive: http1.KeepAlive,
   self: process.Subject(http1.Signal),
-  date_line: BitArray,
+  date_cache: option.Option(encoder.CachedDate),
 ) -> Result(Sent, socket.SocketError) {
   case
     encoder.encode_response(
@@ -159,12 +167,12 @@ fn respond(
       head.method,
       head.version,
       keep_alive,
-      date_line,
+      date_cache,
     )
   {
-    Ok(encoded) -> {
+    Ok(#(encoded, date_cache)) -> {
       let #(transport, socket) = tup.socket(connection)
-      send_response(encoded, transport, socket, self, state)
+      send_response(encoded, transport, socket, self, state, date_cache)
     }
     Error(error) -> {
       logging.log(logging.Error, encoder.error_to_string(error))
@@ -225,13 +233,14 @@ fn send_response(
   socket: socket.Socket,
   self: process.Subject(http1.Signal),
   state: State,
+  date_cache: option.Option(encoder.CachedDate),
 ) -> Result(Sent, socket.SocketError) {
   let encoder.Encoded(head:, keep_alive:, remainder:) = encoded
 
   case remainder {
     encoder.NoRemainder -> {
       use Nil <- result.try(socket.send(transport, socket, head))
-      Ok(to_sent(keep_alive))
+      Ok(to_sent(keep_alive, date_cache))
     }
     encoder.RemainderInline(body) -> {
       use Nil <- result.try(socket.send(
@@ -239,7 +248,7 @@ fn send_response(
         socket,
         bytes_tree.append_tree(head, body),
       ))
-      Ok(to_sent(keep_alive))
+      Ok(to_sent(keep_alive, date_cache))
     }
     encoder.RemainderFile(data) ->
       case socket.send(transport, socket, head) {
@@ -249,7 +258,7 @@ fn send_response(
         }
         Ok(Nil) -> {
           use Nil <- result.try(file.send(transport, socket, data))
-          Ok(to_sent(keep_alive))
+          Ok(to_sent(keep_alive, date_cache))
         }
       }
     encoder.RemainderStream(handler: stream_handler, framing:) -> {
@@ -276,7 +285,7 @@ fn send_response(
           let drained = drain_messages(self)
           case drained.stream {
             option.Some(http1.StreamFinished(keep_alive:)) ->
-              Ok(to_sent(keep_alive))
+              Ok(to_sent(keep_alive, date_cache))
             option.None -> Ok(SentClose)
           }
         }
@@ -315,16 +324,19 @@ fn send_response(
         connection.StoppedAbnormal(reason) -> Ok(SentAbnormal(reason))
         connection.Stopped ->
           http1.and_keep_alive(keep_alive, stream_keep_alive)
-          |> to_sent
+          |> to_sent(date_cache)
           |> Ok
       }
     }
   }
 }
 
-fn to_sent(keep_alive: http1.KeepAlive) -> Sent {
+fn to_sent(
+  keep_alive: http1.KeepAlive,
+  date_cache: option.Option(encoder.CachedDate),
+) -> Sent {
   case keep_alive {
-    http1.KeepAlive -> SentKeepAlive
+    http1.KeepAlive -> SentKeepAlive(date_cache)
     http1.CloseAfterResponse -> SentClose
   }
 }
