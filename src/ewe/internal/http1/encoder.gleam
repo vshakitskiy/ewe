@@ -9,6 +9,7 @@ import gleam/http
 import gleam/http/response
 import gleam/int
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/string
 import tup/socket
@@ -33,10 +34,9 @@ type EncodeState {
   EncodeState(tree: bytes_tree.BytesTree, keep_alive: http1.KeepAlive)
 }
 
-pub type DateLine =
-  #(Int, BitArray)
-
-pub const no_date_line: DateLine = #(-1, <<>>)
+pub opaque type CachedDate {
+  CachedDate(stamp: Int, line: BitArray)
+}
 
 pub type Remainder {
   NoRemainder
@@ -69,13 +69,14 @@ pub fn encode_response(
   method: http.Method,
   version: parser.Version,
   keep_alive: http1.KeepAlive,
-  date_line: BitArray,
-) -> Result(Encoded, EncodeError) {
+  date_cache: option.Option(CachedDate),
+) -> Result(#(Encoded, option.Option(CachedDate)), EncodeError) {
   use Nil <- result.try(validate_status(response.status, response.body))
   use state <- result.try(encode_headers(
     response.headers,
     reserved(response.body),
   ))
+  let #(date_line, date_cache) = refresh_date(date_cache)
   let state =
     EncodeState(..state, tree: bytes_tree.append(state.tree, date_line))
   let keep_alive = http1.and_keep_alive(keep_alive, state.keep_alive)
@@ -89,10 +90,12 @@ pub fn encode_response(
     body, False -> encode_body(state, status, keep_alive, version, body)
   }
 
-  Ok(case method {
+  let encoded = case method {
     http.Head -> drop_body(encoded)
     _method -> encoded
-  })
+  }
+
+  Ok(#(encoded, date_cache))
 }
 
 fn validate_status(
@@ -517,9 +520,10 @@ fn status_line(status: Int) -> BitArray {
 }
 
 pub fn error_response(status: Int) -> bytes_tree.BytesTree {
-  let #(_stamp, line) = date_line(no_date_line)
-
-  EncodeState(bytes_tree.from_bit_array(line), http1.CloseAfterResponse)
+  EncodeState(
+    bytes_tree.from_bit_array(date_line(date())),
+    http1.CloseAfterResponse,
+  )
   |> build_head(status, http1.CloseAfterResponse, <<
     "content-length: 0\r\n",
   >>)
@@ -529,5 +533,30 @@ pub fn internal_server_error() -> bytes_tree.BytesTree {
   error_response(500)
 }
 
-@external(erlang, "ewe_ffi", "date_line")
-pub fn date_line(cached: DateLine) -> DateLine
+fn refresh_date(
+  cache: option.Option(CachedDate),
+) -> #(BitArray, option.Option(CachedDate)) {
+  case gnomon_stamp(), cache {
+    Ok(stamp), option.Some(CachedDate(stamp: cached_stamp, line:))
+      if stamp == cached_stamp
+    -> #(line, cache)
+    Ok(stamp), _cache -> {
+      let line = date_line(date_at(stamp))
+      #(line, option.Some(CachedDate(stamp:, line:)))
+    }
+    Error(Nil), _cache -> #(date_line(date()), option.None)
+  }
+}
+
+fn date_line(value: BitArray) -> BitArray {
+  <<"date: ", value:bits, "\r\n">>
+}
+
+@external(erlang, "ewe_ffi", "gnomon_stamp")
+fn gnomon_stamp() -> Result(Int, Nil)
+
+@external(erlang, "gnomon", "date")
+fn date() -> BitArray
+
+@external(erlang, "gnomon", "date")
+fn date_at(stamp: Int) -> BitArray

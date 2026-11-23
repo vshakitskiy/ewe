@@ -12,7 +12,7 @@
     exit_self/1,
     monotonic_ms/0,
     message_queue_length/0,
-    date_line/1,
+    gnomon_stamp/0,
     queue_pop/1,
     is_valid_utf8/1,
 
@@ -111,11 +111,10 @@ message_queue_length() ->
   {message_queue_len, Length} = erlang:process_info(self(), message_queue_len),
   Length.
 
-date_line({Stamp, _Line} = Cached) ->
+gnomon_stamp() ->
   case gnomon:stamp() of
-    Stamp -> Cached;
-    undefined -> {-1, <<"date: ", (gnomon:date())/binary, "\r\n">>};
-    Fresh -> {Fresh, <<"date: ", (gnomon:date(Fresh))/binary, "\r\n">>}
+    undefined -> {error, nil};
+    Stamp -> {ok, Stamp}
   end.
 
 queue_pop(Queue) ->

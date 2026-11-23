@@ -4,8 +4,7 @@
 
 - Replace the `date` header clock with `gnomon`.
 - Optimize the timer.
-- Reuse an HTTP/1.1 connection's `date` header line until the second changes,
-  with `gnomon` 1.0.1.
+- Reuse an HTTP/1.1 connection's `date` header line.
 
 ## v9.0.0 - 30.09.2026
 

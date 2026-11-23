@@ -1,11 +1,11 @@
 import ewe/internal/connection
 import ewe/internal/http1
 import ewe/internal/http1/connection as http1_connection
-import ewe/internal/http1/encoder
 import ewe/internal/http2
 import ewe/internal/http2/connection as http2_connection
 import gleam/bit_array
 import gleam/erlang/process
+import gleam/option
 import logging
 import tup
 import tup/socket
@@ -68,7 +68,7 @@ pub fn on_init(
           idle_timer:,
           idle_deadline:,
           options: http1_options,
-          date_line: encoder.no_date_line,
+          date_cache: option.None,
         ))
       socket.Tcp, _protocol -> detecting(Http1OrHttp2)
     }
@@ -137,7 +137,7 @@ fn detect(
         idle_timer: detection.idle_timer,
         idle_deadline: detection.idle_deadline,
         options: detection.http1_options,
-        date_line: encoder.no_date_line,
+        date_cache: option.None,
       )
       |> http1.handle_message(connection)
       |> from_http1
