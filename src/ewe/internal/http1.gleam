@@ -121,7 +121,6 @@ fn handle_request(
           head,
           http1.CloseAfterResponse,
           self,
-          state.date_cache,
         )
       Close
     }
@@ -132,17 +131,8 @@ fn handle_request(
       let keep_alive =
         http1.and_keep_alive(metadata.keep_alive, body_keep_alive)
 
-      let response =
-        respond(
-          state,
-          connection,
-          response,
-          head,
-          keep_alive,
-          self,
-          state.date_cache,
-        )
-      case response {
+      let sent = respond(state, connection, response, head, keep_alive, self)
+      case sent {
         Ok(SentKeepAlive(date_cache)) ->
           await_next_request(State(..state, date_cache:), buffer, connection)
         Ok(SentClose) | Error(_reason) -> Close
@@ -159,7 +149,6 @@ fn respond(
   head: parser.Head,
   keep_alive: http1.KeepAlive,
   self: process.Subject(http1.Signal),
-  date_cache: option.Option(encoder.CachedDate),
 ) -> Result(Sent, socket.SocketError) {
   case
     encoder.encode_response(
@@ -167,7 +156,7 @@ fn respond(
       head.method,
       head.version,
       keep_alive,
-      date_cache,
+      state.date_cache,
     )
   {
     Ok(#(encoded, date_cache)) -> {
